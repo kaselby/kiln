@@ -486,6 +486,86 @@ def send_to_inbox(
     return msg_path
 
 
+def do_send_message(
+    inbox_root: Path,
+    agent_id: str,
+    summary: str,
+    body: str,
+    priority: str = "normal",
+    to: str | None = None,
+    channel: str | None = None,
+    channels_path: Path | None = None,
+    channels_dir: Path | None = None,
+) -> dict:
+    """Send a point-to-point or channel broadcast message.
+
+    Standalone function — importable and callable from custom MCP servers
+    without duplicating message/channel logic.
+
+    Args:
+        inbox_root: Root inbox directory (e.g. ~/.aleph/inbox).
+        agent_id: Sender's agent ID.
+        summary: Brief message summary.
+        body: Full message body.
+        priority: Message priority (low, normal, high).
+        to: Recipient agent ID (for point-to-point).
+        channel: Channel name (for broadcast).
+        channels_path: Path to channels.json (defaults to inbox_root/../channels.json).
+        channels_dir: Path to channels/ directory (defaults to inbox_root/../channels).
+
+    Returns:
+        dict with "result" key on success or "error" key on failure.
+    """
+    if not summary and not body:
+        return {"error": "send requires at least a summary or body."}
+    if not to and not channel:
+        return {"error": "send requires either 'to' (agent ID) or 'channel'."}
+
+    if channels_path is None:
+        channels_path = inbox_root.parent / "channels.json"
+    if channels_dir is None:
+        channels_dir = inbox_root.parent / "channels"
+
+    if to:
+        msg_path = send_to_inbox(inbox_root, to, agent_id, summary, body, priority)
+        return {"result": f"Message sent to {to} at {msg_path}"}
+
+    # Channel broadcast
+    if not channels_path.exists():
+        return {"error": f"Channel '{channel}' has no other subscribers."}
+    try:
+        ch_data = json.loads(channels_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        ch_data = {}
+    subs = ch_data.get(channel, [])
+    recipients = [s for s in subs if s != agent_id]
+    if not recipients:
+        return {"error": f"Channel '{channel}' has no other subscribers."}
+    for recipient in recipients:
+        send_to_inbox(
+            inbox_root, recipient, agent_id, summary, body,
+            priority, channel=channel,
+        )
+    # Persist to channel history
+    history_dir = channels_dir / channel
+    history_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "from": agent_id,
+        "summary": summary,
+        "body": body,
+        "priority": priority,
+    }
+    with open(history_dir / "history.jsonl", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {
+        "result": (
+            f"Message broadcast to channel '{channel}' "
+            f"({len(recipients)} recipient(s))."
+        )
+    }
+
+
 def format_plan(data: dict) -> str:
     """Format a plan dict as readable text."""
     lines = [f"Goal: {data.get('goal', '(none)')}"]
@@ -668,6 +748,15 @@ ACTIVATE_SKILL_DESC = (
     "context for the remainder of the session. Use this when your task calls for "
     "a specific skill listed in your session context."
 )
+ACTIVATE_SKILL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+        },
+    },
+    "required": ["name"],
+}
 
 MESSAGE_DESC = (
     "Send messages to agents and manage channel subscriptions.\n\n"
@@ -901,7 +990,7 @@ def create_mcp_server(
             file_state,
         )
 
-    @tool("activate_skill", ACTIVATE_SKILL_DESC, {"name": str})
+    @tool("activate_skill", ACTIVATE_SKILL_DESC, ACTIVATE_SKILL_SCHEMA)
     async def activate_skill_tool(args: dict) -> dict:
         return do_activate_skill(args["name"], skills_path)
 
@@ -958,54 +1047,19 @@ def create_mcp_server(
             return _ok(f"Unsubscribed from channel '{channel}'.")
 
         elif action == "send":
-            summary = args.get("summary", "")
-            body = args.get("body", "")
-            priority = args.get("priority", "normal")
-            if not summary and not body:
-                return _error("send requires at least a summary or body.")
-            to = args.get("to")
-            channel = args.get("channel")
-            if not to and not channel:
-                return _error("send requires either 'to' (agent ID) or 'channel'.")
-
-            if to:
-                msg_path = send_to_inbox(
-                    inbox_root, to, agent_id, summary, body, priority
-                )
-                return _ok(f"Message sent to {to} at {msg_path}")
-
-            # Channel broadcast
-            if not channels_path.exists():
-                return _error(f"Channel '{channel}' has no other subscribers.")
-            try:
-                ch_data = json.loads(channels_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                ch_data = {}
-            subs = ch_data.get(channel, [])
-            recipients = [s for s in subs if s != agent_id]
-            if not recipients:
-                return _error(f"Channel '{channel}' has no other subscribers.")
-            for recipient in recipients:
-                send_to_inbox(
-                    inbox_root, recipient, agent_id, summary, body,
-                    priority, channel=channel,
-                )
-            # Persist to channel history
-            history_dir = channels_dir / channel
-            history_dir.mkdir(parents=True, exist_ok=True)
-            entry = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "from": agent_id,
-                "summary": summary,
-                "body": body,
-                "priority": priority,
-            }
-            with open(history_dir / "history.jsonl", "a") as f:
-                f.write(json.dumps(entry) + "\n")
-            return _ok(
-                f"Message broadcast to channel '{channel}' "
-                f"({len(recipients)} recipient(s))."
+            result = do_send_message(
+                inbox_root, agent_id,
+                summary=args.get("summary", ""),
+                body=args.get("body", ""),
+                priority=args.get("priority", "normal"),
+                to=args.get("to"),
+                channel=args.get("channel"),
+                channels_path=channels_path,
+                channels_dir=channels_dir,
             )
+            if "error" in result:
+                return _error(result["error"])
+            return _ok(result["result"])
 
         else:
             return _error(f"Unknown action: {action}. Use send, subscribe, or unsubscribe.")

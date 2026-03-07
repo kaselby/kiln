@@ -243,17 +243,9 @@ def _stop_caffeinate(pid: int | None) -> None:
 
 def _most_recent_agent_id(config: AgentConfig) -> str | None:
     """Find the most recent agent ID from the session registry."""
+    from .registry import most_recent_agent_id
     registry_path = config.home / "logs" / "session-registry.json"
-    if not registry_path.exists():
-        return None
-    try:
-        registry = json.loads(registry_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    if not registry:
-        return None
-    latest = max(registry.items(), key=lambda kv: kv[1].get("started_at", ""))
-    return latest[0]
+    return most_recent_agent_id(registry_path)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -382,8 +374,19 @@ def cmd_init(args: argparse.Namespace) -> None:
     )
 
     # Standard directories
-    for d in ["inbox", "plans", "tools", "skills", "logs"]:
+    for d in ["inbox", "plans", "logs"]:
         (target / d).mkdir()
+
+    # Copy standard library (tools + skills) from kiln defaults.
+    # After init, the agent owns these — edits, additions, deletions are theirs.
+    defaults_dir = Path(__file__).resolve().parent.parent.parent / "defaults"
+    for subdir in ["tools", "skills"]:
+        src = defaults_dir / subdir
+        dst = target / subdir
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            dst.mkdir()
 
     print(f"Agent scaffolded at {target}/")
     print(f"  Edit identity.md and agent.yml, then: kiln run {target}")

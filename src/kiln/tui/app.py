@@ -510,6 +510,9 @@ class KilnApp:
         # Channel view state: "agent" or "channel:<name>"
         self._current_view: str = "agent"
 
+        # Plan cache: (mtime, formatted_progress_string)
+        self._plan_cache: tuple[float, str | None] = (0.0, None)
+
         # Build the prompt_toolkit Application
         self._input_buffer = Buffer(multiline=True)
         kb = self._build_keybindings()
@@ -887,8 +890,6 @@ class KilnApp:
             parts.append("Esc to interrupt")
 
         return HTML(f" {' | '.join(parts)}")
-
-    _plan_cache: tuple[float, str | None] = (0.0, None)  # (mtime, result)
 
     def _plan_progress(self) -> str | None:
         """Read the agent's plan file and return a compact progress string."""

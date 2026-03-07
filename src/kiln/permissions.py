@@ -208,8 +208,8 @@ def _is_exempt(reason: str, cwd: str, agent_home: str, command: str = "") -> boo
             home_patterns = [
                 re.escape(agent_home),
                 re.escape(agent_home.replace(home, "~")),
-                r"\$KILN_HOME",
-                r"\$\{KILN_HOME\}",
+                r"\$KILN_AGENT_HOME",
+                r"\$\{KILN_AGENT_HOME\}",
             ]
             for pat in home_patterns:
                 # cd <agent-home> && git push  /  cd <agent-home>; git push
@@ -398,6 +398,8 @@ def create_permission_hook(
     get_mode: Callable[[], PermissionMode],
     request_permission: PermissionHandler,
     get_cwd: Callable[[], str] | None = None,
+    agent_id: str = "agent",
+    agent_home: str | None = None,
 ):
     """Factory: create a PreToolUse hook that checks permissions.
 
@@ -410,9 +412,13 @@ def create_permission_hook(
         get_cwd: Returns the shell's current working directory. Used for
                 path-based guardrail exemptions (e.g. allowing git push
                 from the agent's home directory).
+        agent_id: The agent's session ID (used in notifications).
+        agent_home: The agent's home directory (used for git push exemptions).
+                   Defaults to ~ if not provided.
     """
-    agent_id = os.environ.get("KILN_AGENT_ID", "agent")
-    agent_home = os.path.realpath(os.environ.get("KILN_HOME", os.path.expanduser("~")))
+    if agent_home is None:
+        agent_home = os.path.expanduser("~")
+    agent_home = os.path.realpath(agent_home)
 
     async def permission_hook(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
