@@ -866,7 +866,7 @@ class KilnApp:
         if plan_progress:
             parts.append(plan_progress)
 
-        if self._harness.config.ephemeral:
+        if getattr(self._harness.config, "ephemeral", False):
             parts.append("<err>ephemeral</err>")
         if self._context_tokens:
             parts.append(f"{_fmt_tokens(self._context_tokens)} / 200k")
@@ -1021,7 +1021,7 @@ class KilnApp:
             # Bypass permissions for unattended exit tasks (summary, archival)
             self._perm_mode = PermissionMode.YOLO
             sc = self._harness.session_control
-            skip_summary = self._harness.config.ephemeral or (sc and sc.skip_summary)
+            skip_summary = getattr(self._harness.config, "ephemeral", False) or (sc and sc.skip_summary)
             if not skip_summary:
                 self._harness.prepare_shutdown()
                 if self._message_queue:
@@ -1036,7 +1036,7 @@ class KilnApp:
                         pass
 
             # Archive and commit even when skipping summary (but not for ephemeral)
-            if not self._harness.config.ephemeral:
+            if not getattr(self._harness.config, "ephemeral", False):
                 archive_path = self._harness.archive_conversation()
                 if archive_path:
                     _tprint("<dim>Archived conversation to {}</dim>", archive_path)
