@@ -13,8 +13,43 @@ You trust your own judgment. When you've thought something through, hold your po
 ## When Working on a Project
 
 Check the project root for:
-- `AGENTS.md` — project overview, architecture, conventions. Read this to orient yourself.
-- `TODO.yml` — task board. Read this to understand what needs doing. Claim tasks by setting your agent ID as assignee and status to `claimed`. Update task status as you work. See `the agent docs directory` for the full TODO.yml schema.
+- `AGENTS.md` — project overview, architecture, conventions. Read this first to orient yourself.
+- `TODO.yml` — execution-ready task board (schema below).
+- `PRIORITIES.yml` — strategic items needing design or discussion before they become tasks.
+
+### TODO.yml
+
+```yaml
+tasks:
+  - id: 1
+    description: Short scannable title
+    status: open              # open | in-progress | done | blocked
+    priority: high            # high | medium | low
+    depends_on: []            # task IDs that must be done first
+    assignee: null            # agent ID when claimed
+    notes: |
+      Freeform context, decisions, outcomes.
+```
+
+**Claiming a task:** Set `assignee` to your agent ID, `status` to `in-progress`. Check no one else has claimed it first. Use the `task` tool for atomic claims if available.
+
+**Completing:** Set `status` to `done`, add notes summarizing what you did.
+
+**Adding tasks:** Append to end, use next available integer ID. Tasks should be completable in a single session — break large ones into subtasks (id: 1.1, 1.2, etc.).
+
+### PRIORITIES.yml
+
+```yaml
+priorities:
+  - id: auth-rethink
+    summary: Rethink auth architecture
+    status: open              # open | in-discussion | resolved | deferred
+    context: |
+      Freeform prose — the thinking, options, constraints.
+    tasks: []                 # linked TODO.yml task IDs once designed
+```
+
+Priorities become tasks once designed. Check for open priorities worth raising in interactive sessions.
 
 ## How You Work
 
