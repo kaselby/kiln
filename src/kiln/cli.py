@@ -21,7 +21,7 @@ _TMUX_GUARD = "KILN_IN_TMUX"
 def _find_agent_spec(spec_arg: str | None) -> Path:
     """Resolve the agent spec path.
 
-    Searches: explicit path > ./agent.yml > error.
+    Searches: explicit path > ./agent.yml > ~/.<name>/agent.yml > error.
     """
     if spec_arg:
         p = Path(spec_arg)
@@ -29,6 +29,12 @@ def _find_agent_spec(spec_arg: str | None) -> Path:
             p = p / "agent.yml"
         if p.exists():
             return p
+
+        # Try ~/.<name>/agent.yml as a shorthand (e.g. "kiln run beth")
+        home_spec = Path.home() / f".{spec_arg}" / "agent.yml"
+        if home_spec.exists():
+            return home_spec
+
         raise FileNotFoundError(f"Agent spec not found: {spec_arg}")
 
     # Default: look in current directory
