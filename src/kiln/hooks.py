@@ -1,4 +1,4 @@
-"""Hook callbacks for message delivery, read tracking, periodic reminders, planning nudges, and usage logging."""
+"""Infrastructure hook callbacks — message delivery, read tracking, context warnings, and usage logging."""
 
 import json
 import os
