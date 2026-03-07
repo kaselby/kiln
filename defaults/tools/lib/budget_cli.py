@@ -1,10 +1,48 @@
 """CLI for budget management. Invoked by tool-budget shell wrapper."""
 
+import os
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from lib import budget, registry
+from lib import budget
+
+
+def _list_paid_tools():
+    """Scan tool scripts for cost headers. Returns list of dicts."""
+    tools_dir = Path(os.environ.get("AGENT_HOME", ".")) / "tools"
+    tools = []
+    if not tools_dir.is_dir():
+        return tools
+    for f in sorted(tools_dir.iterdir()):
+        if f.is_dir() or f.name.startswith("."):
+            continue
+        try:
+            header = f.read_text()[:1000]
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Parse YAML-style header between # --- markers
+        m = re.search(r"# ---\n(.*?)# ---", header, re.DOTALL)
+        if not m:
+            continue
+        block = m.group(1)
+        name = desc = ""
+        cost = 0.0
+        for line in block.splitlines():
+            line = line.lstrip("# ").strip()
+            if line.startswith("name:"):
+                name = line.split(":", 1)[1].strip().strip('"')
+            elif line.startswith("description:"):
+                desc = line.split(":", 1)[1].strip().strip('"')
+            elif line.startswith("cost:"):
+                try:
+                    cost = float(line.split(":", 1)[1].strip().strip('"').lstrip("$"))
+                except ValueError:
+                    pass
+        if name and cost > 0:
+            tools.append({"name": name, "description": desc, "cost_per_call": cost})
+    return tools
 
 
 def main():
@@ -42,7 +80,7 @@ def main():
         print(f"Budget enforcement set to {args[1]} stop")
 
     elif cmd == "list-tools":
-        tools = registry.list_tools()
+        tools = _list_paid_tools()
         for t in tools:
             cost = t.get("cost_per_call", 0)
             cost_str = f"${cost:.3f}/call" if cost > 0 else "free"
