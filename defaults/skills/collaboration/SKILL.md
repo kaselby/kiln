@@ -9,26 +9,12 @@ description: >
 
 # Collaboration
 
-## Agent Types
-
-**Persistent agents** get full session lifecycle — worklogs, session summaries, inbox. Use when the agent's observations and thinking matter beyond its direct output: investigation, design work, code review, anything where unplanned discoveries are likely.
-
-**Ephemeral agents** are disposable workers — no session summaries, no persistent state. Use when only the output matters: code changes, data extraction, formatting, well-specified transformations. Named with a `_` prefix automatically.
-
-The deciding factor is not task complexity — ephemeral agents are just as capable. It's whether you care about the agent's *process* or just its *product*.
-
 ## Launching Agents
 
-### Persistent agents
+Spawn agents in detached tmux sessions:
 
 ```bash
 kiln run <agent-spec> --detach --mode yolo [--prompt "task description"]
-```
-
-### Ephemeral agents
-
-```bash
-kiln run <agent-spec> --detach --ephemeral --mode yolo [--prompt "task description"]
 ```
 
 **Always use `--mode yolo`** for spawned agents — permission prompts stall forever since nobody is watching their tmux session.
@@ -39,7 +25,7 @@ Use `--prompt` to send initial instructions, or send a message after launch:
 message(action="send", to="<agent-id>", summary="Task assignment", body="detailed instructions...")
 ```
 
-Prefer smaller models for ephemeral workers when the task allows it — `--model sonnet` for most tasks, `--model haiku` for trivial ones.
+Use `--model sonnet` or `--model haiku` for cheaper tasks that don't need the full model.
 
 ## Coordination
 
@@ -82,7 +68,7 @@ tmux capture-pane -t <agent-id> -p      # peek at output
 tmux kill-session -t <agent-id>         # kill a stuck agent
 ```
 
-Let persistent agents finish and exit naturally. Check `capture-pane` before killing. Ephemeral workers can be killed if stuck or no longer needed.
+Check `capture-pane` before killing an agent — let them finish if they're close to done.
 
 ## Working as a Spawned Agent
 
