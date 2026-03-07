@@ -255,6 +255,7 @@ class KilnHarness:
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             "CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING": "1",
             "KILN_AGENT_HOME": str(self.config.home),
+            "AGENT_HOME": str(self.config.home),  # short alias for tools
             "KILN_AGENT_ID": self.agent_id,
         }
         if venv_path.exists():
