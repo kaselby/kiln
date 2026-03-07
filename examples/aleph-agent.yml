@@ -6,12 +6,26 @@ identity_doc: ALEPH.md
 model: claude-opus-4-6
 session_prefix: aleph-
 
+# Aleph's custom MCP server — wraps kiln's base tools with
+# thinking/worklog capture and any agent-specific tools.
+mcp_server: harness/tools.py
+
+# Namespaced tool list — explicit about where each tool comes from.
+# Base = Claude Code built-in, Kiln = kiln's standard library,
+# Aleph = agent's custom MCP server.
 tools:
-  builtin:
-    - Read          # for images, PDFs, notebooks
-    - WebSearch
-  mcp_server: harness/tools.py   # Aleph's custom MCP server (extends kiln's)
-  scripts_dir: tools              # shell scripts invokable via Bash
+  - Base::Read           # built-in Read for images/PDFs
+  - Base::WebSearch      # built-in web search
+  - Aleph::Bash          # kiln Bash + thinking/worklog capture
+  - Aleph::Read          # kiln Read + thinking
+  - Aleph::Write         # kiln Write + thinking
+  - Aleph::Edit          # kiln Edit + thinking
+  - Kiln::message        # messaging (no agent-specific wrapper needed)
+  - Kiln::plan
+  - Kiln::exit_session
+  - Kiln::activate_skill
+
+scripts_dir: tools       # shell scripts invokable via Bash
 
 context_injection:
   - memory/core.md

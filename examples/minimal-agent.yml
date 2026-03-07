@@ -1,14 +1,19 @@
-# Minimal agent spec — a simple coding assistant with no memory or identity
-# kiln init creates something like this
+# Minimal agent spec — a simple coding assistant
+# Uses kiln defaults for everything except identity
 
 name: assistant
 identity_doc: identity.md
 model: claude-sonnet-4-6
 
-tools:
-  builtin:
-    - Read
-    - WebSearch
+# Uses kiln's default tool set (all Kiln:: tools + Base::Read + Base::WebSearch)
+# Uncomment to customize:
+# tools:
+#   - Base::Read
+#   - Base::WebSearch
+#   - Kiln::Bash
+#   - Kiln::Read
+#   - Kiln::Write
+#   - Kiln::Edit
 
 hooks:
   inbox_check: {}

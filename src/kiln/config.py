@@ -7,8 +7,17 @@ from pathlib import Path
 import yaml
 
 
-# Built-in Claude Code tools that can be included via agent spec.
-# These are passed as --tools to the CLI.
+# Known tool namespaces. Tools in the agent spec are namespaced as
+# "Source::ToolName" to make the source explicit.
+#
+#   Base::<name>    — Claude Code built-in tools (passed via --tools flag)
+#   Kiln::<name>    — Kiln's standard MCP server tools
+#   <Agent>::<name> — Agent's custom MCP server tools
+#
+NAMESPACE_BASE = "Base"
+NAMESPACE_KILN = "Kiln"
+
+# Claude Code built-in tools that can be referenced as Base::<name>.
 KNOWN_BUILTINS = {
     "Read",        # built-in Read (images, PDFs, notebooks)
     "Write",       # built-in Write (replaced by MCP in standard library)
@@ -19,9 +28,19 @@ KNOWN_BUILTINS = {
     "TodoWrite",   # built-in todo/planning
 }
 
-# Default builtins when agent spec doesn't specify.
-# Only Read and WebSearch — the rest are replaced by kiln's MCP tools.
-DEFAULT_BUILTINS = ["Read", "WebSearch"]
+# Default tool set when agent spec doesn't specify.
+DEFAULT_TOOLS = [
+    "Base::Read",
+    "Base::WebSearch",
+    "Kiln::Bash",
+    "Kiln::Read",
+    "Kiln::Write",
+    "Kiln::Edit",
+    "Kiln::message",
+    "Kiln::plan",
+    "Kiln::exit_session",
+    "Kiln::activate_skill",
+]
 
 
 @dataclass
@@ -61,8 +80,8 @@ class AgentConfig:
     heartbeat: bool = False
     heartbeat_interval: float = 1800.0
 
-    # Tools
-    builtin_tools: list[str] = field(default_factory=lambda: list(DEFAULT_BUILTINS))
+    # Tools — namespaced list: "Base::Read", "Kiln::Bash", "Aleph::CustomTool"
+    tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
     mcp_server: str | None = None     # path to custom MCP server module (relative to home)
     scripts_dir: str = "tools"        # shell tools directory (relative to home)
 
@@ -164,6 +183,31 @@ class AgentConfig:
             return None
         return self.home / self.mcp_server
 
+    def resolve_tools(self) -> dict[str, list[str]]:
+        """Parse the namespaced tools list into per-source tool lists.
+
+        Returns a dict mapping namespace → list of tool names:
+            {
+                "Base": ["Read", "WebSearch"],
+                "Kiln": ["Bash", "Read", "Write", ...],
+                "Aleph": ["Bash", "CustomTool"],  # agent-specific
+            }
+
+        The harness uses this to:
+        - Pass Base tools to Claude Code's --tools flag
+        - Include Kiln tools from kiln's standard MCP server
+        - Include agent tools from the agent's custom MCP server
+        """
+        result: dict[str, list[str]] = {}
+        for entry in self.tools:
+            if "::" not in entry:
+                # Unnamespaced — treat as Kiln for backward compat
+                result.setdefault(NAMESPACE_KILN, []).append(entry)
+                continue
+            namespace, tool_name = entry.split("::", 1)
+            result.setdefault(namespace, []).append(tool_name)
+        return result
+
 
 def load_agent_spec(spec_path: Path) -> AgentConfig:
     """Load an AgentConfig from an agent.yml spec file.
@@ -195,16 +239,21 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
         if field_name in raw:
             setattr(config, field_name, raw[field_name])
 
-    # Tools
-    tools_spec = raw.get("tools", {})
-    if isinstance(tools_spec, dict):
-        if "builtin" in tools_spec:
-            config.builtin_tools = tools_spec["builtin"]
-        if "mcp_server" in tools_spec:
-            config.mcp_server = tools_spec["mcp_server"]
-        if "scripts_dir" in tools_spec:
-            config.scripts_dir = tools_spec["scripts_dir"]
-    
+    # Tools — either a flat namespaced list or a structured dict
+    tools_raw = raw.get("tools")
+    if isinstance(tools_raw, list):
+        # Flat namespaced list: ["Base::Read", "Kiln::Bash", ...]
+        config.tools = tools_raw
+    elif isinstance(tools_raw, dict):
+        # Structured with separate mcp_server/scripts_dir alongside tool list
+        if "list" in tools_raw:
+            config.tools = tools_raw["list"]
+        if "scripts_dir" in tools_raw:
+            config.scripts_dir = tools_raw["scripts_dir"]
+
+    if "mcp_server" in raw:
+        config.mcp_server = raw["mcp_server"]
+
     # Context injection
     if "context_injection" in raw:
         config.context_injection = raw["context_injection"]
