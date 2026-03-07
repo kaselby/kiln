@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# ---
+# name: hn
+# description: Search and read Hacker News stories and comments. Good for technical trends, Show HN projects, and community discussion on specific topics
+# arguments: "<search|read|top> [options]"
+# ---
+#
+# Subcommands:
+#   search <query> [options]     Search HN stories
+#     --sort <relevance|date>    Sort by relevance or date (default: relevance)
+#     --days <N>                 Only show stories from last N days
+#     -n <count>                 Number of results (default: 10)
+#
+#   read <hn-id-or-url>          Read a story and its top comments
+#     -n <count>                 Number of top-level comments (default: 15)
+#     --depth <N>                Max reply depth (default: 3)
+#
+#   top [options]                Show current top/best stories
+#     --type <top|best|new>      Story type (default: top)
+#     -n <count>                 Number of stories (default: 15)
+#
+# Examples:
+#   hn search "coding agent autonomous" --days 30 -n 10
+#   hn read 46509130
+#   hn read "https://news.ycombinator.com/item?id=46509130"
+#   hn top --type best -n 20
+
+set -euo pipefail
+
+ALGOLIA_API="https://hn.algolia.com/api/v1"
+HN_API="https://hacker-news.firebaseio.com/v0"
+PYTHON="${AGENT_HOME:?}/venv/bin/python3"
+
+usage() {
+    sed -n '/^# Subcommands:/,/^[^#]/p' "$0" | head -n -1 | sed 's/^# \?//'
+    exit 1
+}
+
+[ $# -eq 0 ] && usage
+
+SUBCMD="$1"; shift
+
+# --- search ---
+do_search() {
+    local query="" sort="relevance" days="" count=10
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sort) sort="$2"; shift 2 ;;
+            --days) days="$2"; shift 2 ;;
+            -n) count="$2"; shift 2 ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) query="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$query" ] && { echo "Error: search query required" >&2; exit 1; }
+
+    local endpoint="search"
+    [ "$sort" = "date" ] && endpoint="search_by_date"
+
+    local encoded_query
+    encoded_query=$($PYTHON -c "import urllib.parse; print(urllib.parse.quote('$query'))")
+
+    local url="${ALGOLIA_API}/${endpoint}?query=${encoded_query}&tags=story&hitsPerPage=${count}"
+
+    if [ -n "$days" ]; then
+        local ts
+        ts=$($PYTHON -c "import time; print(int(time.time() - $days * 86400))")
+        url="${url}&numericFilters=created_at_i%3E${ts}"
+    fi
+
+    curl -s "$url" | $PYTHON -c "
+import json, sys
+
+data = json.load(sys.stdin)
+hits = data.get('hits', [])
+total = data.get('nbHits', 0)
+
+if not hits:
+    print('No results found.')
+    sys.exit(0)
+
+print(f'Found {total} results, showing {len(hits)}:')
+print()
+
+for i, hit in enumerate(hits, 1):
+    points = hit.get('points', 0) or 0
+    title = hit.get('title', '?')
+    url = hit.get('url', '')
+    hn_id = hit.get('objectID', '')
+    comments = hit.get('num_comments', 0) or 0
+    created = hit.get('created_at', '')[:10]
+    author = hit.get('author', '?')
+
+    print(f'[{i}] [{points} pts] {title}')
+    print(f'    u/{author} | {comments} comments | {created}')
+    print(f'    HN: https://news.ycombinator.com/item?id={hn_id}')
+    if url:
+        print(f'    Link: {url}')
+
+    # Show story text if it's an Ask HN / Show HN
+    story_text = hit.get('story_text', '')
+    if story_text:
+        import html as h
+        clean = h.unescape(story_text).replace('<p>', '\n').replace('</p>', '')
+        # Strip remaining HTML tags
+        import re
+        clean = re.sub(r'<[^>]+>', '', clean)
+        preview = clean[:200].replace('\n', ' ').strip()
+        if len(clean) > 200:
+            preview += '...'
+        print(f'    {preview}')
+    print()
+"
+}
+
+# --- read ---
+do_read() {
+    local item_id="" max_comments=15 max_depth=3
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) max_comments="$2"; shift 2 ;;
+            --depth) max_depth="$2"; shift 2 ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *)
+                # Extract ID from URL or use directly
+                if [[ "$1" =~ id=([0-9]+) ]]; then
+                    item_id="${BASH_REMATCH[1]}"
+                elif [[ "$1" =~ ^[0-9]+$ ]]; then
+                    item_id="$1"
+                else
+                    echo "Error: couldn't parse HN item ID from: $1" >&2
+                    exit 1
+                fi
+                shift ;;
+        esac
+    done
+
+    [ -z "$item_id" ] && { echo "Error: HN item ID or URL required" >&2; exit 1; }
+
+    # Fetch via Algolia for the story + comments in one call
+    curl -s "${ALGOLIA_API}/items/${item_id}" | $PYTHON -c "
+import json, sys, html, textwrap
+
+MAX_COMMENTS = $max_comments
+MAX_DEPTH = $max_depth
+
+data = json.load(sys.stdin)
+
+# Story info
+title = data.get('title', '?')
+author = data.get('author', '?')
+points = data.get('points', 0) or 0
+url = data.get('url', '')
+text = data.get('text', '')
+created = data.get('created_at', '')[:19]
+
+print(f'# {title}')
+print(f'u/{author} | {points} pts | https://news.ycombinator.com/item?id={data.get(\"id\", \"\")}')
+if url:
+    print(f'Link: {url}')
+print(f'Posted: {created}')
+print()
+
+if text:
+    import re
+    clean = html.unescape(text).replace('<p>', '\n\n')
+    clean = re.sub(r'<[^>]+>', '', clean)
+    print(clean[:5000])
+    if len(clean) > 5000:
+        print(f'\n... (truncated, {len(clean)} chars total)')
+    print()
+
+print('---')
+print(f'Comments (up to {MAX_COMMENTS} top-level, depth {MAX_DEPTH}):')
+print()
+
+import re
+
+def clean_html(s):
+    if not s:
+        return ''
+    s = html.unescape(s).replace('<p>', '\n\n')
+    return re.sub(r'<[^>]+>', '', s)
+
+def print_comment(comment, depth=0, counter=[0]):
+    if counter[0] >= MAX_COMMENTS and depth == 0:
+        return False
+    if depth > MAX_DEPTH:
+        return True
+
+    author = comment.get('author', '[deleted]')
+    text = clean_html(comment.get('text', ''))
+    if not text and not comment.get('children'):
+        return True
+
+    indent = '  ' * depth
+
+    if depth == 0:
+        counter[0] += 1
+
+    if text:
+        # Truncate long comments
+        max_len = 800 if depth == 0 else 500
+        if len(text) > max_len:
+            text = text[:max_len] + '...'
+
+        print(f'{indent}**u/{author}**')
+        for line in text.split('\n'):
+            print(f'{indent}  {line}')
+        print()
+
+    for child in comment.get('children', []):
+        if child.get('type') == 'comment':
+            if not print_comment(child, depth + 1, counter):
+                return False
+
+    return True
+
+children = data.get('children', [])
+shown = 0
+for child in children:
+    if child.get('type') != 'comment':
+        continue
+    if shown >= MAX_COMMENTS:
+        remaining = sum(1 for c in children[shown:] if c.get('type') == 'comment')
+        print(f'... ({remaining} more top-level comments)')
+        break
+    print_comment(child, counter=[shown])
+    shown += 1
+"
+}
+
+# --- top ---
+do_top() {
+    local type="top" count=15
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --type) type="$2"; shift 2 ;;
+            -n) count="$2"; shift 2 ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    local endpoint="${type}stories"
+
+    # Fetch IDs, then fetch details for top N
+    curl -s "${HN_API}/${endpoint}.json" | $PYTHON -c "
+import json, sys, urllib.request, concurrent.futures
+
+ids = json.load(sys.stdin)[:$count]
+
+def fetch_item(item_id):
+    url = f'https://hacker-news.firebaseio.com/v0/item/{item_id}.json'
+    with urllib.request.urlopen(url) as resp:
+        return json.loads(resp.read())
+
+# Fetch in parallel
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+    items = list(pool.map(fetch_item, ids))
+
+for i, item in enumerate(items, 1):
+    if not item:
+        continue
+    title = item.get('title', '?')
+    points = item.get('score', 0)
+    author = item.get('by', '?')
+    comments = item.get('descendants', 0)
+    url = item.get('url', '')
+    hn_id = item.get('id', '')
+
+    print(f'[{i}] [{points} pts] {title}')
+    print(f'    u/{author} | {comments} comments')
+    print(f'    HN: https://news.ycombinator.com/item?id={hn_id}')
+    if url:
+        print(f'    Link: {url}')
+    print()
+"
+}
+
+case "$SUBCMD" in
+    search)   do_search "$@" ;;
+    read)     do_read "$@" ;;
+    top)      do_top "$@" ;;
+    *)        echo "Unknown subcommand: $SUBCMD" >&2; usage ;;
+esac

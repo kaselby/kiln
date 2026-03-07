@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# ---
+# name: fetch
+# description: Fetch a web page as readable text. The default tool for reading web content — use instead of WebFetch when you need actual text (code, quotes, technical details). Automatically falls back to headless Chrome for JS-rendered pages. Use WebFetch only when you want a quick AI summary, not the real content
+# arguments: "<url> [output-file]"
+# ---
+#
+# Smart page fetcher: tries fast extraction first (trafilatura, ~1-2s),
+# automatically falls back to headless Chrome (~10-15s) if the fast path
+# returns too little content (common with SPAs, React apps, JS-heavy docs).
+#
+# Usage:
+#   fetch https://docs.python.org/3/library/asyncio.html
+#   fetch https://docs.anthropic.com/en/docs/prompt-caching   # SPA — auto Chrome
+#   fetch https://example.com ~/scratch/page.md         # Save to file
+#
+# Options via env vars:
+#   FETCH_MAX_LINES=4000       — max lines to stdout (default: 4000, 0 = no limit)
+#   FETCH_MODE=fast|js|auto    — force a mode (default: auto)
+#   FETCH_JS_TIMEOUT=15        — Chrome timeout in seconds (default: 15)
+#   FETCH_MIN_CHARS=200        — min chars from fast path before falling back (default: 200)
+
+set -euo pipefail
+
+CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+VENV="${AGENT_HOME:?}/venv/bin/python3"
+
+if [ $# -eq 0 ]; then
+    echo "Usage: fetch <url> [output-file]" >&2
+    exit 1
+fi
+
+URL="$1"
+OUTPUT="${2:-}"
+MAX_LINES="${FETCH_MAX_LINES:-4000}"
+MODE="${FETCH_MODE:-auto}"
+JS_TIMEOUT="${FETCH_JS_TIMEOUT:-15}"
+MIN_CHARS="${FETCH_MIN_CHARS:-200}"
+
+# ---- Fast path: trafilatura ----
+fetch_fast() {
+    "$VENV" -c "
+import sys
+import trafilatura
+
+url = sys.argv[1]
+downloaded = trafilatura.fetch_url(url)
+if not downloaded:
+    sys.exit(1)
+
+result = trafilatura.extract(
+    downloaded,
+    output_format='markdown',
+    include_links=True,
+    include_comments=False,
+    include_tables=True,
+    favor_precision=True,
+)
+
+if not result:
+    result = trafilatura.extract(
+        downloaded,
+        output_format='markdown',
+        include_links=True,
+        include_comments=False,
+        include_tables=True,
+        favor_recall=True,
+    )
+
+if not result:
+    sys.exit(1)
+
+print(result)
+" "$URL" 2>/dev/null
+}
+
+# ---- Slow path: Chrome headless ----
+fetch_js() {
+    if [ ! -x "$CHROME" ]; then
+        echo "Error: Chrome not found — cannot render JS pages" >&2
+        return 1
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/fetch-js-XXXXXX.html)
+
+    "$CHROME" \
+        --headless=new \
+        --dump-dom \
+        --no-sandbox \
+        --disable-gpu \
+        --disable-software-rasterizer \
+        --disable-dev-shm-usage \
+        --disable-extensions \
+        --no-first-run \
+        --no-default-browser-check \
+        --virtual-time-budget=10000 \
+        "$URL" > "$tmpfile" 2>/dev/null &
+    local pid=$!
+
+    local elapsed=0
+    while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt "$JS_TIMEOUT" ]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+
+    if [ ! -s "$tmpfile" ]; then
+        rm -f "$tmpfile"
+        return 1
+    fi
+
+    "$VENV" -c "
+import sys
+
+with open(sys.argv[1]) as f:
+    html = f.read()
+
+import trafilatura
+result = trafilatura.extract(
+    html,
+    output_format='markdown',
+    include_links=True,
+    include_comments=False,
+    include_tables=True,
+    favor_precision=True,
+)
+if not result:
+    result = trafilatura.extract(
+        html,
+        output_format='markdown',
+        include_links=True,
+        include_comments=False,
+        include_tables=True,
+        favor_recall=True,
+    )
+
+if result:
+    print(result)
+else:
+    # Fallback: basic text extraction
+    from html.parser import HTMLParser
+    class T(HTMLParser):
+        SKIP = {'script','style','noscript','svg','path','meta','link'}
+        BLOCK = {'p','div','h1','h2','h3','h4','h5','h6','li','tr','br','pre','blockquote'}
+        def __init__(self):
+            super().__init__()
+            self.lines, self.cur, self._s = [], [], 0
+        def handle_starttag(self, tag, a):
+            if tag in self.SKIP: self._s += 1
+            elif tag in self.BLOCK and self.cur: self.lines.append(' '.join(self.cur)); self.cur = []
+        def handle_endtag(self, tag):
+            if tag in self.SKIP: self._s = max(0, self._s-1)
+            elif tag in self.BLOCK and self.cur: self.lines.append(' '.join(self.cur)); self.cur = []
+        def handle_data(self, d):
+            t = d.strip()
+            if self._s == 0 and t: self.cur.append(t)
+    p = T(); p.feed(html)
+    if p.cur: p.lines.append(' '.join(p.cur))
+    out = [l for l in p.lines if len(l) > 3]
+    if out:
+        print('[Note: extracted via fallback parser]', file=sys.stderr)
+        print('\n'.join(out))
+    else:
+        sys.exit(1)
+" "$tmpfile" 2>/dev/null
+    local rc=$?
+    rm -f "$tmpfile"
+    return $rc
+}
+
+# ---- Output handling ----
+output_content() {
+    local content="$1"
+    local source="$2"  # "fast" or "js"
+    local total_lines
+    total_lines=$(echo "$content" | wc -l | tr -d ' ')
+
+    if [ -n "$OUTPUT" ]; then
+        echo "$content" > "$OUTPUT"
+        echo "Saved ${total_lines} lines to ${OUTPUT} (via ${source} path)" >&2
+    else
+        if [ "$MAX_LINES" -gt 0 ] 2>/dev/null && [ "$total_lines" -gt "$MAX_LINES" ]; then
+            echo "$content" | head -n "$MAX_LINES"
+            echo ""
+            echo "--- TRUNCATED (showing ${MAX_LINES} of ${total_lines} lines) ---"
+        else
+            echo "$content"
+        fi
+    fi
+}
+
+# ---- Main logic ----
+case "$MODE" in
+    fast)
+        CONTENT=$(fetch_fast) || { echo "Error: fast extraction failed for $URL" >&2; exit 1; }
+        output_content "$CONTENT" "fast"
+        ;;
+    js)
+        CONTENT=$(fetch_js) || { echo "Error: Chrome extraction failed for $URL" >&2; exit 1; }
+        output_content "$CONTENT" "js"
+        ;;
+    auto)
+        # Try fast path first
+        CONTENT=$(fetch_fast 2>/dev/null) || CONTENT=""
+        CHAR_COUNT=${#CONTENT}
+
+        if [ "$CHAR_COUNT" -ge "$MIN_CHARS" ]; then
+            output_content "$CONTENT" "fast"
+        else
+            # Fast path returned too little — try Chrome
+            if [ "$CHAR_COUNT" -gt 0 ]; then
+                echo "(Fast extraction returned only ${CHAR_COUNT} chars — trying Chrome...)" >&2
+            else
+                echo "(Fast extraction failed — trying Chrome...)" >&2
+            fi
+            CONTENT=$(fetch_js) || {
+                echo "Error: both fast and Chrome extraction failed for $URL" >&2
+                if [ "$CHAR_COUNT" -gt 0 ]; then
+                    echo "Returning partial fast extraction (${CHAR_COUNT} chars):" >&2
+                    output_content "$CONTENT" "fast-partial"
+                    exit 0
+                fi
+                exit 1
+            }
+            output_content "$CONTENT" "js"
+        fi
+        ;;
+    *)
+        echo "Error: unknown mode '$MODE' (use: auto, fast, js)" >&2
+        exit 1
+        ;;
+esac

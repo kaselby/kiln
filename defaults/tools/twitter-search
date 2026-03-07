@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# ---
+# name: twitter-search
+# description: Search tweets semantically via Exa API ($0.01/search) and fetch individual tweets via FxTwitter. Good for what people are saying about a topic; not real-time trending
+# arguments: "<search|fetch> <query-or-url> [options]"
+# ---
+#
+# Subcommands:
+#   search <query> [options]     Semantic search for tweets
+#     -n <count>                 Number of results (default: 10)
+#     --days <N>                 Only tweets from last N days
+#     --contents <text|highlights|none>  Content mode (default: text)
+#
+#   fetch <tweet-url-or-id>      Fetch a single tweet's full text and metadata
+#
+# Cost: search uses Exa API (~$0.01-0.02 per search). fetch is free.
+#
+# Examples:
+#   twitter-search search "Claude agent SDK new features" -n 10 --days 7
+#   twitter-search search "MCP model context protocol" --days 30
+#   twitter-search fetch https://x.com/AnthropicAI/status/1234567890
+
+set -euo pipefail
+
+TOOLS_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+    echo "Usage: twitter-search <search|fetch> <query-or-url> [options]"
+    echo ""
+    echo "  search <query> [-n count] [--days N] [--contents text|highlights|none]"
+    echo "  fetch <tweet-url-or-id>"
+    exit 1
+}
+
+[ $# -eq 0 ] && usage
+
+SUBCMD="$1"; shift
+
+case "$SUBCMD" in
+    search)
+        query="" count=10 days="" contents="text"
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                -n) count="$2"; shift 2 ;;
+                --days) days="$2"; shift 2 ;;
+                --contents) contents="$2"; shift 2 ;;
+                -*) echo "Unknown option: $1" >&2; exit 1 ;;
+                *) query="$1"; shift ;;
+            esac
+        done
+        [ -z "$query" ] && { echo "Error: search query required" >&2; exit 1; }
+
+        # Build exa args
+        args=("$query" --category tweet --num_results "$count" --contents "$contents")
+        [ -n "$days" ] && {
+            start_date=$(${AGENT_HOME:?}/venv/bin/python3 -c "
+from datetime import datetime, timedelta
+d = datetime.now() - timedelta(days=$days)
+print(d.strftime('%Y-%m-%d'))
+")
+            args+=(--start_date "$start_date")
+        }
+
+        "$TOOLS_DIR/bin/exa" "${args[@]}"
+        ;;
+
+    fetch)
+        [ $# -eq 0 ] && { echo "Error: tweet URL or ID required" >&2; exit 1; }
+        "$TOOLS_DIR/fetch-tweet" "$1"
+        ;;
+
+    *)
+        echo "Unknown subcommand: $SUBCMD" >&2
+        usage
+        ;;
+esac

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# ---
+# name: fetch-tweet
+# description: Fetch tweet text and metadata via FxTwitter API (no auth required)
+# arguments: "<tweet-url-or-id>"
+# ---
+#
+# Accepts:
+#   - Full URL: https://x.com/user/status/1234567890
+#   - Full URL: https://twitter.com/user/status/1234567890
+#   - Just the ID: 1234567890
+#
+# Returns the tweet text, author, timestamp, and engagement stats.
+# Also shows quoted tweet if present.
+
+set -euo pipefail
+
+if [ $# -eq 0 ]; then
+    echo "Usage: fetch-tweet <tweet-url-or-id>" >&2
+    exit 1
+fi
+
+INPUT="$1"
+
+# Extract tweet ID from URL or use directly
+if [[ "$INPUT" =~ status/([0-9]+) ]]; then
+    TWEET_ID="${BASH_REMATCH[1]}"
+elif [[ "$INPUT" =~ ^[0-9]+$ ]]; then
+    TWEET_ID="$INPUT"
+else
+    echo "Error: couldn't parse tweet ID from: $INPUT" >&2
+    echo "Expected a tweet URL or numeric ID" >&2
+    exit 1
+fi
+
+# Fetch via FxTwitter API (no auth needed) and parse in one step
+curl -s "https://api.fxtwitter.com/x/status/${TWEET_ID}" | python3 -c "
+import sys, json
+from datetime import datetime
+
+data = json.load(sys.stdin)
+
+if data.get('code', 200) != 200:
+    print(f\"Error ({data.get('code')}): {data.get('message', 'Unknown error')}\", file=sys.stderr)
+    sys.exit(1)
+
+tweet = data.get('tweet', {})
+author = tweet.get('author', {})
+
+name = author.get('name', '?')
+handle = author.get('screen_name', '?')
+text = tweet.get('text', '(no text)')
+created = tweet.get('created_at', '')
+likes = tweet.get('likes', 0)
+retweets = tweet.get('retweets', 0)
+replies = tweet.get('replies', 0)
+views = tweet.get('views', 0)
+url = tweet.get('url', '')
+
+try:
+    dt = datetime.strptime(created, '%a %b %d %H:%M:%S %z %Y')
+    ts = dt.strftime('%Y-%m-%d %H:%M UTC')
+except:
+    ts = created
+
+print(f'@{handle} ({name})')
+print(f'{ts}')
+print()
+print(text)
+print()
+print(f'Likes: {likes:,}  Retweets: {retweets:,}  Replies: {replies:,}  Views: {views:,}')
+if url:
+    print(f'URL: {url}')
+
+# Show quoted tweet if present
+quote = tweet.get('quote')
+if quote:
+    q_author = quote.get('author', {})
+    q_handle = q_author.get('screen_name', '?')
+    q_name = q_author.get('name', '?')
+    q_text = quote.get('text', '')
+    print()
+    print(f'  Quoting @{q_handle} ({q_name}):')
+    for line in q_text.split('\n'):
+        print(f'  > {line}')
+"

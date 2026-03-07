@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Web search via Tavily API.
+# Usage: tavily <query> [--search_depth basic|advanced] [--max_results N] [--topic general|news|finance]
+#        [--include_answer true] [--time_range day|week|month|year]
+exec ${AGENT_HOME:?}/venv/bin/python3 ${AGENT_HOME:?}/tools/lib/runner.py tavily "$@"

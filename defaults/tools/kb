@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+# ---
+# name: kb
+# description: Query and manage the Knowledge Base (Obsidian vault)
+# arguments: "<list|search|read|write|index|tag> [options]"
+# ---
+#
+# Usage:
+#   kb list                          List all topic folders with file counts
+#   kb list <topic>                  Show index for a topic folder
+#   kb search <query>               Grep across all Knowledge files
+#   kb search --tag <tag> [query]   Filter by frontmatter tag, optionally with text query
+#   kb read <topic/file>            Read a knowledge file
+#   kb write <topic> <filename> <title> [--tag t1,t2]  Create a new note with frontmatter
+#   kb index                        Generate compact index for context injection (aleph-tagged files)
+#   kb tag <add|remove> <topic/file> <tag>  Add or remove a tag from a file's frontmatter
+
+import os
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+KB_ROOT = Path(os.environ.get(
+    "KB_ROOT",
+    os.path.expanduser("~/Documents/Obsidian Vault/Knowledge")
+))
+
+AGENT_HOME = Path(os.environ.get("AGENT_HOME", os.path.expanduser("~/.agent")))
+
+
+def parse_frontmatter(filepath: Path) -> dict | None:
+    """Parse YAML frontmatter from a markdown file. Returns dict or None."""
+    try:
+        text = filepath.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    if not text.startswith("---"):
+        return None
+
+    end = text.find("---", 3)
+    if end == -1:
+        return None
+
+    # Simple YAML parsing for our limited frontmatter format
+    # Avoids importing yaml (not always available)
+    fm = {}
+    for line in text[3:end].strip().split("\n"):
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+
+        # Parse YAML arrays: [tag1, tag2]
+        if value.startswith("[") and value.endswith("]"):
+            items = [item.strip().strip("'\"") for item in value[1:-1].split(",")]
+            fm[key] = [i for i in items if i]
+        else:
+            fm[key] = value.strip("'\"")
+
+    return fm
+
+
+def get_title(filepath: Path) -> str:
+    """Extract the first heading from a markdown file."""
+    try:
+        for line in filepath.open():
+            line = line.strip()
+            if line.startswith("# "):
+                return line[2:].strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+    return filepath.stem
+
+
+def cmd_list(args: list) -> None:
+    """List topics or files in a topic."""
+    if not KB_ROOT.exists():
+        print(f"Error: Knowledge base not found at {KB_ROOT}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args:
+        # List all topic folders
+        topics = sorted(d for d in KB_ROOT.iterdir() if d.is_dir())
+        if not topics:
+            print("No topic folders found.")
+            return
+
+        for topic in topics:
+            files = list(topic.glob("*.md"))
+            # Don't count _index.md and _conventions.md
+            content_files = [f for f in files if not f.name.startswith("_")]
+            print(f"  {topic.name}/ ({len(content_files)} files)")
+
+            # If there's an _index.md, show a brief summary
+            index = topic / "_index.md"
+            if index.exists():
+                # Extract the overview line (first non-heading, non-empty line after heading)
+                for line in index.read_text().split("\n"):
+                    line = line.strip()
+                    if line and not line.startswith("#") and not line.startswith("---") and not line.startswith("tags:") and not line.startswith("created:") and not line.startswith("updated:"):
+                        print(f"    {line[:80]}")
+                        break
+        return
+
+    # List files in a specific topic
+    topic = args[0].rstrip("/")
+    topic_dir = KB_ROOT / topic
+
+    if not topic_dir.exists():
+        print(f"Error: topic '{topic}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # If there's an index, show it
+    index = topic_dir / "_index.md"
+    if index.exists():
+        print(index.read_text())
+        return
+
+    # Otherwise, list files with titles
+    for f in sorted(topic_dir.glob("*.md")):
+        if f.name.startswith("_"):
+            continue
+        title = get_title(f)
+        fm = parse_frontmatter(f)
+        tags = ""
+        if fm and "tags" in fm:
+            tags = f"  [{', '.join(fm['tags'])}]"
+        print(f"  {f.name} — {title}{tags}")
+
+
+def cmd_search(args: list) -> None:
+    """Search across knowledge files by text and/or tag."""
+    tag_filter = None
+    query_terms = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--tag" and i + 1 < len(args):
+            tag_filter = args[i + 1]
+            i += 2
+        else:
+            query_terms.append(args[i])
+            i += 1
+
+    query = " ".join(query_terms) if query_terms else None
+
+    if not tag_filter and not query:
+        print("Error: provide a search query and/or --tag filter", file=sys.stderr)
+        sys.exit(1)
+
+    results = []
+    for md_file in sorted(KB_ROOT.rglob("*.md")):
+        if md_file.name.startswith("_"):
+            continue
+
+        fm = parse_frontmatter(md_file)
+
+        # Tag filter
+        if tag_filter:
+            if not fm or "tags" not in fm:
+                continue
+            if tag_filter not in fm["tags"]:
+                continue
+
+        # Text search
+        if query:
+            try:
+                content = md_file.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            if query.lower() not in content.lower():
+                continue
+
+            # Find matching lines for context
+            matches = []
+            for line_num, line in enumerate(content.split("\n"), 1):
+                if query.lower() in line.lower():
+                    matches.append((line_num, line.strip()))
+
+            rel_path = md_file.relative_to(KB_ROOT)
+            title = get_title(md_file)
+            results.append((rel_path, title, matches))
+        else:
+            # Tag-only search — just list matching files
+            rel_path = md_file.relative_to(KB_ROOT)
+            title = get_title(md_file)
+            results.append((rel_path, title, []))
+
+    if not results:
+        print("No results found.")
+        return
+
+    for rel_path, title, matches in results:
+        # Show description if available
+        fm = parse_frontmatter(KB_ROOT / rel_path)
+        desc = f" — {fm['description']}" if fm and "description" in fm else ""
+        print(f"\n  {rel_path} — {title}{desc}")
+        if matches:
+            for line_num, line in matches[:3]:  # Show up to 3 matches per file
+                # Truncate long lines
+                display = line[:120] + "..." if len(line) > 120 else line
+                print(f"    L{line_num}: {display}")
+            if len(matches) > 3:
+                print(f"    ... and {len(matches) - 3} more matches")
+
+    print(f"\n{len(results)} file(s) found.")
+
+
+def cmd_read(args: list) -> None:
+    """Read a knowledge file."""
+    if not args:
+        print("Error: specify a file path (e.g., 'claude-sdk/hooks.md')", file=sys.stderr)
+        sys.exit(1)
+
+    filepath = KB_ROOT / args[0]
+
+    # Try with .md extension if not specified
+    if not filepath.exists() and not filepath.suffix:
+        filepath = filepath.with_suffix(".md")
+
+    if not filepath.exists():
+        print(f"Error: file not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    print(filepath.read_text())
+
+
+def cmd_write(args: list) -> None:
+    """Create a new knowledge file with proper frontmatter."""
+    # Parse args: topic filename title [--tag t1,t2]
+    tags_extra = []
+    positional = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--tag" and i + 1 < len(args):
+            tags_extra = [t.strip() for t in args[i + 1].split(",")]
+            i += 2
+        else:
+            positional.append(args[i])
+            i += 1
+
+    if len(positional) < 3:
+        print("Error: usage: kb write <topic> <filename> <title> [--tag t1,t2]", file=sys.stderr)
+        sys.exit(1)
+
+    topic, filename, title = positional[0], positional[1], " ".join(positional[2:])
+
+    # Ensure .md extension
+    if not filename.endswith(".md"):
+        filename += ".md"
+
+    topic_dir = KB_ROOT / topic
+    if not topic_dir.exists():
+        print(f"Error: topic folder '{topic}' does not exist", file=sys.stderr)
+        sys.exit(1)
+
+    filepath = topic_dir / filename
+    if filepath.exists():
+        print(f"Error: file already exists: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    # Build tags
+    tags = [topic]
+    tags.extend(tags_extra)
+    tags_str = ", ".join(tags)
+
+    today = date.today().isoformat()
+
+    content = f"""---
+created: {today}
+updated: {today}
+tags: [{tags_str}]
+---
+
+# {title}
+
+"""
+
+    filepath.write_text(content)
+    print(f"Created: {filepath}")
+
+    # Update _index.md if it exists
+    index_path = topic_dir / "_index.md"
+    if index_path.exists():
+        index_content = index_path.read_text()
+        # Append entry to the Notes section
+        entry = f"- [[{filename[:-3]}]] -- (new)\n"
+        if "## Notes" in index_content:
+            index_content = index_content.rstrip() + "\n" + entry
+        else:
+            index_content = index_content.rstrip() + "\n\n## Notes\n\n" + entry
+
+        index_path.write_text(index_content)
+        # Update the 'updated' date in index frontmatter
+        print(f"Updated: {index_path}")
+
+
+def cmd_index(args: list) -> None:
+    """Generate compact index of aleph-tagged files for context injection."""
+    topics = {}
+
+    for md_file in sorted(KB_ROOT.rglob("*.md")):
+        if md_file.name.startswith("_"):
+            continue
+
+        fm = parse_frontmatter(md_file)
+        if not fm or "tags" not in fm:
+            continue
+
+        if "aleph" not in fm["tags"]:
+            continue
+
+        topic = md_file.parent.name
+        if topic not in topics:
+            topics[topic] = 0
+        topics[topic] += 1
+
+    if not topics:
+        print("No aleph-tagged files found. Tag files with 'aleph' to include them in the index.")
+        return
+
+    # Generate compact index using folder descriptions from _index.md
+    lines = [
+        f"## Knowledge Base -- {KB_ROOT}",
+        f"Use `kb list <topic>` to see files, `kb read <topic/file>` to read, `kb search <query>` to search.",
+        "",
+    ]
+
+    for topic in sorted(topics.keys()):
+        count = topics[topic]
+        # Get folder description from _index.md
+        index_file = KB_ROOT / topic / "_index.md"
+        folder_desc = ""
+        if index_file.exists():
+            fm = parse_frontmatter(index_file)
+            if fm and "description" in fm:
+                folder_desc = fm["description"]
+        if not folder_desc:
+            folder_desc = topic
+        lines.append(f"- **{topic}/** ({count}) -- {folder_desc}")
+
+    index_text = "\n".join(lines) + "\n"
+
+    # Write to core.md-adjacent file for injection
+    output_path = AGENT_HOME / "memory" / "knowledge-index.md"
+    output_path.write_text(index_text)
+
+    print(index_text)
+    print(f"Written to: {output_path}")
+    print(f"\nNote: Add this file to your context injection config to see it every session.")
+
+
+def cmd_tag(args: list) -> None:
+    """Add or remove a tag from a file's frontmatter."""
+    if len(args) < 3:
+        print("Error: usage: kb tag <add|remove> <topic/file> <tag>", file=sys.stderr)
+        sys.exit(1)
+
+    action, filepath_str, tag = args[0], args[1], args[2]
+
+    if action not in ("add", "remove"):
+        print(f"Error: action must be 'add' or 'remove', got '{action}'", file=sys.stderr)
+        sys.exit(1)
+
+    filepath = KB_ROOT / filepath_str
+    if not filepath.exists() and not filepath.suffix:
+        filepath = filepath.with_suffix(".md")
+
+    if not filepath.exists():
+        print(f"Error: file not found: {filepath}", file=sys.stderr)
+        sys.exit(1)
+
+    content = filepath.read_text()
+
+    if not content.startswith("---"):
+        print(f"Error: file has no frontmatter", file=sys.stderr)
+        sys.exit(1)
+
+    end = content.find("---", 3)
+    if end == -1:
+        print(f"Error: malformed frontmatter", file=sys.stderr)
+        sys.exit(1)
+
+    fm_text = content[3:end]
+    body = content[end:]
+
+    # Find and modify the tags line
+    new_lines = []
+    tags_found = False
+    for line in fm_text.split("\n"):
+        if line.strip().startswith("tags:"):
+            tags_found = True
+            # Parse current tags
+            match = re.search(r'\[([^\]]*)\]', line)
+            if match:
+                current_tags = [t.strip() for t in match.group(1).split(",") if t.strip()]
+            else:
+                current_tags = []
+
+            if action == "add":
+                if tag not in current_tags:
+                    current_tags.append(tag)
+                    print(f"Added tag '{tag}' to {filepath_str}")
+                else:
+                    print(f"Tag '{tag}' already present")
+            elif action == "remove":
+                if tag in current_tags:
+                    current_tags.remove(tag)
+                    print(f"Removed tag '{tag}' from {filepath_str}")
+                else:
+                    print(f"Tag '{tag}' not found")
+
+            new_lines.append(f"tags: [{', '.join(current_tags)}]")
+        else:
+            new_lines.append(line)
+
+    if not tags_found:
+        if action == "add":
+            new_lines.insert(-1, f"tags: [{tag}]")  # Before the last empty line
+            print(f"Added tag '{tag}' to {filepath_str}")
+        else:
+            print("No tags field found in frontmatter")
+            return
+
+    filepath.write_text("---" + "\n".join(new_lines) + body)
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "search": cmd_search,
+    "read": cmd_read,
+    "write": cmd_write,
+    "index": cmd_index,
+    "tag": cmd_tag,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: kb <list|search|read|write|index|tag> [options]")
+        print()
+        print(f"Knowledge base: {KB_ROOT}")
+        print()
+        print("Commands:")
+        print("  list [topic]                              List topics or files in a topic")
+        print("  search <query>                            Text search across all files")
+        print("  search --tag <tag> [query]                Filter by tag, optionally with text")
+        print("  read <topic/file>                         Read a knowledge file")
+        print("  write <topic> <filename> <title> [--tag]  Create new note with frontmatter")
+        print("  index                                     Generate context index (aleph-tagged)")
+        print("  tag <add|remove> <topic/file> <tag>       Modify file tags")
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        print(f"Error: unknown command '{cmd}'", file=sys.stderr)
+        sys.exit(1)
+
+    COMMANDS[cmd](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

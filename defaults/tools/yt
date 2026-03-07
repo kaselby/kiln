@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# ---
+# name: yt
+# description: Extract YouTube video transcripts as readable text. Invaluable for research — conference talks, podcasts, tutorials, interviews. Supports timestamps, paragraph grouping, and language selection
+# arguments: "<url-or-video-id> [output-file]"
+# ---
+#
+# Extracts auto-generated or manual transcripts from YouTube videos.
+# Groups text into readable paragraphs by default.
+#
+# Usage:
+#   yt https://www.youtube.com/watch?v=VIDEO_ID
+#   yt https://youtu.be/VIDEO_ID
+#   yt VIDEO_ID
+#   yt VIDEO_ID ~/scratch/talk-notes.md          # Save to file
+#
+# Options via env vars:
+#   YT_TIMESTAMPS=1           — include timestamps (default: 0)
+#   YT_RAW=1                  — raw line-by-line output, no paragraph grouping (default: 0)
+#   YT_LANG=en                — preferred language code (default: en, falls back to any available)
+#   YT_MAX_LINES=0            — max lines to stdout (default: 0 = no limit)
+
+set -euo pipefail
+
+VENV="${AGENT_HOME:?}/venv/bin/python3"
+
+if [ $# -eq 0 ]; then
+    echo "Usage: yt <youtube-url-or-video-id> [output-file]" >&2
+    echo "" >&2
+    echo "Options (env vars):" >&2
+    echo "  YT_TIMESTAMPS=1   Include timestamps" >&2
+    echo "  YT_RAW=1          Raw line-by-line (no paragraph grouping)" >&2
+    echo "  YT_LANG=en        Preferred language" >&2
+    exit 1
+fi
+
+export INPUT="$1"
+OUTPUT="${2:-}"
+export TIMESTAMPS="${YT_TIMESTAMPS:-0}"
+export RAW="${YT_RAW:-0}"
+export LANG_PREF="${YT_LANG:-en}"
+MAX_LINES="${YT_MAX_LINES:-0}"
+
+CONTENT=$("$VENV" << 'PYEOF'
+import sys, re, os, json
+
+input_str = os.environ.get("INPUT", "")
+timestamps = os.environ.get("TIMESTAMPS", "0") == "1"
+raw_mode = os.environ.get("RAW", "0") == "1"
+lang_pref = os.environ.get("LANG_PREF", "en")
+
+# Extract video ID from various URL formats
+video_id = input_str
+patterns = [
+    r'(?:youtube\.com/watch\?.*v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',
+]
+for pattern in patterns:
+    match = re.search(pattern, input_str)
+    if match:
+        video_id = match.group(1)
+        break
+else:
+    # Maybe it's already a video ID
+    if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+        print(f"Error: could not extract video ID from '{input_str}'", file=sys.stderr)
+        sys.exit(1)
+
+from youtube_transcript_api import YouTubeTranscriptApi
+import urllib.request
+
+ytt_api = YouTubeTranscriptApi()
+
+# Fetch video title via oEmbed (lightweight, no extra deps)
+video_title = None
+video_author = None
+try:
+    oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+    oembed_data = json.loads(urllib.request.urlopen(oembed_url, timeout=5).read())
+    video_title = oembed_data.get("title")
+    video_author = oembed_data.get("author_name")
+except Exception:
+    pass
+
+# Try to get transcript
+try:
+    # List available transcripts first
+    transcript_list = ytt_api.list(video_id)
+    
+    # Try preferred language first, then fall back
+    transcript = None
+    try:
+        transcript = transcript_list.find_transcript([lang_pref])
+    except Exception:
+        # Fall back to any available transcript
+        try:
+            # Try generated transcripts
+            generated = [t for t in transcript_list if t.is_generated]
+            manual = [t for t in transcript_list if not t.is_generated]
+            if manual:
+                transcript = manual[0]
+            elif generated:
+                transcript = generated[0]
+        except Exception:
+            pass
+    
+    if transcript is None:
+        print("Error: no transcript available for this video", file=sys.stderr)
+        available = []
+        try:
+            for t in transcript_list:
+                available.append(f"  {t.language} ({t.language_code}){' [auto]' if t.is_generated else ''}")
+        except:
+            pass
+        if available:
+            print("Available languages:", file=sys.stderr)
+            for a in available:
+                print(a, file=sys.stderr)
+        sys.exit(1)
+    
+    snippets = transcript.fetch()
+    
+except Exception as e:
+    print(f"Error fetching transcript: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# Format output
+def fmt_time(seconds):
+    """Format seconds as H:MM:SS or M:SS"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+if raw_mode:
+    # Line-by-line output
+    for snippet in snippets:
+        text = snippet.text.replace('\n', ' ').strip()
+        if timestamps:
+            ts = fmt_time(snippet.start)
+            print(f"[{ts}] {text}")
+        else:
+            print(text)
+else:
+    # Paragraph grouping: merge snippets into paragraphs based on pause gaps
+    # A gap > 2 seconds usually indicates a topic/sentence break
+    paragraphs = []
+    current_texts = []
+    current_start = 0
+    last_end = 0
+    
+    for snippet in snippets:
+        text = snippet.text.replace('\n', ' ').strip()
+        if not text or text in ['[Music]', '[♪♪♪]', '[Applause]']:
+            continue
+        
+        gap = snippet.start - last_end if last_end > 0 else 0
+        
+        # Start new paragraph on significant gaps or after ~300 chars
+        total_len = sum(len(t) for t in current_texts)
+        if current_texts and (gap > 2.0 or total_len > 300):
+            para_text = ' '.join(current_texts)
+            paragraphs.append((current_start, para_text))
+            current_texts = []
+            current_start = snippet.start
+        
+        if not current_texts:
+            current_start = snippet.start
+        
+        current_texts.append(text)
+        last_end = snippet.start + snippet.duration
+    
+    # Don't forget the last paragraph
+    if current_texts:
+        paragraphs.append((current_start, ' '.join(current_texts)))
+    
+    # Output
+    for start, text in paragraphs:
+        if timestamps:
+            ts = fmt_time(start)
+            print(f"[{ts}] {text}")
+        else:
+            print(text)
+        print()  # Blank line between paragraphs
+
+# Print metadata to stderr
+title_info = ""
+if video_title:
+    title_info = f"{video_title}"
+    if video_author:
+        title_info += f" — {video_author}"
+    title_info += " | "
+lang_info = f"{transcript.language} ({transcript.language_code})"
+gen_info = " [auto-generated]" if transcript.is_generated else " [manual]"
+duration = snippets[-1].start + snippets[-1].duration if snippets else 0
+print(f"{title_info}Transcript: {lang_info}{gen_info} | {len(snippets)} segments | {fmt_time(duration)} duration", file=sys.stderr)
+PYEOF
+)
+
+RC=$?
+if [ $RC -ne 0 ]; then
+    exit $RC
+fi
+
+TOTAL_LINES=$(echo "$CONTENT" | wc -l | tr -d ' ')
+
+if [ -n "$OUTPUT" ]; then
+    echo "$CONTENT" > "$OUTPUT"
+    echo "Saved ${TOTAL_LINES} lines to ${OUTPUT}" >&2
+else
+    if [ "$MAX_LINES" -gt 0 ] 2>/dev/null && [ "$TOTAL_LINES" -gt "$MAX_LINES" ]; then
+        echo "$CONTENT" | head -n "$MAX_LINES"
+        echo ""
+        echo "--- TRUNCATED (showing ${MAX_LINES} of ${TOTAL_LINES} lines) ---"
+    else
+        echo "$CONTENT"
+    fi
+fi

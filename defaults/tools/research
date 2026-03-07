@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# ---
+# name: research
+# description: Multi-source search across web, Reddit, HN, and Twitter in parallel. Your first tool for any research topic — gives cross-platform landscape in one call. Supports --save to accumulate findings across searches. Costs ~$0.03/run (web+reddit+twitter), less with --skip
+# arguments: "<query> [options]"
+# ---
+#
+# Default sources (run in parallel):
+#   web     — tavily keyword search (articles, docs, papers)
+#   neural  — exa semantic search (conceptually related content, no domain filter)
+#   reddit  — exa filtered to reddit.com (community discussion)
+#
+# Opt-in sources:
+#   --twitter   Add Twitter/X search (exa tweet category, ~$0.01)
+#   --hn        Add Hacker News search (Algolia, free)
+#   --all       Enable all sources
+#
+# Options:
+#   --sub <subreddit>    Also search within a specific subreddit (Reddit API)
+#   --days <N>           Only results from last N days (default: 60)
+#   -n <count>           Results per source (default: 5)
+#   --skip <sources>     Skip default sources: web,neural,reddit
+#   --save <topic>       Append results to ~/scratch/research-<topic>.md
+#
+# Cost: ~$0.03 default (tavily $0.008 + exa×2 $0.02). +$0.01 for --twitter. HN is free.
+#
+# Examples:
+#   research "AI agent framework"
+#   research "quantization inference" --sub LocalLLaMA --days 14
+#   research "Claude MCP protocol" --twitter --hn
+#   research "post-training quantization" --save ptq-research --all
+
+set -euo pipefail
+
+TOOLS_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+query="" sub="" days=60 count=5 skip="" save_topic=""
+opt_twitter=false opt_hn=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --sub) sub="$2"; shift 2 ;;
+        --days) days="$2"; shift 2 ;;
+        -n) count="$2"; shift 2 ;;
+        --skip) skip="$2"; shift 2 ;;
+        --save) save_topic="$2"; shift 2 ;;
+        --twitter|--tw) opt_twitter=true; shift ;;
+        --hn) opt_hn=true; shift ;;
+        --all) opt_twitter=true; opt_hn=true; shift ;;
+        -*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *) query="$1"; shift ;;
+    esac
+done
+
+[ -z "$query" ] && {
+    echo "Usage: research <query> [options]"
+    echo ""
+    echo "Default: web + neural + reddit. Add --twitter --hn --all for more."
+    echo "Options: --sub <sub> --days <N> -n <count> --skip <sources> --save <topic>"
+    exit 1
+}
+
+should_skip() {
+    [[ ",$skip," == *",$1,"* ]]
+}
+
+# Compute start date for exa
+start_date=$(${AGENT_HOME:?}/venv/bin/python3 -c "
+from datetime import datetime, timedelta
+d = datetime.now() - timedelta(days=$days)
+print(d.strftime('%Y-%m-%d'))
+")
+
+# Map tavily time range from days
+tavily_range="month"
+if [ "$days" -le 1 ]; then tavily_range="day"
+elif [ "$days" -le 7 ]; then tavily_range="week"
+elif [ "$days" -le 31 ]; then tavily_range="month"
+else tavily_range="year"
+fi
+
+# Create temp files for parallel output
+tmp_web=$(mktemp)
+tmp_neural=$(mktemp)
+tmp_reddit=$(mktemp)
+tmp_reddit_sub=$(mktemp)
+tmp_hn=$(mktemp)
+tmp_twitter=$(mktemp)
+trap "rm -f $tmp_web $tmp_neural $tmp_reddit $tmp_reddit_sub $tmp_hn $tmp_twitter" EXIT
+
+# ---- Launch searches in parallel ----
+
+# Web: tavily keyword search
+if ! should_skip web; then
+    (
+        echo "## Web"
+        echo ""
+        result=$("$TOOLS_DIR/bin/tavily" "$query" \
+            --max_results "$count" \
+            --time_range "$tavily_range" 2>/dev/null) || result="(Web search failed)"
+        echo "$result"
+        echo ""
+    ) > "$tmp_web" &
+fi
+
+# Neural: exa semantic search (general, no domain filter)
+if ! should_skip neural; then
+    (
+        echo "## Neural"
+        echo ""
+        result=$("$TOOLS_DIR/bin/exa" "$query" \
+            --num_results "$count" \
+            --contents highlights \
+            --start_date "$start_date" 2>/dev/null) || result="(Neural search failed)"
+        echo "$result"
+        echo ""
+    ) > "$tmp_neural" &
+fi
+
+# Reddit: exa filtered to reddit.com
+if ! should_skip reddit; then
+    (
+        echo "## Reddit"
+        echo ""
+        result=$("$TOOLS_DIR/bin/exa" "$query" \
+            --include_domains reddit.com \
+            --num_results "$count" \
+            --contents highlights \
+            --start_date "$start_date" 2>/dev/null) || result="(Reddit search failed)"
+        echo "$result"
+        echo ""
+    ) > "$tmp_reddit" &
+fi
+
+# Subreddit-specific: direct Reddit API (only if --sub specified)
+if [ -n "$sub" ]; then
+    (
+        echo "## r/$sub"
+        echo ""
+        "$TOOLS_DIR/reddit" search "$query" --sub "$sub" --sort relevance --time month -n "$count" 2>/dev/null || echo "(Subreddit search failed)"
+        echo ""
+    ) > "$tmp_reddit_sub" &
+fi
+
+# HN: Algolia (opt-in, free)
+if $opt_hn; then
+    (
+        echo "## Hacker News"
+        echo ""
+        "$TOOLS_DIR/hn" search "$query" --days "$days" -n "$count" 2>/dev/null || echo "(HN search failed)"
+        echo ""
+    ) > "$tmp_hn" &
+fi
+
+# Twitter: exa with tweet category (opt-in)
+if $opt_twitter; then
+    (
+        echo "## Twitter"
+        echo ""
+        result=$("$TOOLS_DIR/twitter-search" search "$query" -n "$count" --days "$days" 2>/dev/null) || result="(Twitter search failed)"
+        echo "$result"
+        echo ""
+    ) > "$tmp_twitter" &
+fi
+
+# Wait for all background jobs
+wait
+
+# ---- Assemble output ----
+sources=""
+should_skip web     || sources="${sources}web, "
+should_skip neural  || sources="${sources}neural, "
+should_skip reddit  || sources="${sources}reddit, "
+[ -n "$sub" ]       && sources="${sources}r/$sub, "
+$opt_hn             && sources="${sources}HN, "
+$opt_twitter        && sources="${sources}twitter, "
+sources="${sources%, }"
+
+HEADER="# Research: \"$query\""$'\n'"Sources: ${sources} | Last $days days | $count per source"$'\n'
+
+# ---- Save to file FIRST (before stdout, so SIGPIPE from pipes doesn't kill the save) ----
+if [ -n "$save_topic" ]; then
+    SAVE_FILE="${AGENT_HOME:?}/scratch/research-${save_topic}.md"
+    TIMESTAMP=$(date "+%Y-%m-%d %H:%M")
+
+    if [ ! -f "$SAVE_FILE" ]; then
+        echo "# Research: ${save_topic}" > "$SAVE_FILE"
+        echo "" >> "$SAVE_FILE"
+    fi
+
+    {
+        echo "---"
+        echo "### Search: \"$query\" ($TIMESTAMP)"
+        echo ""
+        [ -s "$tmp_web" ]        && cat "$tmp_web"
+        [ -s "$tmp_neural" ]     && cat "$tmp_neural"
+        [ -s "$tmp_reddit" ]     && cat "$tmp_reddit"
+        [ -s "$tmp_reddit_sub" ] && cat "$tmp_reddit_sub"
+        [ -s "$tmp_hn" ]         && cat "$tmp_hn"
+        [ -s "$tmp_twitter" ]    && cat "$tmp_twitter"
+    } >> "$SAVE_FILE"
+
+    echo "(Saved to $SAVE_FILE)" >&2
+fi
+
+# ---- Print to stdout ----
+echo "$HEADER"
+[ -s "$tmp_web" ]        && cat "$tmp_web"
+[ -s "$tmp_neural" ]     && cat "$tmp_neural"
+[ -s "$tmp_reddit" ]     && cat "$tmp_reddit"
+[ -s "$tmp_reddit_sub" ] && cat "$tmp_reddit_sub"
+[ -s "$tmp_hn" ]         && cat "$tmp_hn"
+[ -s "$tmp_twitter" ]    && cat "$tmp_twitter"

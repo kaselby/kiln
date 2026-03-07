@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# ---
+# name: reddit
+# description: Search and read Reddit posts/comments. Best within a specific subreddit (--sub); cross-subreddit search is poor — use exa with --include_domains reddit.com instead
+# arguments: "<search|read|comments> [options]"
+# ---
+#
+# Subcommands:
+#   search <query> [options]     Search posts across Reddit or within a subreddit
+#     --sub <subreddit>          Restrict to subreddit (e.g. LocalLLaMA)
+#     --sort <relevance|new|top> Sort order (default: relevance)
+#     --time <day|week|month|year|all>  Time filter (default: month)
+#     -n <count>                 Number of results (default: 10, max: 25)
+#
+#   read <url-or-path>           Read a post and its top comments
+#     -n <count>                 Number of top-level comments (default: 15)
+#
+#   comments <url-or-path>       Read all comments (more verbose than read)
+#     -n <count>                 Number of top-level comments (default: 25)
+#
+# Examples:
+#   reddit search "agent framework" --sub LocalLLaMA --sort top --time month
+#   reddit read "https://reddit.com/r/LocalLLaMA/comments/1rdxfdu/..."
+#   reddit read "/r/LocalLLaMA/comments/1rdxfdu/qwen3535ba3b_is_a_gamechanger"
+#   reddit comments "/r/LocalLLaMA/comments/1rdxfdu/" -n 40
+
+set -euo pipefail
+
+UA="kiln-agent/1.0 (research tool)"
+
+usage() {
+    sed -n '/^# Subcommands:/,/^[^#]/p' "$0" | head -n -1 | sed 's/^# \?//'
+    exit 1
+}
+
+[ $# -eq 0 ] && usage
+
+SUBCMD="$1"; shift
+
+# --- Helper: fetch JSON from Reddit ---
+reddit_fetch() {
+    local url="$1"
+    # Ensure .json suffix
+    url="${url%%/}/"
+    if [[ "$url" != *.json* ]]; then
+        url="${url}.json"
+    fi
+    # Add https if needed
+    if [[ "$url" == /r/* ]]; then
+        url="https://www.reddit.com${url}"
+    fi
+    curl -s -A "$UA" "$url" 2>/dev/null
+}
+
+# --- search ---
+do_search() {
+    local query="" sub="" sort="relevance" time="month" count=10
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sub) sub="$2"; shift 2 ;;
+            --sort) sort="$2"; shift 2 ;;
+            --time) time="$2"; shift 2 ;;
+            -n) count="$2"; shift 2 ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) query="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$query" ] && { echo "Error: search query required" >&2; exit 1; }
+
+    local base_url
+    if [ -n "$sub" ]; then
+        base_url="https://www.reddit.com/r/${sub}/search.json"
+        params="q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$query'))")&restrict_sr=on&sort=${sort}&t=${time}&limit=${count}"
+    else
+        base_url="https://www.reddit.com/search.json"
+        params="q=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$query'))")&sort=${sort}&t=${time}&limit=${count}"
+    fi
+
+    curl -s -A "$UA" "${base_url}?${params}" | ${AGENT_HOME:?}/venv/bin/python3 -c "
+import json, sys, html
+from datetime import datetime, timezone
+
+data = json.load(sys.stdin)
+if 'data' not in data:
+    print('Error: unexpected response', file=sys.stderr)
+    print(json.dumps(data, indent=2)[:500], file=sys.stderr)
+    sys.exit(1)
+
+posts = data['data']['children']
+if not posts:
+    print('No results found.')
+    sys.exit(0)
+
+for i, post in enumerate(posts, 1):
+    d = post['data']
+    score = d.get('score', 0)
+    title = html.unescape(d.get('title', '?'))
+    sub = d.get('subreddit', '?')
+    comments = d.get('num_comments', 0)
+    created = datetime.fromtimestamp(d.get('created_utc', 0), tz=timezone.utc).strftime('%Y-%m-%d')
+    permalink = d.get('permalink', '')
+    selftext = html.unescape(d.get('selftext', ''))
+    url = d.get('url', '')
+
+    print(f'[{i}] [{score} pts] {title}')
+    print(f'    r/{sub} | {comments} comments | {created}')
+    print(f'    https://reddit.com{permalink}')
+    if url and not url.startswith('https://www.reddit.com'):
+        print(f'    Link: {url}')
+    if selftext:
+        # Show first 200 chars of self text
+        preview = selftext[:200].replace('\n', ' ').strip()
+        if len(selftext) > 200:
+            preview += '...'
+        print(f'    {preview}')
+    print()
+"
+}
+
+# --- read / comments ---
+do_read() {
+    local url="" count="${1:-15}" mode="$1"
+    shift || true
+
+    local max_comments=15
+    [ "$mode" = "comments" ] && max_comments=25
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) max_comments="$2"; shift 2 ;;
+            -*) echo "Unknown option: $1" >&2; exit 1 ;;
+            *) url="$1"; shift ;;
+        esac
+    done
+
+    [ -z "$url" ] && { echo "Error: URL or path required" >&2; exit 1; }
+
+    # Normalize URL
+    if [[ "$url" == https://reddit.com/* ]]; then
+        url="${url#https://reddit.com}"
+    elif [[ "$url" == https://www.reddit.com/* ]]; then
+        url="${url#https://www.reddit.com}"
+    elif [[ "$url" == https://old.reddit.com/* ]]; then
+        url="${url#https://old.reddit.com}"
+    fi
+
+    # Ensure it starts with /r/
+    [[ "$url" != /r/* ]] && url="/r/$url"
+
+    reddit_fetch "$url" | ${AGENT_HOME:?}/venv/bin/python3 -c "
+import json, sys, html, textwrap
+from datetime import datetime, timezone
+
+MAX_COMMENTS = $max_comments
+MODE = '$mode'
+
+data = json.load(sys.stdin)
+if not isinstance(data, list) or len(data) < 2:
+    print('Error: unexpected response format', file=sys.stderr)
+    sys.exit(1)
+
+# Post data
+post = data[0]['data']['children'][0]['data']
+title = html.unescape(post.get('title', '?'))
+author = post.get('author', '?')
+score = post.get('score', 0)
+sub = post.get('subreddit', '?')
+num_comments = post.get('num_comments', 0)
+created = datetime.fromtimestamp(post.get('created_utc', 0), tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+selftext = html.unescape(post.get('selftext', ''))
+url = post.get('url', '')
+permalink = post.get('permalink', '')
+
+print(f'# {title}')
+print(f'r/{sub} | u/{author} | {score} pts | {num_comments} comments | {created}')
+print(f'https://reddit.com{permalink}')
+if url and not url.startswith('https://www.reddit.com'):
+    print(f'Link: {url}')
+print()
+if selftext:
+    print(selftext[:3000])
+    if len(selftext) > 3000:
+        print(f'\n... (truncated, {len(selftext)} chars total)')
+    print()
+
+# Comments
+print('---')
+print(f'Top comments (showing up to {MAX_COMMENTS}):')
+print()
+
+def print_comment(comment, depth=0):
+    if not isinstance(comment, dict):
+        return
+    d = comment.get('data', {})
+    if not d.get('body'):
+        return
+    author = d.get('author', '?')
+    score = d.get('score', 0)
+    body = html.unescape(d.get('body', ''))
+
+    indent = '  ' * depth
+    header = f'{indent}**u/{author}** ({score} pts)'
+
+    # In read mode, truncate long comments; in comments mode, show more
+    max_body = 500 if MODE == 'read' else 1500
+    if len(body) > max_body:
+        body = body[:max_body] + '...'
+
+    # Indent body lines
+    lines = body.split('\n')
+    indented = '\n'.join(f'{indent}  {line}' for line in lines)
+
+    print(header)
+    print(indented)
+    print()
+
+    # Recurse into replies (limit depth)
+    max_depth = 2 if MODE == 'read' else 4
+    if depth < max_depth:
+        replies = d.get('replies', '')
+        if isinstance(replies, dict):
+            for child in replies.get('data', {}).get('children', []):
+                if child.get('kind') == 't1':
+                    print_comment(child, depth + 1)
+
+count = 0
+comments = data[1]['data']['children']
+for comment in comments:
+    if comment.get('kind') != 't1':
+        continue
+    if count >= MAX_COMMENTS:
+        remaining = len(comments) - count
+        if remaining > 0:
+            print(f'... ({remaining} more top-level comments)')
+        break
+    print_comment(comment)
+    count += 1
+"
+}
+
+case "$SUBCMD" in
+    search)  do_search "$@" ;;
+    read)    do_read "read" "$@" ;;
+    comments) do_read "comments" "$@" ;;
+    *)       echo "Unknown subcommand: $SUBCMD" >&2; usage ;;
+esac

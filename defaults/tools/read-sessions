@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# ---
+# name: read-sessions
+# description: Read session summaries and output their full contents
+# arguments: "[--since <date>] [--until <date>] [-n <count>] [--all]"
+# ---
+#
+# Usage: read-sessions --since 2026-02-24                 → all from date onward
+#        read-sessions --since 2026-02-24 --until 2026-02-25  → date range
+#        read-sessions -n 5                                → last 5 sessions
+#        read-sessions --all                               → everything
+
+set -euo pipefail
+
+SESSIONS_DIR="${AGENT_HOME:?}/memory/sessions"
+SINCE=""
+UNTIL=""
+COUNT=0
+ALL=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --since) SINCE="$2"; shift 2 ;;
+        --until) UNTIL="$2"; shift 2 ;;
+        -n) COUNT="$2"; shift 2 ;;
+        --all) ALL=true; shift ;;
+        -h|--help)
+            echo "Usage: read-sessions [--since DATE] [--until DATE] [-n COUNT] [--all]"
+            echo ""
+            echo "Output full contents of session summaries, chronological order."
+            echo "Dates are YYYY-MM-DD. Files are matched by filename prefix."
+            exit 0
+            ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [[ ! -d "$SESSIONS_DIR" ]]; then
+    echo "No sessions directory at $SESSIONS_DIR" >&2
+    exit 1
+fi
+
+# Collect and sort files chronologically
+all_files=()
+while IFS= read -r f; do
+    all_files+=("$f")
+done < <(ls "$SESSIONS_DIR"/*.md 2>/dev/null | sort)
+
+if [[ ${#all_files[@]} -eq 0 ]]; then
+    echo "No session summaries found." >&2
+    exit 1
+fi
+
+# Filter by date range (filenames start with YYYY-MM-DD)
+filtered=()
+for f in "${all_files[@]}"; do
+    base="$(basename "$f")"
+    file_date="${base:0:10}"
+
+    if [[ -n "$SINCE" && "$file_date" < "$SINCE" ]]; then
+        continue
+    fi
+    if [[ -n "$UNTIL" && "$file_date" > "$UNTIL" ]]; then
+        continue
+    fi
+    filtered+=("$f")
+done
+
+# Apply count limit (take last N)
+if [[ $COUNT -gt 0 && ${#filtered[@]} -gt $COUNT ]]; then
+    start=$(( ${#filtered[@]} - COUNT ))
+    filtered=("${filtered[@]:$start}")
+fi
+
+if [[ ${#filtered[@]} -eq 0 ]]; then
+    echo "No sessions match the criteria." >&2
+    exit 1
+fi
+
+echo "# Session Summaries (${#filtered[@]} files)"
+echo ""
+
+for f in "${filtered[@]}"; do
+    base="$(basename "$f")"
+    echo "---"
+    echo "## $base"
+    echo ""
+    cat "$f"
+    echo ""
+done

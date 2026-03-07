@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Run any registered tool by name.
+exec ${AGENT_HOME:?}/venv/bin/python3 ${AGENT_HOME:?}/tools/lib/runner.py "$@"

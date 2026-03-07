@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Semantic search via Exa API.
+# Usage: exa <query> [--num_results N] [--type auto|neural|keyword] [--contents highlights|text|none]
+#        [--category "research paper"|news|tweet|company] [--include_domains "a.com,b.com"]
+#        [--start_date YYYY-MM-DD]
+exec ${AGENT_HOME:?}/venv/bin/python3 ${AGENT_HOME:?}/tools/lib/runner.py exa "$@"

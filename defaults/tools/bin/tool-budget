@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# View and manage the paid tool budget.
+exec ${AGENT_HOME:?}/venv/bin/python3 ${AGENT_HOME:?}/tools/lib/budget_cli.py "$@"
