@@ -26,6 +26,7 @@ from .hooks import (
     create_context_warning_hook,
     create_inbox_check_hook,
     create_message_sent_hook,
+    create_plan_nudge_hook,
     create_queued_message_hook,
     create_read_tracking_hook,
     create_skill_context_hook,
@@ -57,9 +58,9 @@ class KilnHarness:
 
     def __init__(self, config: AgentConfig):
         self.config = config
+        base_prefix = config.session_prefix.rstrip("-")
         self.agent_id = config.agent_id or generate_agent_name(
-            prefix=config.session_prefix.rstrip("-"),
-            ephemeral=config.ephemeral,
+            prefix=f"_{base_prefix}" if config.ephemeral else base_prefix,
             worklogs_dir=config.worklogs_path,
         )
         self.session_id: str | None = None
@@ -78,6 +79,7 @@ class KilnHarness:
         self.handoff_text: str | None = None
         self.user_message_queue: list[str] = []
         self.ui_events: list[dict] = []
+        self.show_thinking: bool = True
         self._worklog_path = self._resolve_worklog_path()
 
         # Spawned subagents default to yolo — no human watching
@@ -205,11 +207,13 @@ class KilnHarness:
         )
         message_sent = create_message_sent_hook(self.ui_events)
 
+        plan_nudge = create_plan_nudge_hook(plans_path / f"{self.agent_id}.yml")
+
         hooks = {
             "PostToolUse": [
                 HookMatcher(matcher=None, hooks=[
                     inbox_check, queued_messages, context_warning,
-                    active_agents, usage_log,
+                    active_agents, usage_log, plan_nudge,
                 ]),
                 HookMatcher(matcher="Read", hooks=[read_tracker]),
                 HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker]),
@@ -406,6 +410,14 @@ class KilnHarness:
         dest = dest_dir / f"{today}-{self.agent_id}.jsonl"
         shutil.copy2(source, dest)
         return str(dest)
+
+    def prepare_shutdown(self) -> None:
+        """Called by the TUI when the user initiates shutdown.
+
+        Override in custom harnesses to push session-end prompts
+        onto user_message_queue (e.g. session summary, memory update).
+        The TUI will drain the queue before disconnecting.
+        """
 
     async def stop(self):
         """Disconnect the agent session and clean up resources."""

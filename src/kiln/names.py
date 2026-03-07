@@ -29,13 +29,9 @@ _NOUNS = [
 def generate_agent_name(
     prefix: str = "kiln",
     *,
-    ephemeral: bool = False,
     worklogs_dir: Path | None = None,
 ) -> str:
     """Generate a human-readable agent name like 'aleph-frost-hawk'.
-
-    When ephemeral=True, uses '_{prefix}' (e.g. '_aleph-frost-hawk')
-    to visually distinguish ephemeral workers in tmux list-sessions.
 
     Checks running tmux sessions AND today's worklogs to avoid collisions
     with both active agents and agents that already ran today.
@@ -43,15 +39,16 @@ def generate_agent_name(
     Falls back to hex UUID after 20 attempts.
 
     Args:
-        prefix: Name prefix (e.g. "aleph", "kiln"). Determines both the
-            generated name prefix and the tmux session prefix to check.
-        ephemeral: If True, prepend underscore to prefix.
+        prefix: Name prefix (e.g. "aleph", "_aleph", "kiln"). Used as-is
+            in the generated name. Callers handle any conventions like
+            underscore prefixes for ephemeral agents.
         worklogs_dir: Directory to check for today's worklogs. If None,
             only checks tmux sessions.
     """
-    full_prefix = f"_{prefix}" if ephemeral else prefix
-    # Also check the opposite prefix to avoid aleph-X colliding with _aleph-X
-    other_prefix = f"_{prefix}" if not ephemeral else prefix
+    # Check both prefix and its underscore variant to avoid collisions
+    # (e.g. aleph-frost-hawk shouldn't collide with _aleph-frost-hawk)
+    bare = prefix.lstrip("_")
+    variants = {bare, f"_{bare}"}
 
     # Get running tmux session names for collision check.
     used: set[str] = set()
@@ -63,7 +60,7 @@ def generate_agent_name(
         if result.returncode == 0:
             used = {
                 s for s in result.stdout.strip().splitlines()
-                if s.startswith(f"{full_prefix}-") or s.startswith(f"{other_prefix}-")
+                if any(s.startswith(f"{v}-") for v in variants)
             }
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -79,8 +76,8 @@ def generate_agent_name(
                 used.add(agent_name)
 
     for _ in range(20):
-        name = f"{full_prefix}-{random.choice(_ADJECTIVES)}-{random.choice(_NOUNS)}"
+        name = f"{prefix}-{random.choice(_ADJECTIVES)}-{random.choice(_NOUNS)}"
         if name not in used:
             return name
     # Extremely unlikely fallback
-    return f"{full_prefix}-{uuid.uuid4().hex[:8]}"
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
