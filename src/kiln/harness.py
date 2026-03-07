@@ -38,6 +38,7 @@ from .prompt import (
     build_session_context,
     discover_skills,
     discover_tools,
+    load_tool_docs,
     resolve_model,
 )
 from .registry import lookup_session, register_session
@@ -145,12 +146,18 @@ class KilnHarness:
             extra_lines=extra_lines,
         )
 
+        # Load tool documentation for configured tools
+        tool_docs = load_tool_docs(self.config.tools)
+
         # Load context injection files
         context_parts = []
         for label, content in self.config.load_context_files():
             context_parts.append(f"\n\n---\n## {label}\n\n{content}")
 
-        full_prompt = identity + session_ctx + "".join(context_parts)
+        full_prompt = identity
+        if tool_docs:
+            full_prompt += "\n\n" + tool_docs
+        full_prompt += session_ctx + "".join(context_parts)
 
         # Save/restore system prompt for faithful resume
         prompt_store = self.config.home / "logs" / "system-prompts"
@@ -207,6 +214,7 @@ class KilnHarness:
         )
         message_sent = create_message_sent_hook(self.ui_events)
 
+        plans_path = self.config.plans_path
         plan_nudge = create_plan_nudge_hook(plans_path / f"{self.agent_id}.yml")
 
         hooks = {
@@ -230,6 +238,8 @@ class KilnHarness:
                 get_mode=get_mode,
                 request_permission=request_permission,
                 get_cwd=lambda: self._get_shell_cwd() if self._get_shell_cwd else safe_getcwd(),
+                agent_id=self.agent_id,
+                agent_home=str(self.config.home),
             )
             hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[perm_hook])]
 
@@ -255,7 +265,6 @@ class KilnHarness:
             env["PATH"] = f"{tools_dir}:{base_path}"
 
         # Build MCP server
-        plans_path = self.config.plans_path
         mcp_server, self._shell_cleanup, self._get_shell_cwd = create_mcp_server(
             self.config.inbox_path, self.config.skills_path,
             agent_id=self.agent_id,

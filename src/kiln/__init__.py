@@ -19,6 +19,7 @@ Modules:
 from .config import AgentConfig, load_agent_spec
 from .harness import KilnHarness
 from .names import generate_agent_name
+from .prompt import load_tool_docs
 from .registry import lookup_session, register_session
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "KilnHarness",
     "generate_agent_name",
     "load_agent_spec",
+    "load_tool_docs",
     "lookup_session",
     "register_session",
 ]

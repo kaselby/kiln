@@ -54,6 +54,87 @@ def get_knowledge_cutoff(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool documentation
+# ---------------------------------------------------------------------------
+
+# Built-in tool docs shipped with kiln (for Kiln:: and Base:: tools).
+_KILN_TOOL_DOCS_DIR = Path(__file__).parent / "tool_docs"
+
+# Map tool names to doc filenames. Handles both namespaced ("Kiln::Edit")
+# and bare ("Edit") names. Case-insensitive lookup.
+_TOOL_DOC_NAMES = {
+    "bash": "bash",
+    "read": "read",
+    "write": "write",
+    "edit": "edit",
+    "plan": "plan",
+    "websearch": "websearch",
+    "message": "message",
+    "exit_session": "exit_session",
+    "activate_skill": "activate_skill",
+}
+
+
+def _tool_doc_key(tool_name: str) -> str:
+    """Extract the base tool name from a possibly namespaced name.
+
+    'Kiln::Edit' → 'edit', 'Base::WebSearch' → 'websearch', 'Read' → 'read'
+    """
+    # Strip namespace prefix
+    if "::" in tool_name:
+        tool_name = tool_name.split("::", 1)[1]
+    return tool_name.lower()
+
+
+def load_tool_docs(
+    tool_names: list[str],
+    *,
+    extra_dirs: list[Path] | None = None,
+) -> str:
+    """Load tool documentation for the given tool names.
+
+    Searches kiln's built-in tool_docs/ first, then any extra directories
+    (e.g. an agent's own tool_docs/ for agent-namespaced tools).
+
+    Args:
+        tool_names: List of tool names, possibly namespaced
+            (e.g. ["Kiln::Edit", "Aleph::Bash", "Base::Read"]).
+        extra_dirs: Additional directories to search for tool doc files.
+            Searched after kiln's built-in docs, so agent docs can override.
+
+    Returns:
+        Concatenated tool documentation as a string, suitable for injection
+        into the system prompt. Empty string if no docs found.
+    """
+    search_dirs = [_KILN_TOOL_DOCS_DIR]
+    if extra_dirs:
+        search_dirs.extend(extra_dirs)
+
+    seen = set()
+    docs = []
+
+    for name in tool_names:
+        key = _tool_doc_key(name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Search directories in order — last match wins (agent overrides kiln)
+        doc_content = None
+        for d in search_dirs:
+            doc_file = d / f"{key}.md"
+            if doc_file.exists():
+                doc_content = doc_file.read_text().strip()
+
+        if doc_content:
+            docs.append(doc_content)
+
+    if not docs:
+        return ""
+    return "## Tools\n\n" + "\n\n".join(docs) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Tool and skill discovery
 # ---------------------------------------------------------------------------
 
