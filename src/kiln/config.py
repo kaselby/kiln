@@ -63,7 +63,6 @@ class AgentConfig:
     # Spawning hierarchy
     parent: str | None = None
     depth: int = 0
-    ephemeral: bool = False
     persistent: bool = False
     continuation: bool = False
 
@@ -149,11 +148,6 @@ class AgentConfig:
 
     def load_identity(self) -> str:
         """Load the agent's identity document."""
-        if self.ephemeral:
-            # Ephemeral agents may have a separate lean identity doc
-            ephemeral_path = self.home / "EPHEMERAL.md"
-            if ephemeral_path.exists():
-                return ephemeral_path.read_text()
         path = self.identity_path
         if path.exists():
             return path.read_text()

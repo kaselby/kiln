@@ -61,7 +61,7 @@ class KilnHarness:
         self.config = config
         base_prefix = config.session_prefix.rstrip("-")
         self.agent_id = config.agent_id or generate_agent_name(
-            prefix=f"_{base_prefix}" if config.ephemeral else base_prefix,
+            prefix=base_prefix,
             worklogs_dir=config.worklogs_path,
         )
         self.session_id: str | None = None
@@ -193,7 +193,7 @@ class KilnHarness:
 
         # Shared state
         file_state = FileState()
-        self.session_control = SessionControl(ephemeral=self.config.ephemeral)
+        self.session_control = SessionControl()
 
         # Build infrastructure hooks
         inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events)

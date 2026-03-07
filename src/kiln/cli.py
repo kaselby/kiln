@@ -59,12 +59,8 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--depth", type=int, default=0, help="Spawning depth")
     parser.add_argument(
-        "--ephemeral", action="store_true",
-        help="Ephemeral session: skip handoffs and exit summary",
-    )
-    parser.add_argument(
         "--persistent", action="store_true",
-        help="Persistent peer instance: self-continues, coordinates with canonical",
+        help="Persistent peer instance: self-continues, coordinates with parent",
     )
     parser.add_argument(
         "--continue", dest="continue_session", action="store_true",
@@ -146,8 +142,6 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--prompt-file", args.prompt_file]
     if args.depth:
         cmd_parts += ["--depth", str(args.depth)]
-    if args.ephemeral:
-        cmd_parts.append("--ephemeral")
     if args.persistent:
         cmd_parts.append("--persistent")
     if args.mode:
@@ -174,7 +168,7 @@ def _launch_in_tmux(args: argparse.Namespace, config: AgentConfig, spec_path: Pa
 
     base_prefix = config.session_prefix.rstrip("-")
     agent_id = config.agent_id or generate_agent_name(
-        prefix=f"_{base_prefix}" if config.ephemeral else base_prefix,
+        prefix=base_prefix,
         worklogs_dir=config.worklogs_path,
     )
     inner_cmd = _build_inner_command(args, agent_id, spec_path.resolve())
@@ -264,8 +258,6 @@ def cmd_run(args: argparse.Namespace) -> None:
         config.parent = args.parent
     if args.depth:
         config.depth = args.depth
-    if args.ephemeral:
-        config.ephemeral = True
     if args.persistent:
         config.persistent = True
     if args.continuation:

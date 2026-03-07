@@ -88,8 +88,7 @@ class FileState:
 class SessionControl:
     """Shared state for session lifecycle signals between MCP tools and the TUI."""
 
-    def __init__(self, *, ephemeral: bool = False):
-        self.ephemeral = ephemeral
+    def __init__(self):
         self.quit_requested = False
         self.skip_summary = False
         self.continue_requested = False

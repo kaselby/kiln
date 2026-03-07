@@ -39,9 +39,8 @@ def generate_agent_name(
     Falls back to hex UUID after 20 attempts.
 
     Args:
-        prefix: Name prefix (e.g. "aleph", "_aleph", "kiln"). Used as-is
-            in the generated name. Callers handle any conventions like
-            underscore prefixes for ephemeral agents.
+        prefix: Name prefix (e.g. "aleph", "kiln"). Used as-is
+            in the generated name.
         worklogs_dir: Directory to check for today's worklogs. If None,
             only checks tmux sessions.
     """
