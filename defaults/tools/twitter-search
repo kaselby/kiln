@@ -61,7 +61,7 @@ print(d.strftime('%Y-%m-%d'))
             args+=(--start_date "$start_date")
         }
 
-        "$TOOLS_DIR/bin/exa" "${args[@]}"
+        "$TOOLS_DIR/exa" "${args[@]}"
         ;;
 
     fetch)

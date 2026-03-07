@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# ---
+# name: tavily
+# description: Web search via Tavily API. Has --include_answer for quick AI-synthesized answers and --time_range for recency. Better than exa for quick factual questions; weaker for deep research.
+# arguments: "<query> [--search_depth basic|advanced] [--max_results N] [--topic general|news|finance] [--include_answer true] [--time_range day|week|month|year]"
+# cost: 0.008
+# ---
+"""
+Tavily search API.
+
+Requires TAVILY_API_KEY environment variable (or credentials file).
+Pricing: 1 credit per basic search ($0.008/credit PAYG), 2 credits for advanced.
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+COST_BASIC = 0.008
+COST_ADVANCED = 0.016
+
+# Load credentials from agent home if not in env
+_agent_home = os.environ.get("AGENT_HOME", "")
+if _agent_home:
+    _creds_dir = Path(_agent_home) / "credentials"
+    if _creds_dir.is_dir():
+        for _f in _creds_dir.iterdir():
+            if _f.is_file() and not _f.name.startswith(".") and _f.name not in os.environ:
+                os.environ[_f.name] = _f.read_text().strip()
+
+
+def check_budget(cost):
+    """Check and log budget if budget module is available."""
+    if not _agent_home:
+        return True, None
+    try:
+        sys.path.insert(0, str(Path(_agent_home) / "tools"))
+        from lib import budget
+        allowed, spent, limit, msg = budget.check_budget(cost)
+        if not allowed:
+            print(f"BLOCKED: {msg}", file=sys.stderr)
+            sys.exit(2)
+        if "WARNING" in msg:
+            print(msg, file=sys.stderr)
+        return True, budget
+    except ImportError:
+        return True, None
+
+
+def log_usage(budget_mod, tool_name, cost, params):
+    """Log usage if budget module is available."""
+    if budget_mod:
+        log_params = {k: v for k, v in params.items() if k not in ("api_key",)}
+        budget_mod.log_usage(tool_name, cost, params=log_params)
+
+
+def parse_args(argv):
+    """Parse CLI arguments."""
+    if not argv:
+        print("Usage: tavily <query> [options]", file=sys.stderr)
+        print("Options:", file=sys.stderr)
+        print("  --search_depth basic|advanced  (default basic)", file=sys.stderr)
+        print("  --max_results N                (default 5)", file=sys.stderr)
+        print("  --topic general|news|finance", file=sys.stderr)
+        print("  --include_answer true          Include AI-generated answer", file=sys.stderr)
+        print("  --time_range day|week|month|year", file=sys.stderr)
+        print("  --include_domains d1,d2", file=sys.stderr)
+        print("  --exclude_domains d1,d2", file=sys.stderr)
+        sys.exit(1)
+
+    params = {"query": []}
+    i = 0
+    while i < len(argv):
+        if argv[i].startswith("--") and i + 1 < len(argv):
+            key = argv[i][2:]
+            params[key] = argv[i + 1]
+            i += 2
+        else:
+            params["query"].append(argv[i])
+            i += 1
+    params["query"] = " ".join(params["query"])
+    return params
+
+
+def search(params):
+    """Execute Tavily search."""
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        print("Error: TAVILY_API_KEY not set", file=sys.stderr)
+        sys.exit(1)
+
+    depth = params.get("search_depth", "basic")
+
+    body = {
+        "query": params["query"],
+        "search_depth": depth,
+        "max_results": int(params.get("max_results", 5)),
+        "topic": params.get("topic", "general"),
+        "include_answer": params.get("include_answer", "false").lower() == "true",
+        "include_raw_content": params.get("include_raw_content", "false").lower() == "true",
+    }
+
+    if params.get("time_range"):
+        body["time_range"] = params["time_range"]
+    if params.get("include_domains"):
+        body["include_domains"] = [d.strip() for d in params["include_domains"].split(",")]
+    if params.get("exclude_domains"):
+        body["exclude_domains"] = [d.strip() for d in params["exclude_domains"].split(",")]
+
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "kiln-tools/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        print(f"Tavily API error ({e.code}): {error_body}", file=sys.stderr)
+        sys.exit(1)
+
+    actual_cost = COST_BASIC if depth == "basic" else COST_ADVANCED
+
+    lines = []
+    results = data.get("results", [])
+    lines.append(f"Tavily search: {len(results)} results for \"{params['query']}\"")
+    lines.append(f"Cost: ${actual_cost:.4f}")
+    lines.append("")
+
+    if data.get("answer"):
+        lines.append("Answer:")
+        lines.append(data["answer"])
+        lines.append("")
+
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r.get('title', '(no title)')}")
+        lines.append(f"    {r.get('url', '')}")
+        if r.get("score"):
+            lines.append(f"    Score: {r['score']:.3f}")
+        if r.get("content"):
+            lines.append(f"    {r['content'][:500]}")
+        lines.append("")
+
+    return "\n".join(lines), actual_cost
+
+
+if __name__ == "__main__":
+    params = parse_args(sys.argv[1:])
+    depth = params.get("search_depth", "basic")
+    cost = COST_BASIC if depth == "basic" else COST_ADVANCED
+    allowed, budget_mod = check_budget(cost)
+    output, actual_cost = search(params)
+    log_usage(budget_mod, "tavily", actual_cost, params)
+    print(output)

@@ -85,11 +85,14 @@ def discover_tools(tools_path: Path) -> list[dict]:
             continue
         header = _parse_tool_header(text)
         if header and "name" in header:
-            tools.append({
+            entry = {
                 "name": header["name"],
                 "description": header.get("description", ""),
                 "arguments": header.get("arguments", ""),
-            })
+            }
+            if header.get("cost"):
+                entry["cost"] = header["cost"]
+            tools.append(entry)
 
     # --- Managed tools (definitions/*.py with meta dict) ---
     defs_dir = tools_path / "definitions"

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# ---
+# name: exa
+# description: Semantic search via Exa API. Best for conceptual/related content, domain-filtered search (e.g. reddit.com), and tweet search (--category tweet). Prefer over tavily for research depth.
+# arguments: "<query> [--num_results N] [--type auto|neural|keyword] [--contents highlights|text|none] [--category <cat>] [--include_domains d1,d2] [--start_date YYYY-MM-DD]"
+# cost: 0.01
+# ---
+"""
+Exa semantic search.
+
+Requires EXA_API_KEY environment variable (or credentials file).
+Pricing: ~$0.005 per search + $0.001 per page for content.
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+COST_PER_CALL = 0.01  # conservative estimate
+
+# Load credentials from agent home if not in env
+_agent_home = os.environ.get("AGENT_HOME", "")
+if _agent_home:
+    _creds_dir = Path(_agent_home) / "credentials"
+    if _creds_dir.is_dir():
+        for _f in _creds_dir.iterdir():
+            if _f.is_file() and not _f.name.startswith(".") and _f.name not in os.environ:
+                os.environ[_f.name] = _f.read_text().strip()
+
+
+def check_budget(cost):
+    """Check and log budget if budget module is available."""
+    if not _agent_home:
+        return True, None
+    try:
+        sys.path.insert(0, str(Path(_agent_home) / "tools"))
+        from lib import budget
+        allowed, spent, limit, msg = budget.check_budget(cost)
+        if not allowed:
+            print(f"BLOCKED: {msg}", file=sys.stderr)
+            sys.exit(2)
+        if "WARNING" in msg:
+            print(msg, file=sys.stderr)
+        return True, budget
+    except ImportError:
+        return True, None
+
+
+def log_usage(budget_mod, tool_name, cost, params):
+    """Log usage if budget module is available."""
+    if budget_mod:
+        log_params = {k: v for k, v in params.items() if k not in ("api_key",)}
+        budget_mod.log_usage(tool_name, cost, params=log_params)
+
+
+def parse_args(argv):
+    """Parse CLI arguments."""
+    if not argv:
+        print("Usage: exa <query> [options]", file=sys.stderr)
+        print("Options:", file=sys.stderr)
+        print("  --num_results N          Number of results (1-100, default 5)", file=sys.stderr)
+        print("  --type auto|neural|keyword", file=sys.stderr)
+        print("  --contents highlights|text|none", file=sys.stderr)
+        print("  --category <category>    research paper, news, tweet, company", file=sys.stderr)
+        print("  --include_domains d1,d2", file=sys.stderr)
+        print("  --exclude_domains d1,d2", file=sys.stderr)
+        print("  --start_date YYYY-MM-DD", file=sys.stderr)
+        sys.exit(1)
+
+    params = {"query": []}
+    i = 0
+    while i < len(argv):
+        if argv[i].startswith("--") and i + 1 < len(argv):
+            key = argv[i][2:]
+            params[key] = argv[i + 1]
+            i += 2
+        else:
+            params["query"].append(argv[i])
+            i += 1
+    params["query"] = " ".join(params["query"])
+    return params
+
+
+def search(params):
+    """Execute Exa search."""
+    api_key = os.environ.get("EXA_API_KEY")
+    if not api_key:
+        print("Error: EXA_API_KEY not set", file=sys.stderr)
+        sys.exit(1)
+
+    body = {
+        "query": params["query"],
+        "numResults": int(params.get("num_results", 5)),
+        "type": params.get("type", "auto"),
+    }
+
+    contents_mode = params.get("contents", "highlights")
+    if contents_mode == "highlights":
+        body["contents"] = {"highlights": {"numSentences": 3}}
+    elif contents_mode == "text":
+        body["contents"] = {"text": {"maxCharacters": 2000}}
+
+    if params.get("category"):
+        body["category"] = params["category"]
+    if params.get("include_domains"):
+        body["includeDomains"] = [d.strip() for d in params["include_domains"].split(",")]
+    if params.get("exclude_domains"):
+        body["excludeDomains"] = [d.strip() for d in params["exclude_domains"].split(",")]
+    if params.get("start_date"):
+        body["startPublishedDate"] = params["start_date"] + "T00:00:00.000Z"
+
+    req = urllib.request.Request(
+        "https://api.exa.ai/search",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "User-Agent": "kiln-tools/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        print(f"Exa API error ({e.code}): {error_body}", file=sys.stderr)
+        sys.exit(1)
+
+    actual_cost = COST_PER_CALL
+    if "costDollars" in data:
+        actual_cost = data["costDollars"].get("total", COST_PER_CALL)
+
+    lines = []
+    results = data.get("results", [])
+    lines.append(f"Exa search: {len(results)} results for \"{params['query']}\"")
+    lines.append(f"Cost: ${actual_cost:.4f}")
+    lines.append("")
+
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r.get('title', '(no title)')}")
+        lines.append(f"    {r.get('url', '')}")
+        if r.get("publishedDate"):
+            lines.append(f"    Published: {r['publishedDate'][:10]}")
+        if r.get("highlights"):
+            for h in r["highlights"]:
+                lines.append(f"    > {h.strip()}")
+        elif r.get("text"):
+            lines.append(f"    {r['text'][:500]}")
+        lines.append("")
+
+    return "\n".join(lines), actual_cost
+
+
+if __name__ == "__main__":
+    params = parse_args(sys.argv[1:])
+    allowed, budget_mod = check_budget(COST_PER_CALL)
+    output, actual_cost = search(params)
+    log_usage(budget_mod, "exa", actual_cost, params)
+    print(output)
