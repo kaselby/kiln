@@ -1,0 +1,16 @@
+# Minimal agent spec — a simple coding assistant with no memory or identity
+# kiln init creates something like this
+
+name: assistant
+identity_doc: identity.md
+model: claude-sonnet-4-6
+
+tools:
+  builtin:
+    - Read
+    - WebSearch
+
+hooks:
+  inbox_check: {}
+  context_warning:
+    max_tokens: 200000

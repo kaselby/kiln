@@ -1,0 +1,50 @@
+# Example agent spec for Aleph
+# This would live at ~/.aleph/agent.yml
+
+name: aleph
+identity_doc: ALEPH.md
+model: claude-opus-4-6
+session_prefix: aleph-
+
+tools:
+  builtin:
+    - Read          # for images, PDFs, notebooks
+    - WebSearch
+  mcp_server: harness/tools.py   # Aleph's custom MCP server (extends kiln's)
+  scripts_dir: tools              # shell scripts invokable via Bash
+
+context_injection:
+  - memory/core.md
+  - memory/knowledge-index.md
+  - memory/volatile.md
+
+skills_dir: skills
+worklogs_dir: memory/worklogs
+sessions_dir: memory/sessions
+inbox_dir: inbox
+plans_dir: plans
+
+heartbeat:
+  enabled: true
+  interval: 600    # 10 minutes
+
+hooks:
+  # Infrastructure hooks (from kiln's standard library)
+  inbox_check: {}
+  read_tracking: {}
+  skill_context: {}
+  context_warning:
+    max_tokens: 200000
+  queued_message: {}
+  message_sent: {}
+  active_agents:
+    interval: 15
+
+  # Behavioral hooks (Aleph-specific, also from kiln's library)
+  worklog:
+    interval_minutes: 5
+  autonomous_worklog:
+    interval_calls: 30
+  plan_nudge:
+    interval: 20
+  usage_log: {}
