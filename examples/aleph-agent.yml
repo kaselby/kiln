@@ -1,4 +1,9 @@
 # Example agent spec for Aleph
+#
+# Aleph uses a CUSTOM HARNESS — not kiln's default harness.
+# This spec serves as metadata (for discovery tools like `branches`,
+# `sitrep`, spawning) and as configuration that Aleph's own harness reads.
+#
 # This would live at ~/.aleph/agent.yml
 
 name: aleph
@@ -42,23 +47,7 @@ heartbeat:
   enabled: true
   interval: 600    # 10 minutes
 
-hooks:
-  # Infrastructure hooks (from kiln's standard library)
-  inbox_check: {}
-  read_tracking: {}
-  skill_context: {}
-  context_warning:
-    max_tokens: 200000
-  queued_message: {}
-  message_sent: {}
-  active_agents:
-    interval: 15
-
-  # Behavioral hooks (Aleph-specific, also from kiln's library)
-  worklog:
-    interval_minutes: 5
-  autonomous_worklog:
-    interval_calls: 30
-  plan_nudge:
-    interval: 20
-  usage_log: {}
+# Note: Aleph's hooks (both infrastructure and behavioral) are wired
+# directly in his custom harness. Infrastructure hooks are imported from
+# kiln.hooks; behavioral hooks (worklog, plan nudge, etc.) are Aleph's
+# own code. No hook configuration needed in the spec.

@@ -1,5 +1,5 @@
 # Minimal agent spec — a simple coding assistant
-# Uses kiln defaults for everything except identity
+# Uses kiln's default harness. No custom code needed.
 
 name: assistant
 identity_doc: identity.md
@@ -14,8 +14,3 @@ model: claude-sonnet-4-6
 #   - Kiln::Read
 #   - Kiln::Write
 #   - Kiln::Edit
-
-hooks:
-  inbox_check: {}
-  context_warning:
-    max_tokens: 200000

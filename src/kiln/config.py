@@ -95,13 +95,11 @@ class AgentConfig:
     worklogs_dir: str = "memory/worklogs"   # relative to home
     sessions_dir: str = "memory/sessions"   # relative to home
 
-    # Hooks — which standard library hooks to enable and their config.
-    # Keys are hook names, values are parameter dicts.
-    # Example: {"worklog": {"interval_minutes": 5}, "plan_nudge": {"interval": 20}}
+    # Hooks — agent-defined configuration for hook behavior.
+    # The default harness reads this to configure infrastructure hooks.
+    # Custom harnesses may read it, extend it, or ignore it entirely.
+    # Keys and values are agent-defined — kiln imposes no schema.
     hooks: dict[str, dict] = field(default_factory=dict)
-
-    # Agent-provided hook modules — paths relative to home
-    custom_hooks: list[str] = field(default_factory=list)
 
     # Tmux session prefix for agent naming
     session_prefix: str = "kiln-"
@@ -261,8 +259,6 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
     # Hooks
     if "hooks" in raw:
         config.hooks = raw["hooks"]
-    if "custom_hooks" in raw:
-        config.custom_hooks = raw["custom_hooks"]
 
     # Heartbeat
     if "heartbeat" in raw:
