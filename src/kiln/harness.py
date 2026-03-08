@@ -159,16 +159,11 @@ class KilnHarness:
             full_prompt += "\n\n" + tool_docs
         full_prompt += session_ctx + "".join(context_parts)
 
-        # Save/restore system prompt for faithful resume
+        # Save system prompt for debugging. Do NOT restore on resume — a stale
+        # system prompt can embed outdated role/context that misleads the model.
         prompt_store = self.config.home / "logs" / "system-prompts"
         prompt_store.mkdir(parents=True, exist_ok=True)
-        is_resuming = self.config.continue_session or self.config.resume_session
-        if is_resuming:
-            saved = prompt_store / f"{self.config.resume_session or self.agent_id}.txt"
-            if saved.exists():
-                full_prompt = saved.read_text()
-        else:
-            (prompt_store / f"{self.agent_id}.txt").write_text(full_prompt)
+        (prompt_store / f"{self.agent_id}.txt").write_text(full_prompt)
 
         # Set up inbox
         inbox = self.config.agent_inbox(self.agent_id)
@@ -275,7 +270,8 @@ class KilnHarness:
         )
         mcp_servers = {"kiln": mcp_server}
 
-        # Resolve resume
+        # Resolve conversation continuity — prefer agent-specific UUID over
+        # cwd-global --continue, which can pick up a different agent's conversation.
         resume_uuid = None
         if self.config.resume_session:
             entry = lookup_session(self._registry_path, self.config.resume_session)
@@ -283,9 +279,20 @@ class KilnHarness:
                 raise RuntimeError(
                     f"Cannot resume: no session found for '{self.config.resume_session}'."
                 )
-            resume_uuid = entry["session_uuid"]
+            resume_uuid = entry.get("session_uuid")
+            if not resume_uuid:
+                raise RuntimeError(
+                    f"Cannot resume: no session UUID recorded for '{self.config.resume_session}'. "
+                    f"The session may have exited before completing its first turn."
+                )
             if entry.get("cwd"):
                 cwd = entry["cwd"]
+        elif self.config.continue_session:
+            entry = lookup_session(self._registry_path, self.agent_id)
+            if entry:
+                resume_uuid = entry.get("session_uuid")
+                if entry.get("cwd"):
+                    cwd = entry["cwd"]
 
         # Stderr logging
         log_dir = self.config.home / "logs"
@@ -308,7 +315,7 @@ class KilnHarness:
             env=env,
             permission_mode="bypassPermissions",
             include_partial_messages=True,
-            continue_conversation=self.config.continue_session,
+            continue_conversation=self.config.continue_session and not resume_uuid,
             resume=resume_uuid,
             stderr=_stderr_callback,
         )
