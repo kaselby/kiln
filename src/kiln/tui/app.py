@@ -1239,13 +1239,22 @@ class KilnApp:
     def _check_heartbeat_file(self) -> None:
         """Read heartbeat config from per-agent state file.
 
-        Checks state/heartbeat-{agent_id} first, falls back to the shared
-        state/heartbeat for backward compatibility (e.g. manual writes before
-        the per-agent fix).
+        Checks state/heartbeat-{agent_id} first. Only falls back to the shared
+        state/heartbeat if heartbeat was already enabled (e.g. canonical/persistent
+        sessions). Without this guard, the shared file would enable heartbeat on
+        every agent — including ephemeral ones that shouldn't have it.
         """
         per_agent = self._heartbeat_file()
-        shared = self._harness.config.home / "state" / "heartbeat"
-        hb_file = per_agent if per_agent.exists() else shared
+        if per_agent.exists():
+            hb_file = per_agent
+        elif self._heartbeat_enabled:
+            # Only read the shared file if heartbeat is already on —
+            # don't let a stale shared file activate heartbeat on agents
+            # that weren't configured for it.
+            shared = self._harness.config.home / "state" / "heartbeat"
+            hb_file = shared
+        else:
+            return
         try:
             if not hb_file.exists():
                 return
