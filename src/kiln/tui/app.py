@@ -484,6 +484,7 @@ class KilnApp:
         else:
             self._perm_mode = PermissionMode.DEFAULT
         self._pending_permission: PermissionRequest | None = None
+        self._mode_override_dir = self._harness.config.home / "control"
         self._app: Application | None = None
 
         # Idle message delivery
@@ -1144,6 +1145,8 @@ class KilnApp:
         while True:
             await asyncio.sleep(1.0)
             try:
+                # Check for external mode overrides (e.g. from Discord relay)
+                self._check_mode_override()
                 if not self._should_deliver(inbox):
                     continue
                 msg = self._next_unread_message(inbox)
@@ -1453,8 +1456,33 @@ class KilnApp:
 
     # ---- Permissions ----
 
+
+    def _check_mode_override(self) -> None:
+        """Check for external mode override file (e.g. from Discord relay).
+
+        Override files are written to <home>/control/<agent-id>.mode and
+        contain a single mode name (yolo, default, safe). Consumed on read.
+        """
+        try:
+            override_file = self._mode_override_dir / f"{self._harness.agent_id}.mode"
+            if override_file.exists():
+                mode_str = override_file.read_text().strip().lower()
+                new_mode = PermissionMode(mode_str)
+                override_file.unlink()
+                if new_mode != self._perm_mode:
+                    self._perm_mode = new_mode
+                    _tprint("<dim>Mode changed to {} (external override)</dim>", mode_str)
+                    if self._app:
+                        self._app.invalidate()
+        except (ValueError, OSError):
+            pass
+
     async def _request_permission(self, req: PermissionRequest) -> bool:
-        """Display diff/preview and wait for user y/n decision."""
+        """Display diff/preview and wait for user y/n decision.
+
+        Polls for external mode overrides every 2s so that a remote mode
+        change (e.g. via Discord) can unblock a pending permission request.
+        """
         self._commit_stream()
         self._commit_thinking()
 
@@ -1465,11 +1493,24 @@ class KilnApp:
             self._app.invalidate()
 
         try:
-            await asyncio.wait_for(req.event.wait(), timeout=300)
-        except asyncio.TimeoutError:
-            req.timed_out = True
-            req.decide(False)
-            _tprint("<dim>Permission request timed out (5 min). Auto-rejected.</dim>")
+            deadline = asyncio.get_event_loop().time() + 300
+            while not req.event.is_set():
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    req.timed_out = True
+                    req.decide(False)
+                    _tprint("<dim>Permission request timed out (5 min). Auto-rejected.</dim>")
+                    break
+                # Check for external mode override (e.g. from Discord)
+                self._check_mode_override()
+                if self._perm_mode == PermissionMode.YOLO:
+                    req.decide(True)
+                    _tprint("<dim>    auto-approved (mode switched to yolo)</dim>")
+                    break
+                try:
+                    await asyncio.wait_for(req.event.wait(), timeout=min(2.0, remaining))
+                except asyncio.TimeoutError:
+                    continue
         finally:
             self._pending_permission = None
             if self._app:
