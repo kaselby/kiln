@@ -1018,6 +1018,14 @@ class KilnApp:
                         await task
                     except asyncio.CancelledError:
                         pass
+            # Clean up per-agent heartbeat state file so it doesn't accumulate
+            # across sessions. Each session writes its own file if /heartbeat
+            # is used; remove it on exit so stale files don't pile up.
+            try:
+                self._heartbeat_file().unlink(missing_ok=True)
+            except OSError:
+                pass
+
             # Bypass permissions for unattended exit tasks (summary, archival)
             self._perm_mode = PermissionMode.YOLO
             sc = self._harness.session_control
