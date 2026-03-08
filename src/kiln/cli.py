@@ -173,7 +173,7 @@ def _launch_in_tmux(args: argparse.Namespace, config: AgentConfig, spec_path: Pa
         sys.exit(1)
 
     base_prefix = config.session_prefix.rstrip("-")
-    agent_id = config.agent_id or generate_agent_name(
+    agent_id = config.agent_id or config.resume_session or generate_agent_name(
         prefix=base_prefix,
         worklogs_dir=config.worklogs_path,
     )
@@ -292,17 +292,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     if prompt:
         config.prompt = prompt
 
+    # Resolve --continue agent ID before launching tmux so the session name is correct
+    if args.continue_session and not args.id:
+        resolved_id = _most_recent_agent_id(config)
+        if resolved_id:
+            config.agent_id = resolved_id
+
     # If not inside our tmux guard, launch through tmux
     if not os.environ.get(_TMUX_GUARD) or args.detach:
         _launch_in_tmux(args, config, spec_path)
         return
 
     # --- Inner execution (inside tmux) ---
-
-    if args.continue_session and not args.id:
-        resolved_id = _most_recent_agent_id(config)
-        if resolved_id:
-            config.agent_id = resolved_id
 
     from .harness import KilnHarness
     harness = KilnHarness(config)

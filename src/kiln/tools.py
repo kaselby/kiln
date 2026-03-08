@@ -452,6 +452,50 @@ def do_update_plan(
 
 # --- Messaging helpers (importable) ---
 
+_NAMESPACE_REGISTRY_PATH = Path.home() / ".kiln" / "agents.yml"
+
+
+def _load_namespace_registry() -> dict[str, Path]:
+    """Load the namespace → home directory registry from ~/.kiln/agents.yml.
+
+    File format:
+        aleph: ~/.aleph
+        beth: ~/.beth
+
+    Returns an empty dict if the file doesn't exist or can't be parsed.
+    """
+    if not _NAMESPACE_REGISTRY_PATH.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(_NAMESPACE_REGISTRY_PATH.read_text()) or {}
+        return {k: Path(os.path.expanduser(str(v))) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _resolve_recipient_inbox(recipient: str, fallback: Path) -> Path:
+    """Infer the recipient's inbox path from their agent ID.
+
+    Resolution order:
+      1. ~/.kiln/agents.yml registry (explicit namespace → home mapping)
+      2. ~/.{prefix}/inbox/ convention (implicit, if the directory exists)
+      3. fallback (sender's inbox root)
+
+    Agent IDs follow the pattern <namespace>-<name> (e.g. aleph-cold-grove).
+    """
+    prefix = recipient.split("-")[0]
+
+    registry = _load_namespace_registry()
+    if prefix in registry:
+        return registry[prefix] / "inbox"
+
+    candidate_inbox = Path.home() / f".{prefix}" / "inbox"
+    if candidate_inbox.is_dir():
+        return candidate_inbox
+
+    return fallback
+
+
 def send_to_inbox(
     inbox_root: Path,
     recipient: str,
@@ -526,7 +570,8 @@ def do_send_message(
         channels_dir = inbox_root.parent / "channels"
 
     if to:
-        msg_path = send_to_inbox(inbox_root, to, agent_id, summary, body, priority)
+        recipient_inbox_root = _resolve_recipient_inbox(to, inbox_root)
+        msg_path = send_to_inbox(recipient_inbox_root, to, agent_id, summary, body, priority)
         return {"result": f"Message sent to {to} at {msg_path}"}
 
     # Channel broadcast
@@ -541,8 +586,9 @@ def do_send_message(
     if not recipients:
         return {"error": f"Channel '{channel}' has no other subscribers."}
     for recipient in recipients:
+        recipient_inbox_root = _resolve_recipient_inbox(recipient, inbox_root)
         send_to_inbox(
-            inbox_root, recipient, agent_id, summary, body,
+            recipient_inbox_root, recipient, agent_id, summary, body,
             priority, channel=channel,
         )
     # Persist to channel history
