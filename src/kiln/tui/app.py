@@ -1224,9 +1224,20 @@ class KilnApp:
 
     # ---- Heartbeat ----
 
+    def _heartbeat_file(self) -> Path:
+        """Return the per-agent heartbeat state file path."""
+        return self._harness.config.home / "state" / f"heartbeat-{self._harness.agent_id}"
+
     def _check_heartbeat_file(self) -> None:
-        """Read heartbeat config from state/heartbeat if it exists."""
-        hb_file = self._harness.config.home / "state" / "heartbeat"
+        """Read heartbeat config from per-agent state file.
+
+        Checks state/heartbeat-{agent_id} first, falls back to the shared
+        state/heartbeat for backward compatibility (e.g. manual writes before
+        the per-agent fix).
+        """
+        per_agent = self._heartbeat_file()
+        shared = self._harness.config.home / "state" / "heartbeat"
+        hb_file = per_agent if per_agent.exists() else shared
         try:
             if not hb_file.exists():
                 return
@@ -1299,6 +1310,21 @@ class KilnApp:
             state = "on" if self._heartbeat_enabled else "off"
             _tprint("<dim>Heartbeat: {} (interval {}min)</dim>",
                     state, int(self._heartbeat_interval / 60))
+        # Persist to per-agent state file so the setting survives
+        # _check_heartbeat_file polls and doesn't affect other agents.
+        self._write_heartbeat_file()
+
+    def _write_heartbeat_file(self) -> None:
+        """Write current heartbeat state to the per-agent state file."""
+        hb_file = self._heartbeat_file()
+        try:
+            hb_file.parent.mkdir(parents=True, exist_ok=True)
+            if self._heartbeat_enabled:
+                hb_file.write_text(str(int(self._heartbeat_interval / 60)))
+            else:
+                hb_file.write_text("off")
+        except OSError:
+            pass
 
     def _pending_message_count(self) -> int:
         """Count unread messages in the inbox."""
