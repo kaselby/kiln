@@ -168,6 +168,15 @@ def _compile_guardrails():
 _compile_guardrails()
 
 
+def _is_tool(tool_name: str, base: str) -> bool:
+    """Check if tool_name matches a base tool (e.g. 'Bash').
+
+    Matches the bare name and any MCP-prefixed variant:
+    'Bash', 'mcp__kiln__Bash', 'mcp__aleph__Bash', etc.
+    """
+    return tool_name == base or tool_name.endswith(f"__{base}")
+
+
 def _has_rm_rf(command: str) -> bool:
     """Check if a command contains rm with both -r and -f flags in any form."""
     # Quick exit
@@ -266,9 +275,9 @@ def needs_permission(mode: PermissionMode, tool_name: str) -> bool:
     """Whether this tool requires user permission in the given mode."""
     if mode == PermissionMode.YOLO:
         return False
-    if tool_name in ("Edit", "Write", "mcp__kiln__Edit", "mcp__kiln__Write"):
+    if _is_tool(tool_name, "Edit") or _is_tool(tool_name, "Write"):
         return True  # Edit/Write gated in both safe and default
-    if tool_name in ("Bash", "mcp__kiln__Bash") and mode == PermissionMode.SAFE:
+    if _is_tool(tool_name, "Bash") and mode == PermissionMode.SAFE:
         return True
     return False
 
@@ -291,11 +300,11 @@ class PermissionRequest:
 
 def generate_diff(tool_name: str, tool_input: dict[str, Any]) -> str:
     """Generate a human-readable diff or preview for a tool call."""
-    if tool_name in ("Edit", "mcp__kiln__Edit"):
+    if _is_tool(tool_name, "Edit"):
         return _diff_edit(tool_input)
-    elif tool_name in ("Write", "mcp__kiln__Write"):
+    elif _is_tool(tool_name, "Write"):
         return _diff_write(tool_input)
-    elif tool_name in ("Bash", "mcp__kiln__Bash"):
+    elif _is_tool(tool_name, "Bash"):
         return _preview_bash(tool_input)
     return ""
 
@@ -428,7 +437,7 @@ def create_permission_hook(
         mode = get_mode()
 
         # --- Guardrails: check dangerous commands BEFORE mode check ---
-        if tool_name in ("Bash", "mcp__kiln__Bash"):
+        if _is_tool(tool_name, "Bash"):
             command = tool_input.get("command", "")
             danger = classify_danger(command)
 

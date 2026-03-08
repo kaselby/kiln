@@ -478,7 +478,7 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
             is_error = bool(tool_output.get("is_error"))
 
         # Skill activations
-        if tool_name == "mcp__kiln__activate_skill":
+        if tool_name == "mcp__kiln__activate_skill" or tool_name.endswith("__activate_skill"):
             skill = tool_input.get("name", "unknown")
             _append({
                 "ts": datetime.now().isoformat(),
@@ -489,7 +489,7 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
             return {}
 
         # Custom tools (Bash calls to tools/bin/)
-        if tool_name in ("Bash", "mcp__kiln__Bash") and bin_prefix:
+        if (tool_name == "Bash" or tool_name.endswith("__Bash")) and bin_prefix:
             command = tool_input.get("command", "")
             if bin_prefix in command:
                 # Use regex to extract the tool name immediately after bin_prefix.
