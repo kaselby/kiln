@@ -329,8 +329,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     if harness.continue_requested:
         kiln_bin = shutil.which("kiln") or sys.argv[0]
         exec_args = [kiln_bin, "run", str(spec_path.resolve()),
-                     "--mode", "yolo", "--heartbeat",
+                     "--mode", "yolo",
+                     "--heartbeat", str(int(config.heartbeat_interval / 60)),
                      "--parent", harness.agent_id, "--continuation"]
+        if args.model:
+            exec_args += ["--model", args.model]
         if args.persistent:
             exec_args.append("--persistent")
         if harness.handoff_text:

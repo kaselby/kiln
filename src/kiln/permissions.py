@@ -289,6 +289,7 @@ class PermissionRequest:
     tool_name: str
     tool_input: dict[str, Any]
     diff_text: str
+    is_guardrail: bool = False
     result: bool = False
     timed_out: bool = False
     event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -480,6 +481,7 @@ def create_permission_hook(
                     tool_name=tool_name,
                     tool_input=tool_input,
                     diff_text=diff_text,
+                    is_guardrail=True,
                 )
                 allowed = await request_permission(req)
                 decision = "allow" if allowed else "deny"

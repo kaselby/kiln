@@ -21,7 +21,22 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
 
     Returns summaries of unread messages as additionalContext (agent-facing).
     Also pushes inbox_message UI events for TUI rendering (user-facing).
+
+    Intentionally does NOT write .read markers. That responsibility belongs
+    solely to the TUI's _inbox_watcher (via _deliver_agent_message), which
+    delivers messages as proper user-turn wakeups. Writing .read here would
+    consume messages mid-turn and prevent idle-session wakeup: the watcher
+    would find nothing to deliver after the turn ends.
+
+    Instead, an in-memory set tracks which messages have already been injected
+    this session so the hook doesn't re-inject on every subsequent tool call.
+    The .read marker (written by the watcher) is still respected — once the
+    watcher delivers a message, the hook skips it too.
     """
+    # Track messages already injected this session to avoid repeated injection.
+    # Key: str(msg_file). The watcher writes .read when it delivers; the hook
+    # relies on that marker for already-delivered messages.
+    _injected: set[str] = set()
 
     async def inbox_check_hook(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
@@ -30,41 +45,43 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
             return {}
 
         summaries = []
-        to_mark = []
         for msg_file in sorted(inbox_path.iterdir()):
-            if msg_file.is_file() and msg_file.suffix == ".md":
-                # Check for read marker
-                read_marker = msg_file.with_suffix(".read")
-                if read_marker.exists():
-                    continue
+            if not msg_file.is_file() or msg_file.suffix != ".md":
+                continue
 
-                # Extract sender and channel from frontmatter
-                parsed = parse_message(msg_file)
-                if parsed:
-                    sender = parsed["from"] or "unknown"
-                    if parsed["channel"]:
-                        ping = f"[Notification] Message from {sender} in {parsed['channel']} — {msg_file}"
-                    else:
-                        ping = f"[Notification] Message from {sender} — {msg_file}"
-                    summaries.append(ping)
-                    to_mark.append(read_marker)
+            # Skip messages already delivered by the watcher
+            read_marker = msg_file.with_suffix(".read")
+            if read_marker.exists():
+                continue
 
-                    # Push UI event for TUI rendering
-                    if ui_events is not None:
-                        ui_events.append({
-                            "type": "inbox_message",
-                            "from": parsed.get("from", ""),
-                            "summary": parsed["summary"],
-                            "channel": parsed.get("channel", ""),
-                            "path": str(msg_file),
-                        })
+            # Skip messages already injected this session (in-memory dedup)
+            path_str = str(msg_file)
+            if path_str in _injected:
+                continue
+
+            # Extract sender and channel from frontmatter
+            parsed = parse_message(msg_file)
+            if parsed:
+                sender = parsed["from"] or "unknown"
+                if parsed["channel"]:
+                    ping = f"[Notification] Message from {sender} in {parsed['channel']} — {msg_file}"
+                else:
+                    ping = f"[Notification] Message from {sender} — {msg_file}"
+                summaries.append(ping)
+                _injected.add(path_str)  # prevent re-injection; don't write .read
+
+                # Push UI event for TUI rendering
+                if ui_events is not None:
+                    ui_events.append({
+                        "type": "inbox_message",
+                        "from": parsed.get("from", ""),
+                        "summary": parsed["summary"],
+                        "channel": parsed.get("channel", ""),
+                        "path": path_str,
+                    })
 
         if not summaries:
             return {}
-
-        # Mark as read so subsequent hook fires don't re-display
-        for marker in to_mark:
-            marker.touch()
 
         return {
             "hookSpecificOutput": {
@@ -101,8 +118,11 @@ def create_skill_context_hook(skills_path: Path):
 
         # Strip YAML frontmatter
         if content.startswith("---"):
-            end = content.index("---", 3)
-            content = content[end + 3:].strip()
+            try:
+                end = content.index("---", 3)
+                content = content[end + 3:].strip()
+            except ValueError:
+                pass
 
         return {
             "hookSpecificOutput": {
@@ -191,16 +211,16 @@ def create_context_warning_hook(session_control, max_tokens: int = 200_000):
 
         fraction = tokens / max_tokens
 
-        # Find the highest threshold we've crossed that hasn't fired yet
-        crossed = None
-        for t in thresholds:
-            if fraction >= t and t not in fired:
-                crossed = t
-
-        if crossed is None:
+        # Find all thresholds crossed that haven't fired yet.
+        # Mark all as fired in one call — prevents stale lower-threshold
+        # messages firing on subsequent calls when context jumps multiple
+        # levels at once.
+        newly_crossed = [t for t in thresholds if fraction >= t and t not in fired]
+        if not newly_crossed:
             return {}
 
-        fired.add(crossed)
+        fired.update(newly_crossed)
+        crossed = max(newly_crossed)
         pct = int(crossed * 100)
         token_k = f"{tokens // 1000}k"
 

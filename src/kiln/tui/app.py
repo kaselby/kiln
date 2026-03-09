@@ -999,10 +999,10 @@ class KilnApp:
 
                 async def send_initial():
                     await asyncio.sleep(0)  # yield once to let Application start
-                    while self._message_queue:
+                    if self._message_queue:
                         msg = self._message_queue.pop(0)
                         _tprint("<dim>...</dim>")
-                        await self._send_and_receive(msg)
+                        self._receive_task = asyncio.ensure_future(self._send_and_receive(msg))
 
                 if self._message_queue:
                     self._initial_task = asyncio.ensure_future(send_initial())
@@ -1204,7 +1204,8 @@ class KilnApp:
     async def _deliver_agent_message(self, msg: dict) -> None:
         """Format and inject an agent message as a user turn."""
         msg_path = Path(msg["path"])
-        msg_path.with_suffix(".read").touch()
+        marker = msg_path.with_suffix(".read")
+        marker.touch()  # write early to prevent concurrent re-queue; removed on failure
 
         sender = msg.get("from", "unknown")
         summary = msg.get("summary", "")
@@ -1225,11 +1226,16 @@ class KilnApp:
         else:
             cooldown = 1.0
 
+        self._receive_task = asyncio.ensure_future(self._send_and_receive(formatted, source="agent"))
         self._receiving = True
         if self._app:
             self._app.invalidate()
 
-        await self._send_and_receive(formatted, source="agent")
+        try:
+            await self._receive_task
+        except Exception:
+            marker.unlink(missing_ok=True)
+            raise
 
         self._last_auto_delivery = time.monotonic() + (cooldown - 1.0)
 
@@ -1269,6 +1275,11 @@ class KilnApp:
                 if minutes > 0:
                     self._heartbeat_interval = minutes * 60
                     self._heartbeat_enabled = True
+                    # Clamp backoff to the new interval cap so a previously
+                    # large backoff doesn't block the newly reduced interval.
+                    self._heartbeat_backoff = min(
+                        self._heartbeat_backoff, self._heartbeat_interval
+                    )
         except (ValueError, OSError):
             pass
 
@@ -1297,10 +1308,11 @@ class KilnApp:
             minutes = int(elapsed / 60)
             _tprint("\n<dim>\u2764\ufe0f Heartbeat ({} idle)</dim>", f"{minutes}min")
 
+            self._receive_task = asyncio.ensure_future(self._send_and_receive(msg, source="heartbeat"))
             self._receiving = True
             if self._app:
                 self._app.invalidate()
-            await self._send_and_receive(msg, source="heartbeat")
+            await self._receive_task
 
             self._heartbeat_backoff = min(
                 self._heartbeat_backoff * 2, self._heartbeat_interval
@@ -1314,6 +1326,9 @@ class KilnApp:
                 minutes = float(parts[1])
                 self._heartbeat_interval = minutes * 60
                 self._heartbeat_enabled = True
+                # Explicit interval change: reset backoff so the new interval
+                # takes effect on the next fire, not after the old backoff expires.
+                self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
                 _tprint("<dim>Heartbeat: on, interval {}min</dim>", int(minutes))
             except ValueError:
                 if parts[1] == "off":
@@ -1503,7 +1518,7 @@ class KilnApp:
                     break
                 # Check for external mode override (e.g. from Discord)
                 self._check_mode_override()
-                if self._perm_mode == PermissionMode.YOLO:
+                if self._perm_mode == PermissionMode.YOLO and not req.is_guardrail:
                     req.decide(True)
                     _tprint("<dim>    auto-approved (mode switched to yolo)</dim>")
                     break
