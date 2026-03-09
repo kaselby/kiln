@@ -22,20 +22,17 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
     Returns summaries of unread messages as additionalContext (agent-facing).
     Also pushes inbox_message UI events for TUI rendering (user-facing).
 
-    Intentionally does NOT write .read markers. That responsibility belongs
-    solely to the TUI's _inbox_watcher (via _deliver_agent_message), which
-    delivers messages as proper user-turn wakeups. Writing .read here would
-    consume messages mid-turn and prevent idle-session wakeup: the watcher
-    would find nothing to deliver after the turn ends.
-
-    Instead, an in-memory set tracks which messages have already been injected
-    this session so the hook doesn't re-inject on every subsequent tool call.
-    The .read marker (written by the watcher) is still respected — once the
-    watcher delivers a message, the hook skips it too.
+    Writes .read markers when notifying, so the watcher doesn't re-deliver
+    messages the agent has already been told about. This is safe because the
+    hook and watcher operate in non-overlapping time windows: the hook fires
+    mid-turn (PostToolUse) when the watcher is blocked (_receiving=True);
+    the watcher fires between turns when no tool calls are happening.
+    Messages arriving while the agent is idle bypass the hook entirely and
+    are delivered by the watcher as proper user turns.
     """
-    # Track messages already injected this session to avoid repeated injection.
-    # Key: str(msg_file). The watcher writes .read when it delivers; the hook
-    # relies on that marker for already-delivered messages.
+    # Track messages already injected this session (in-memory dedup for the
+    # rare case where .read write succeeds but the set check runs before the
+    # filesystem catches up on the next iteration).
     _injected: set[str] = set()
 
     async def inbox_check_hook(
@@ -68,7 +65,8 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
                 else:
                     ping = f"[Notification] Message from {sender} — {msg_file}"
                 summaries.append(ping)
-                _injected.add(path_str)  # prevent re-injection; don't write .read
+                _injected.add(path_str)
+                read_marker.touch()  # prevent watcher re-delivery
 
                 # Push UI event for TUI rendering
                 if ui_events is not None:
