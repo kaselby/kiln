@@ -18,12 +18,15 @@ def register_session(
     cwd: str | None = None,
     model: str | None = None,
     session_uuid: str | None = None,
+    extras: dict | None = None,
 ) -> None:
     """Persist agent_id → session metadata to the registry.
 
     Called at startup (without session_uuid) so the agent is immediately
     visible to branches/sitrep, then again when the session UUID is
     captured from the first ResultMessage.
+
+    extras: arbitrary key-value pairs merged into the entry (e.g. thread name).
     """
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -44,6 +47,8 @@ def register_session(
             })
             if session_uuid:
                 entry["session_uuid"] = session_uuid
+            if extras:
+                entry.update(extras)
             registry[agent_id] = entry
 
             f.seek(0)
