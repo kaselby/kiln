@@ -326,7 +326,7 @@ def create_active_agents_hook(
 # ---------------------------------------------------------------------------
 # Agent-behavioral hooks (worklog, memory reminders) were removed from
 # kiln in the library-not-framework redesign (2026-03-07). They belong
-# to the agent's codebase — see e.g. ~/.aleph/harness/hooks.py.
+# to the agent's own codebase.
 # ---------------------------------------------------------------------------
 
 

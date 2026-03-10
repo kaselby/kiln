@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # ---
 # name: log-analysis
-# description: Analyze Aleph observability logs — tool usage, session stats, conversation content
+# description: Analyze agent observability logs — tool usage, session stats, conversation content
 # arguments: "<subcommand> [options]"
 # ---
-"""Analyze Aleph observability logs.
+"""Analyze agent observability logs.
 
 Subcommands:
   tools          Custom tool & skill usage summary
@@ -429,7 +429,7 @@ def _fmt_tokens(n: int) -> str:
 def main():
     parser = argparse.ArgumentParser(
         prog="log-analysis",
-        description="Analyze Aleph observability logs.",
+        description="Analyze agent observability logs.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

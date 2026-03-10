@@ -96,7 +96,7 @@ On `kiln init`, these are copied into the agent's home directory. After that, th
 
 ## Project Status
 
-Kiln is extracted from [Aleph](https://github.com/kaselby/aleph), a persistent AI agent project. It's functional and in active use, but the API is not yet stable. Expect breaking changes.
+Kiln is extracted from a persistent AI agent project. It's functional and in active use, but the API is not yet stable. Expect breaking changes.
 
 ## Requirements
 

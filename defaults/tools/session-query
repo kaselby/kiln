@@ -14,7 +14,7 @@ Usage:
   session-query ask <pattern> "question" --model opus   Use a specific model (default: sonnet)
 
 Pattern matching:
-  Full agent ID:    session-query extract aleph-thorn-crow
+  Full agent ID:    session-query extract kiln-thorn-crow
   Date prefix:      session-query extract 2026-03-02       (lists matches if multiple)
   Partial match:    session-query extract thorn             (fuzzy match on agent ID)
 
@@ -92,7 +92,7 @@ def find_sessions(pattern: str) -> list[Path]:
     if prefix:
         return prefix
 
-    # Substring match (e.g., "thorn" matches "2026-03-02-aleph-thorn-crow")
+    # Substring match (e.g., "thorn" matches "2026-03-02-kiln-thorn-crow")
     substr = [f for f in archived if pattern in f.stem]
     if substr:
         return substr

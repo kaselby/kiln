@@ -79,7 +79,7 @@ class ChannelViewer:
     def __init__(self, channel: str, user: str = "kira", home: Path | None = None):
         self.channel = channel
         self.user = user
-        self.home = home or Path(os.environ.get("KILN_AGENT_HOME", Path.home() / ".aleph"))
+        self.home = home or Path(os.environ.get("KILN_AGENT_HOME", Path.cwd()))
         self.channels_path = self.home / "channels.json"
         self.history_file = self.home / "channels" / channel / "history.jsonl"
         self.inbox_root = self.home / "inbox"

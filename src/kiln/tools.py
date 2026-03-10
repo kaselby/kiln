@@ -459,8 +459,8 @@ def _load_namespace_registry() -> dict[str, Path]:
     """Load the namespace → home directory registry from ~/.kiln/agents.yml.
 
     File format:
-        aleph: ~/.aleph
-        beth: ~/.beth
+        myagent: ~/.myagent
+        other: ~/.other
 
     Returns an empty dict if the file doesn't exist or can't be parsed.
     """
@@ -481,7 +481,7 @@ def _resolve_recipient_inbox(recipient: str, fallback: Path) -> Path:
       2. ~/.{prefix}/inbox/ convention (implicit, if the directory exists)
       3. fallback (sender's inbox root)
 
-    Agent IDs follow the pattern <namespace>-<name> (e.g. aleph-cold-grove).
+    Agent IDs follow the pattern <prefix>-<adj>-<noun> (e.g. kiln-cold-grove).
     """
     prefix = recipient.split("-")[0]
 
@@ -546,7 +546,7 @@ def do_send_message(
     without duplicating message/channel logic.
 
     Args:
-        inbox_root: Root inbox directory (e.g. ~/.aleph/inbox).
+        inbox_root: Root inbox directory (e.g. <agent_home>/inbox).
         agent_id: Sender's agent ID.
         summary: Brief message summary.
         body: Full message body.

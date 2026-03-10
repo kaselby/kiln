@@ -1,5 +1,5 @@
 """
-Embedding-based semantic search over Aleph's memory system.
+Embedding-based semantic search over the agent's memory system.
 
 Uses nomic-ai/modernbert-embed-base (8192 token context, 768-dim).
 Indexes: latent notes, session summaries, facts, buffer entries,

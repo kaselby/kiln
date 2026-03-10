@@ -1,7 +1,7 @@
 ---
 name: tool-authoring
 description: >
-  Creates and modifies tools in the Aleph tool system. Covers the two tool
+  Creates and modifies tools in the Kiln tool system. Covers the two tool
   types (standalone scripts and managed definitions), the header contract for
   auto-discovery, budget tracking for paid APIs, and conventions for testing
   and documenting tools. Activate when building a new tool, modifying an
@@ -97,7 +97,7 @@ for t in tools:
 ```
 
 Python standalone scripts should use `<agent_home>/venv/bin/python3` in the shebang
-or invoke it explicitly, to ensure dependencies from the Aleph venv are available.
+or invoke it explicitly, to ensure dependencies from the agent's venv are available.
 
 ## Creating a Managed Tool (Paid APIs)
 

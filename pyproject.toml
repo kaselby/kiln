@@ -2,6 +2,10 @@
 name = "kiln"
 version = "0.1.0"
 description = "Agent runtime for Claude Code — identity-neutral, extensible"
+license = "Apache-2.0"
+authors = [
+    {name = "Kira Selby"},
+]
 requires-python = ">=3.12"
 dependencies = [
     "claude-agent-sdk>=0.1.41",

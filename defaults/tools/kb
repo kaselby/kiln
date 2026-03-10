@@ -12,7 +12,7 @@
 #   kb search --tag <tag> [query]   Filter by frontmatter tag, optionally with text query
 #   kb read <topic/file>            Read a knowledge file
 #   kb write <topic> <filename> <title> [--tag t1,t2]  Create a new note with frontmatter
-#   kb index                        Generate compact index for context injection (aleph-tagged files)
+#   kb index                        Generate compact index for context injection (agent-tagged files)
 #   kb tag <add|remove> <topic/file> <tag>  Add or remove a tag from a file's frontmatter
 
 import os
@@ -302,7 +302,7 @@ tags: [{tags_str}]
 
 
 def cmd_index(args: list) -> None:
-    """Generate compact index of aleph-tagged files for context injection."""
+    """Generate compact index of agent-tagged files for context injection."""
     topics = {}
 
     for md_file in sorted(KB_ROOT.rglob("*.md")):
@@ -313,7 +313,8 @@ def cmd_index(args: list) -> None:
         if not fm or "tags" not in fm:
             continue
 
-        if "aleph" not in fm["tags"]:
+        tag = os.environ.get("KB_INDEX_TAG", "agent")
+        if tag not in fm["tags"]:
             continue
 
         topic = md_file.parent.name
@@ -322,7 +323,7 @@ def cmd_index(args: list) -> None:
         topics[topic] += 1
 
     if not topics:
-        print("No aleph-tagged files found. Tag files with 'aleph' to include them in the index.")
+        print(f"No '{tag}'-tagged files found. Tag files with '{tag}' to include them in the index.")
         return
 
     # Generate compact index using folder descriptions from _index.md
@@ -453,7 +454,7 @@ def main():
         print("  search --tag <tag> [query]                Filter by tag, optionally with text")
         print("  read <topic/file>                         Read a knowledge file")
         print("  write <topic> <filename> <title> [--tag]  Create new note with frontmatter")
-        print("  index                                     Generate context index (aleph-tagged)")
+        print("  index                                     Generate context index (agent-tagged)")
         print("  tag <add|remove> <topic/file> <tag>       Modify file tags")
         sys.exit(0)
 

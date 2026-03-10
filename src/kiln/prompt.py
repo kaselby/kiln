@@ -98,7 +98,7 @@ def load_tool_docs(
 
     Args:
         tool_names: List of tool names, possibly namespaced
-            (e.g. ["Kiln::Edit", "Aleph::Bash", "Base::Read"]).
+            (e.g. ["Kiln::Edit", "MyAgent::Bash", "Base::Read"]).
         extra_dirs: Additional directories to search for tool doc files.
             Searched after kiln's built-in docs, so agent docs can override.
 

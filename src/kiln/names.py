@@ -1,4 +1,4 @@
-"""Agent name generation — human-readable names like 'aleph-frost-hawk'."""
+"""Agent name generation — human-readable names like 'kiln-frost-hawk'."""
 
 import random
 import subprocess
@@ -31,7 +31,7 @@ def generate_agent_name(
     *,
     worklogs_dir: Path | None = None,
 ) -> str:
-    """Generate a human-readable agent name like 'aleph-frost-hawk'.
+    """Generate a human-readable agent name like 'kiln-frost-hawk'.
 
     Checks running tmux sessions AND today's worklogs to avoid collisions
     with both active agents and agents that already ran today.
@@ -39,13 +39,13 @@ def generate_agent_name(
     Falls back to hex UUID after 20 attempts.
 
     Args:
-        prefix: Name prefix (e.g. "aleph", "kiln"). Used as-is
+        prefix: Name prefix (e.g. "kiln", "myagent"). Used as-is
             in the generated name.
         worklogs_dir: Directory to check for today's worklogs. If None,
             only checks tmux sessions.
     """
     # Check both prefix and its underscore variant to avoid collisions
-    # (e.g. aleph-frost-hawk shouldn't collide with _aleph-frost-hawk)
+    # (e.g. kiln-frost-hawk shouldn't collide with _kiln-frost-hawk)
     bare = prefix.lstrip("_")
     variants = {bare, f"_{bare}"}
 
