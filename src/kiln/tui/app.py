@@ -1302,15 +1302,8 @@ class KilnApp:
             # --- Auto self-continuation check ---
             if self._auto_sc_timeout > 0:
                 idle = time.monotonic() - self._last_real_activity
-                if idle >= self._auto_sc_timeout:
-                    if self._auto_sc_prompted:
-                        # Agent didn't self-continue after prompt — force it
-                        _tprint("\n<dim>\u26a1 Auto-SC: forcing self-continuation</dim>")
-                        self._harness.continue_requested = True
-                        if self._app:
-                            self._app.exit()
-                        return
-                    # Send auto-SC prompt
+                if idle >= self._auto_sc_timeout and not self._auto_sc_prompted:
+                    # Send auto-SC prompt (once)
                     self._auto_sc_prompted = True
                     minutes = int(idle / 60)
                     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
