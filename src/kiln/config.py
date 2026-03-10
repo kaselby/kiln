@@ -51,7 +51,7 @@ class AgentConfig:
     """
 
     # Agent identity
-    name: str = ""                    # agent name (e.g. "aleph")
+    name: str = ""                    # agent name (e.g. "assistant")
     home: Path = field(default_factory=lambda: Path.home())
     identity_doc: str = "identity.md"  # relative to home
 
@@ -73,7 +73,11 @@ class AgentConfig:
     prompt: str | None = None
 
     # Permission mode
-    initial_mode: str | None = None   # safe, default, yolo
+    initial_mode: str | None = None   # safe, supervised, yolo (trusted is TUI-only)
+
+    # Thinking effort — controls depth of reasoning ("low", "medium", "high")
+    # None means use the SDK/CLI default.
+    effort: str | None = None
 
     # Heartbeat
     heartbeat: bool = False
@@ -82,7 +86,7 @@ class AgentConfig:
     # Idle nudge: send a message after prolonged inactivity (seconds, 0 = disabled)
     idle_nudge_timeout: float = 0.0
 
-    # Tools — namespaced list: "Base::Read", "Kiln::Bash", "Aleph::CustomTool"
+    # Tools — namespaced list: "Base::Read", "Kiln::Bash", "MyAgent::CustomTool"
     tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
     mcp_server: str | None = None     # path to custom MCP server module (relative to home)
     scripts_dir: str = "tools"        # shell tools directory (relative to home)
@@ -185,7 +189,7 @@ class AgentConfig:
             {
                 "Base": ["Read", "WebSearch"],
                 "Kiln": ["Bash", "Read", "Write", ...],
-                "Aleph": ["Bash", "CustomTool"],  # agent-specific
+                "MyAgent": ["Bash", "CustomTool"],  # agent-specific
             }
 
         The harness uses this to:
@@ -227,7 +231,7 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
 
     # Simple scalar fields
     for field_name in [
-        "identity_doc", "model", "session_prefix",
+        "identity_doc", "model", "effort", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server",
     ]:

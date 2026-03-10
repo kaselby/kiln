@@ -160,6 +160,10 @@ def _compile_guardrails():
         (r"\btmux\s+kill-(session|server)\b", "confirm", "kill tmux session/server"),
         (r"\bkillall\s", "confirm", "kill processes by name (killall)"),
         (r"\bpkill\s", "confirm", "kill processes by pattern (pkill)"),
+
+        # --- Confirm: external communication (requires human supervision) ---
+        (r"\bcolony\b", "confirm", "Colony access (supervised only)"),
+        (r"\bemail\b", "confirm", "email (supervised only)"),
     ]
     for pattern_str, tier, desc in raw:
         _GUARDRAIL_PATTERNS.append((re.compile(pattern_str), tier, desc))
@@ -172,7 +176,7 @@ def _is_tool(tool_name: str, base: str) -> bool:
     """Check if tool_name matches a base tool (e.g. 'Bash').
 
     Matches the bare name and any MCP-prefixed variant:
-    'Bash', 'mcp__kiln__Bash', 'mcp__aleph__Bash', etc.
+    'Bash', 'mcp__kiln__Bash', 'mcp__myagent__Bash', etc.
     """
     return tool_name == base or tool_name.endswith(f"__{base}")
 
@@ -262,21 +266,22 @@ def classify_danger(command: str) -> tuple[str, str] | None:
 
 class PermissionMode(Enum):
     SAFE = "safe"
-    DEFAULT = "default"
+    SUPERVISED = "supervised"
     YOLO = "yolo"
+    TRUSTED = "trusted"
 
     def next(self) -> "PermissionMode":
-        cycle = [PermissionMode.SAFE, PermissionMode.DEFAULT, PermissionMode.YOLO]
+        cycle = [PermissionMode.SAFE, PermissionMode.SUPERVISED, PermissionMode.YOLO, PermissionMode.TRUSTED]
         idx = cycle.index(self)
         return cycle[(idx + 1) % len(cycle)]
 
 
 def needs_permission(mode: PermissionMode, tool_name: str) -> bool:
     """Whether this tool requires user permission in the given mode."""
-    if mode == PermissionMode.YOLO:
+    if mode in (PermissionMode.YOLO, PermissionMode.TRUSTED):
         return False
     if _is_tool(tool_name, "Edit") or _is_tool(tool_name, "Write"):
-        return True  # Edit/Write gated in both safe and default
+        return True  # Edit/Write gated in both safe and supervised
     if _is_tool(tool_name, "Bash") and mode == PermissionMode.SAFE:
         return True
     return False
@@ -455,14 +460,23 @@ def create_permission_hook(
                                 f"Blocked by guardrail: {reason}. "
                                 f"Slow down — guardrails exist for a reason. "
                                 f"Make sure you aren't trying to do anything "
-                                f"destructive, and do NOT attempt to work "
-                                f"around this by writing to a file, using "
-                                f"variable indirection, or other indirect "
-                                f"execution methods.",
+                                f"that requires human supervision, and please "
+                                f"do not attempt to work around this by using "
+                                f"any form of indirection or alternate execution "
+                                f"paths."
                         }
                     }
 
-                # Confirm tier — check path-based exemptions before prompting
+                # Confirm tier — skip in TRUSTED mode (user is present and watching)
+                if mode == PermissionMode.TRUSTED:
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                        }
+                    }
+
+                # Check path-based exemptions before prompting
                 if get_cwd and _is_exempt(reason, get_cwd(), agent_home, command):
                     return {
                         "hookSpecificOutput": {
@@ -500,10 +514,10 @@ def create_permission_hook(
                         f"User rejected dangerous command: {reason}. "
                         f"Slow down — guardrails exist for a reason. "
                         f"Make sure you aren't trying to do anything "
-                        f"destructive, and do NOT attempt to work "
-                        f"around this by writing to a file, using "
-                        f"variable indirection, or other indirect "
-                        f"execution methods."
+                        f"that requires human supervision, and please "
+                        f"do not attempt to work around this by using "
+                        f"any form of indirection or alternate execution "
+                        f"paths."
                     )
                 return result
 

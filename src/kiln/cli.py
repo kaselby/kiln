@@ -77,8 +77,8 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         help="Resume a specific session by agent ID",
     )
     parser.add_argument(
-        "--mode", choices=["safe", "default", "yolo"], default=None,
-        help="Initial permission mode",
+        "--mode", choices=["safe", "supervised", "yolo"], default=None,
+        help="Initial permission mode (trusted mode is TUI-only)",
     )
     parser.add_argument(
         "--detach", action="store_true",
@@ -412,9 +412,20 @@ def cmd_list(args: argparse.Namespace) -> None:
     """List known sessions from registries."""
     # Search common locations for session registries
     candidates = [
-        Path.home() / ".aleph" / "logs" / "session-registry.json",
         Path("logs") / "session-registry.json",
     ]
+    # Also check ~/.{name}/logs/ for any agents registered in ~/.kiln/agents.yml
+    agents_yml = Path.home() / ".kiln" / "agents.yml"
+    if agents_yml.exists():
+        try:
+            import yaml as _yaml
+            registry = _yaml.safe_load(agents_yml.read_text()) or {}
+            for name, home_path in registry.items():
+                p = Path(os.path.expanduser(str(home_path))) / "logs" / "session-registry.json"
+                if p not in candidates:
+                    candidates.insert(0, p)
+        except Exception:
+            pass
 
     registry_path = None
     for c in candidates:

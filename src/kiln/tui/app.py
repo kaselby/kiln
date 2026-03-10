@@ -85,8 +85,9 @@ TUI_STYLE = Style.from_dict({
     "perm-prompt": "ansiyellow bold",
     "perm-key": "ansicyan bold",
     "mode-safe": "ansired bold",
-    "mode-default": "ansiyellow bold",
+    "mode-supervised": "ansiyellow bold",
     "mode-yolo": "ansigreen bold",
+    "mode-trusted": "ansicyan bold",
     "danger": "ansired bold",
 })
 
@@ -336,8 +337,8 @@ def _base_tool_name(name: str) -> str:
 def _display_name(name: str) -> str:
     """Convert internal tool name to a human-friendly display name.
 
-    mcp__kiln__Bash   -> Kiln::Bash
-    mcp__aleph__Bash  -> Aleph::Bash
+    mcp__kiln__Bash    -> Kiln::Bash
+    mcp__myagent__Bash -> Myagent::Bash
     Read              -> Base::Read
     """
     if name.startswith("mcp__"):
@@ -482,7 +483,7 @@ class KilnApp:
         if harness.config.initial_mode:
             self._perm_mode = PermissionMode(harness.config.initial_mode)
         else:
-            self._perm_mode = PermissionMode.DEFAULT
+            self._perm_mode = PermissionMode.SUPERVISED
         self._pending_permission: PermissionRequest | None = None
         self._mode_override_dir = self._harness.config.home / "control"
         self._app: Application | None = None
@@ -842,8 +843,9 @@ class KilnApp:
 
     _MODE_STYLE = {
         PermissionMode.SAFE: "mode-safe",
-        PermissionMode.DEFAULT: "mode-default",
+        PermissionMode.SUPERVISED: "mode-supervised",
         PermissionMode.YOLO: "mode-yolo",
+        PermissionMode.TRUSTED: "mode-trusted",
     }
 
     def _toolbar(self) -> HTML:
@@ -1508,14 +1510,18 @@ class KilnApp:
         """Check for external mode override file (e.g. from Discord relay).
 
         Override files are written to <home>/control/<agent-id>.mode and
-        contain a single mode name (yolo, default, safe). Consumed on read.
+        contain a single mode name (yolo, supervised, safe). Consumed on read.
+        TRUSTED mode cannot be set via override — TUI only.
         """
         try:
             override_file = self._mode_override_dir / f"{self._harness.agent_id}.mode"
             if override_file.exists():
                 mode_str = override_file.read_text().strip().lower()
-                new_mode = PermissionMode(mode_str)
                 override_file.unlink()
+                if mode_str == "trusted":
+                    _tprint("<dim>Ignoring mode override: trusted mode is TUI-only</dim>")
+                    return
+                new_mode = PermissionMode(mode_str)
                 if new_mode != self._perm_mode:
                     self._perm_mode = new_mode
                     _tprint("<dim>Mode changed to {} (external override)</dim>", mode_str)
@@ -1550,6 +1556,10 @@ class KilnApp:
                     break
                 # Check for external mode override (e.g. from Discord)
                 self._check_mode_override()
+                if self._perm_mode == PermissionMode.TRUSTED:
+                    req.decide(True)
+                    _tprint("<dim>    auto-approved (mode switched to trusted)</dim>")
+                    break
                 if self._perm_mode == PermissionMode.YOLO and not req.is_guardrail:
                     req.decide(True)
                     _tprint("<dim>    auto-approved (mode switched to yolo)</dim>")
