@@ -5,7 +5,7 @@ infrastructure hooks, and manages the session lifecycle. This is what
 `kiln run <agent>` uses.
 
 Complex agents write their own harness that imports kiln's building
-blocks directly. See examples/aleph-agent.yml for that pattern.
+blocks directly.
 """
 
 import json

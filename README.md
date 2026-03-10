@@ -49,7 +49,7 @@ from kiln.permissions import create_permission_hook
 
 Compose exactly the pieces you need. No extension points to navigate, no framework boundary — just Python calling library functions.
 
-See [`examples/aleph-agent.yml`](examples/aleph-agent.yml) for how a complex agent configures itself.
+See the [Architecture](#architecture) section below for how the pieces fit together.
 
 ## Architecture
 
@@ -88,9 +88,9 @@ The `Base::` namespace exposes Claude Code's built-in tools. `Kiln::` provides K
 
 Kiln ships with a standard library of shell-script tools and skills in `defaults/`:
 
-**Tools** (18): `research`, `fetch`, `exa`, `tavily`, `reddit`, `hn`, `twitter-search`, `yt`, `kb`, `session-query`, `log-analysis`, `read-sessions`, `list-sessions`, `task`, `todo`, and more.
+**Tools** (16): `research`, `fetch`, `exa`, `tavily`, `reddit`, `hn`, `twitter-search`, `yt`, `session-query`, `log-analysis`, `read-sessions`, `list-sessions`, `task`, `todo`, and more.
 
-**Skills** (5): `programming`, `research`, `task-management`, `tool-authoring`, `skill-authoring`.
+**Skills** (6): `autonomy`, `collaboration`, `programming`, `research`, `tool-authoring`, `skill-authoring`.
 
 On `kiln init`, these are copied into the agent's home directory. After that, the agent owns them — edits, additions, and deletions are theirs.
 

@@ -76,7 +76,7 @@ def format_message(msg: dict, show_body: bool = False) -> str:
 
 
 class ChannelViewer:
-    def __init__(self, channel: str, user: str = "kira", home: Path | None = None):
+    def __init__(self, channel: str, user: str = "user", home: Path | None = None):
         self.channel = channel
         self.user = user
         self.home = home or Path(os.environ.get("KILN_AGENT_HOME", Path.cwd()))
@@ -349,8 +349,8 @@ def main():
     )
     parser.add_argument("channel", help="Channel name to view")
     parser.add_argument(
-        "--as", dest="user", default="kira",
-        help="User identity for sending messages (default: kira)",
+        "--as", dest="user", default="user",
+        help="User identity for sending messages (default: user)",
     )
     parser.add_argument(
         "--home", type=Path, default=None,
