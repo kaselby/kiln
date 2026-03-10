@@ -500,10 +500,10 @@ class KilnApp:
         self._heartbeat_task: asyncio.Task | None = None
         self._heartbeat_oneshot: float | None = None  # one-shot override (seconds)
 
-        # Auto self-continuation: restart session after prolonged inactivity.
-        self._auto_sc_timeout: float = harness.config.auto_sc_timeout
+        # Idle nudge: send a message after prolonged inactivity.
+        self._idle_nudge_timeout: float = harness.config.idle_nudge_timeout
         self._last_real_activity: float = time.monotonic()
-        self._auto_sc_prompted: bool = False
+        self._idle_nudge_sent: bool = False
 
         # Queued messages: user input submitted while receiving.
         # Uses the harness's shared queue so the PostToolUse hook can
@@ -1094,10 +1094,10 @@ class KilnApp:
             self._last_auto_delivery = time.monotonic()
 
             # Reset heartbeat backoff on real activity (not heartbeats themselves)
-            if source not in ("heartbeat", "auto-sc"):
+            if source not in ("heartbeat", "idle-nudge"):
                 self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
                 self._last_real_activity = time.monotonic()
-                self._auto_sc_prompted = False
+                self._idle_nudge_sent = False
 
             # Check if the agent requested a session exit (exit_session tool)
             sc = self._harness.session_control
@@ -1299,25 +1299,23 @@ class KilnApp:
             if self._input_buffer.text:
                 continue
 
-            # --- Auto self-continuation check ---
-            if self._auto_sc_timeout > 0:
+            # --- Idle nudge check ---
+            if self._idle_nudge_timeout > 0:
                 idle = time.monotonic() - self._last_real_activity
-                if idle >= self._auto_sc_timeout and not self._auto_sc_prompted:
-                    # Send auto-SC prompt (once)
-                    self._auto_sc_prompted = True
+                if idle >= self._idle_nudge_timeout and not self._idle_nudge_sent:
+                    # Send idle nudge (once per idle period)
+                    self._idle_nudge_sent = True
                     minutes = int(idle / 60)
                     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
                     msg = (
                         f"[{ts}]\n"
                         f"<system-reminder>\n"
-                        f"(auto-sc) You've been idle for {minutes} minutes with no real activity. "
-                        f"Self-continue to start fresh: call exit_session(continue=true, skip_summary=true, "
-                        f'handoff="...") with a brief handoff of your current state.\n'
+                        f"(idle-nudge) You've been idle for {minutes} minutes with no real activity.\n"
                         f"</system-reminder>"
                     )
-                    _tprint("\n<dim>\u26a1 Auto-SC: idle {}min, prompting self-continuation</dim>", minutes)
+                    _tprint("\n<dim>\u23f0 Idle nudge ({} min inactive)</dim>", minutes)
                     self._receive_task = asyncio.ensure_future(
-                        self._send_and_receive(msg, source="auto-sc"))
+                        self._send_and_receive(msg, source="idle-nudge"))
                     self._receiving = True
                     if self._app:
                         self._app.invalidate()

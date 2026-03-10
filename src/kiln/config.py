@@ -79,8 +79,8 @@ class AgentConfig:
     heartbeat: bool = False
     heartbeat_interval: float = 1800.0
 
-    # Auto self-continuation: restart session after idle (seconds, 0 = disabled)
-    auto_sc_timeout: float = 0.0
+    # Idle nudge: send a message after prolonged inactivity (seconds, 0 = disabled)
+    idle_nudge_timeout: float = 0.0
 
     # Tools — namespaced list: "Base::Read", "Kiln::Bash", "Aleph::CustomTool"
     tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
@@ -266,10 +266,11 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
         else:
             config.heartbeat = bool(hb)
 
-    # Auto self-continuation on inactivity (value in minutes)
-    if "auto_sc" in raw:
-        val = raw["auto_sc"]
+    # Idle nudge — send a message after prolonged inactivity (value in minutes)
+    idle_key = "idle_nudge" if "idle_nudge" in raw else "idle-nudge" if "idle-nudge" in raw else None
+    if idle_key:
+        val = raw[idle_key]
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
-            config.auto_sc_timeout = float(val) * 60
+            config.idle_nudge_timeout = float(val) * 60
 
     return config

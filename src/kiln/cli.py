@@ -89,8 +89,8 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         help="Enable heartbeat (nudge agent after idle). Default 10 min.",
     )
     parser.add_argument(
-        "--auto-sc", dest="auto_sc", default=None, metavar="MINUTES",
-        help="Auto self-continue after idle (minutes). 0 to disable.",
+        "--idle-nudge", dest="idle_nudge", default=None, metavar="MINUTES",
+        help="Send idle nudge after N minutes of inactivity. 0 to disable.",
     )
     parser.add_argument(
         "--continuation", action="store_true",
@@ -162,8 +162,8 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--resume", args.resume]
     if args.heartbeat is not None:
         cmd_parts += ["--heartbeat", args.heartbeat]
-    if args.auto_sc is not None:
-        cmd_parts += ["--auto-sc", args.auto_sc]
+    if args.idle_nudge is not None:
+        cmd_parts += ["--idle-nudge", args.idle_nudge]
     return shlex.join(cmd_parts)
 
 
@@ -283,8 +283,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.heartbeat is not None:
         config.heartbeat = True
         config.heartbeat_interval = float(args.heartbeat) * 60
-    if args.auto_sc is not None:
-        config.auto_sc_timeout = float(args.auto_sc) * 60
+    if args.idle_nudge is not None:
+        config.idle_nudge_timeout = float(args.idle_nudge) * 60
 
     # Resolve prompt
     if args.prompt and getattr(args, "prompt_file", None):
@@ -344,8 +344,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             exec_args += ["--model", args.model]
         if args.persistent:
             exec_args.append("--persistent")
-        if config.auto_sc_timeout > 0:
-            exec_args += ["--auto-sc", str(int(config.auto_sc_timeout / 60))]
+        if config.idle_nudge_timeout > 0:
+            exec_args += ["--idle-nudge", str(int(config.idle_nudge_timeout / 60))]
         if harness.handoff_text:
             import tempfile
             fd, path = tempfile.mkstemp(prefix="kiln-handoff-", suffix=".md")
