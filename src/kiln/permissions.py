@@ -160,16 +160,25 @@ def _compile_guardrails():
         (r"\btmux\s+kill-(session|server)\b", "confirm", "kill tmux session/server"),
         (r"\bkillall\s", "confirm", "kill processes by name (killall)"),
         (r"\bpkill\s", "confirm", "kill processes by pattern (pkill)"),
-
-        # --- Confirm: external communication (requires human supervision) ---
-        (r"\bcolony\b", "confirm", "Colony access (supervised only)"),
-        (r"\bemail\b", "confirm", "email (supervised only)"),
     ]
     for pattern_str, tier, desc in raw:
         _GUARDRAIL_PATTERNS.append((re.compile(pattern_str), tier, desc))
 
 
 _compile_guardrails()
+
+
+def register_guardrail(pattern: str, tier: str, description: str) -> None:
+    """Register an additional guardrail pattern.
+
+    Args:
+        pattern: Regex pattern string to match against bash commands.
+        tier: "block" (always denied) or "confirm" (requires user approval).
+        description: Human-readable description shown in the prompt/notification.
+    """
+    if tier not in ("block", "confirm"):
+        raise ValueError(f"tier must be 'block' or 'confirm', got {tier!r}")
+    _GUARDRAIL_PATTERNS.append((re.compile(pattern), tier, description))
 
 
 def _is_tool(tool_name: str, base: str) -> bool:
