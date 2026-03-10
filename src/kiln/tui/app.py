@@ -500,6 +500,11 @@ class KilnApp:
         self._heartbeat_task: asyncio.Task | None = None
         self._heartbeat_oneshot: float | None = None  # one-shot override (seconds)
 
+        # Auto self-continuation: restart session after prolonged inactivity.
+        self._auto_sc_timeout: float = harness.config.auto_sc_timeout
+        self._last_real_activity: float = time.monotonic()
+        self._auto_sc_prompted: bool = False
+
         # Queued messages: user input submitted while receiving.
         # Uses the harness's shared queue so the PostToolUse hook can
         # drain it mid-turn (not just at turn end).
@@ -1089,8 +1094,10 @@ class KilnApp:
             self._last_auto_delivery = time.monotonic()
 
             # Reset heartbeat backoff on real activity (not heartbeats themselves)
-            if source != "heartbeat":
+            if source not in ("heartbeat", "auto-sc"):
                 self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
+                self._last_real_activity = time.monotonic()
+                self._auto_sc_prompted = False
 
             # Check if the agent requested a session exit (exit_session tool)
             sc = self._harness.session_control
@@ -1287,12 +1294,46 @@ class KilnApp:
         """Nudge the agent after a period of inactivity."""
         while True:
             await asyncio.sleep(10.0)
-            self._check_heartbeat_file()
-            if not self._heartbeat_enabled:
-                continue
             if self._receiving or self._pending_permission:
                 continue
             if self._input_buffer.text:
+                continue
+
+            # --- Auto self-continuation check ---
+            if self._auto_sc_timeout > 0:
+                idle = time.monotonic() - self._last_real_activity
+                if idle >= self._auto_sc_timeout:
+                    if self._auto_sc_prompted:
+                        # Agent didn't self-continue after prompt — force it
+                        _tprint("\n<dim>\u26a1 Auto-SC: forcing self-continuation</dim>")
+                        self._harness.continue_requested = True
+                        if self._app:
+                            self._app.exit()
+                        return
+                    # Send auto-SC prompt
+                    self._auto_sc_prompted = True
+                    minutes = int(idle / 60)
+                    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    msg = (
+                        f"[{ts}]\n"
+                        f"<system-reminder>\n"
+                        f"(auto-sc) You've been idle for {minutes} minutes with no real activity. "
+                        f"Self-continue to start fresh: call exit_session(continue=true, skip_summary=true, "
+                        f'handoff="...") with a brief handoff of your current state.\n'
+                        f"</system-reminder>"
+                    )
+                    _tprint("\n<dim>\u26a1 Auto-SC: idle {}min, prompting self-continuation</dim>", minutes)
+                    self._receive_task = asyncio.ensure_future(
+                        self._send_and_receive(msg, source="auto-sc"))
+                    self._receiving = True
+                    if self._app:
+                        self._app.invalidate()
+                    await self._receive_task
+                    continue
+
+            # --- Regular heartbeat ---
+            self._check_heartbeat_file()
+            if not self._heartbeat_enabled:
                 continue
             if self._context_tokens > 150_000:
                 continue
