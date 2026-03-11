@@ -18,7 +18,6 @@ import json
 import os
 import re
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -881,7 +880,7 @@ class KilnApp:
             parts.append(f"{_fmt_tokens(self._context_tokens)} / 200k")
 
         # Context budget warning
-        if self._context_tokens > 180_000:
+        if self._context_tokens > 150_000:
             parts.append("<err>\u26a0 auto-delivery paused</err>")
 
         # Pending message count
@@ -1149,18 +1148,6 @@ class KilnApp:
 
     # ---- Idle message delivery ----
 
-    def _watcher_debug_log(self, msg: str) -> None:
-        """Append a timestamped debug line to <home>/debug/inbox_watcher.log."""
-        try:
-            log_dir = self._harness.config.home / "debug"
-            log_dir.mkdir(exist_ok=True)
-            log_path = log_dir / "inbox_watcher.log"
-            ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            with log_path.open("a") as f:
-                f.write(f"[{ts}] [{self._harness.agent_id}] {msg}\n")
-        except Exception:
-            pass  # never let logging itself crash the watcher
-
     async def _inbox_watcher(self) -> None:
         """Poll the inbox directory for unread messages while the agent is idle."""
         inbox = self._harness.config.agent_inbox(self._harness.agent_id)
@@ -1176,11 +1163,7 @@ class KilnApp:
                     await self._deliver_agent_message(msg)
             except asyncio.CancelledError:
                 raise
-            except Exception as _exc:
-                self._watcher_debug_log(
-                    f"EXCEPTION in watcher loop: {_exc!r}\n"
-                    + traceback.format_exc().rstrip()
-                )
+            except Exception:
                 await asyncio.sleep(5.0)
 
     def _should_deliver(self, inbox: Path) -> bool:
@@ -1197,7 +1180,7 @@ class KilnApp:
         min_wait = 2.0 if self._last_turn_source == "user" else 1.0
         if elapsed < min_wait:
             return False
-        if self._context_tokens > 180_000:
+        if self._context_tokens > 150_000:
             return False
         if not inbox.exists():
             return False
@@ -1238,11 +1221,11 @@ class KilnApp:
         body = msg.get("body", "")
 
         _tprint("\n<agent-msg-b>\U0001f4e8 {}:</agent-msg-b>", sender)
-        if body:
+        if summary:
+            _tprint("<agent-msg>{}</agent-msg>", summary)
+        if body and body != summary:
             display_body = body if len(body) < 2000 else body[:2000] + "\n... (truncated)"
             _tprint("<agent-msg>{}</agent-msg>", display_body)
-        elif summary:
-            _tprint("<agent-msg>{}</agent-msg>", summary)
 
         model_text = body or summary
         formatted = f"[Message from {sender}]\n{model_text}"
@@ -1345,7 +1328,7 @@ class KilnApp:
             self._check_heartbeat_file()
             if not self._heartbeat_enabled:
                 continue
-            if self._context_tokens > 180_000:
+            if self._context_tokens > 150_000:
                 continue
             elapsed = time.monotonic() - self._last_auto_delivery
             interval = self._heartbeat_oneshot or self._heartbeat_backoff
