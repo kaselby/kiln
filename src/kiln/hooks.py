@@ -648,3 +648,116 @@ def _extract_summary(msg_file: Path) -> str | None:
     if parsed is None:
         return None
     return parsed["summary"] or None
+
+
+# ---------------------------------------------------------------------------
+# Hook observability — JSONL logging of hook invocations
+# ---------------------------------------------------------------------------
+
+
+class HookLogger:
+    """Wraps hook functions with JSONL logging for post-session analysis.
+
+    Each invocation is logged with: timestamp, hook name, event type,
+    triggering tool, and the full hook output (additionalContext, decisions,
+    tool output modifications).
+
+    Usage::
+
+        logger = HookLogger(Path("logs/hook-trace/agent-id.jsonl"))
+        inbox_check = logger.wrap(inbox_check, "inbox_check", "PostToolUse")
+    """
+
+    # Truncate very large additionalContext to keep logs manageable.
+    MAX_CONTEXT_LOG = 5000
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = None
+
+    def _ensure_fh(self):
+        if self._fh is None:
+            self._fh = open(self.log_path, "a")
+
+    def _write(self, entry: dict) -> None:
+        self._ensure_fh()
+        self._fh.write(json.dumps(entry, default=str) + "\n")
+        self._fh.flush()
+
+    def wrap(self, hook_fn, name: str, event_type: str):
+        """Return a wrapped hook that logs invocations to JSONL."""
+        logger = self
+
+        async def logged_hook(
+            input_data: HookInput, tool_use_id: str | None, context: HookContext
+        ) -> HookJSONOutput:
+            result = await hook_fn(input_data, tool_use_id, context)
+            logger._log(name, event_type, input_data, tool_use_id, result)
+            return result
+
+        return logged_hook
+
+    def _log(
+        self,
+        name: str,
+        event_type: str,
+        input_data: HookInput,
+        tool_use_id: str | None,
+        result: HookJSONOutput,
+    ) -> None:
+        entry: dict = {
+            "type": "hook",
+            "timestamp": datetime.now(tz=__import__('datetime').timezone.utc).isoformat(),
+            "hook": name,
+            "event": event_type,
+        }
+
+        # Tool context (PostToolUse)
+        tool_name = input_data.get("tool_name", "")
+        if tool_name:
+            entry["tool"] = tool_name
+        if tool_use_id:
+            entry["tool_use_id"] = tool_use_id
+
+        # Parse the hook output
+        if not result:
+            entry["injected"] = False
+            self._write(entry)
+            return
+
+        entry["injected"] = True
+        hook_output = result.get("hookSpecificOutput", {})
+
+        # additionalContext — the main thing we're auditing
+        ctx = hook_output.get("additionalContext", "")
+        if ctx:
+            entry["context_bytes"] = len(ctx)
+            if len(ctx) > self.MAX_CONTEXT_LOG:
+                entry["context"] = ctx[:self.MAX_CONTEXT_LOG]
+                entry["context_truncated"] = True
+            else:
+                entry["context"] = ctx
+
+        # Tool output modifications
+        if hook_output.get("updatedMCPToolOutput"):
+            entry["updated_output"] = True
+
+        # Stop hook decisions
+        decision = result.get("decision")
+        if decision:
+            entry["decision"] = decision
+            reason = result.get("reason", "")
+            if reason:
+                entry["reason"] = reason[:500]
+
+        # continue_ (worklog cutoff)
+        if "continue_" in result:
+            entry["continue"] = result["continue_"]
+
+        self._write(entry)
+
+    def close(self):
+        if self._fh:
+            self._fh.close()
+            self._fh = None
