@@ -255,29 +255,47 @@ def _parse_meta_from_source(path: Path) -> dict | None:
 def discover_skills(skills_path: Path) -> list[dict]:
     """Scan a skills directory and extract name + description from SKILL.md frontmatter.
 
+    Scans skills_path and its immediate subdirectories (e.g. core/, library/),
+    same pattern as discover_tools.
+
     Returns list of dicts with keys: name, description, path.
     """
     skills = []
     if not skills_path.exists():
         return skills
-    for skill_dir in sorted(skills_path.iterdir()):
-        skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        text = skill_md.read_text()
-        if not text.startswith("---"):
-            continue
-        try:
-            end = text.index("---", 3)
-        except ValueError:
-            continue
-        frontmatter = yaml.safe_load(text[3:end])
-        if frontmatter and "name" in frontmatter:
-            skills.append({
-                "name": frontmatter["name"],
-                "description": frontmatter.get("description", "").strip(),
-                "path": str(skill_dir),
-            })
+
+    # Directories to scan: top-level + immediate subdirs
+    scan_dirs = [skills_path]
+    for child in sorted(skills_path.iterdir()):
+        if child.is_dir() and not child.name.startswith(".") and child.name != "__pycache__":
+            scan_dirs.append(child)
+
+    seen_names: set[str] = set()
+    for scan_dir in scan_dirs:
+        for skill_dir in sorted(scan_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            text = skill_md.read_text()
+            if not text.startswith("---"):
+                continue
+            try:
+                end = text.index("---", 3)
+            except ValueError:
+                continue
+            frontmatter = yaml.safe_load(text[3:end])
+            if frontmatter and "name" in frontmatter:
+                name = frontmatter["name"]
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                skills.append({
+                    "name": name,
+                    "description": frontmatter.get("description", "").strip(),
+                    "path": str(skill_dir),
+                })
     return skills
 
 

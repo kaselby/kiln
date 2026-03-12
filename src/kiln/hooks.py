@@ -108,7 +108,15 @@ def create_skill_context_hook(skills_path: Path):
         if not name:
             return {}
 
+        # Search for SKILL.md: flat layout first, then subdirectories
         skill_md = skills_path / name / "SKILL.md"
+        if not skill_md.exists():
+            for child in sorted(skills_path.iterdir()):
+                if child.is_dir() and not child.name.startswith("."):
+                    candidate = child / name / "SKILL.md"
+                    if candidate.exists():
+                        skill_md = candidate
+                        break
         if not skill_md.exists():
             return {}
 
