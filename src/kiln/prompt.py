@@ -141,8 +141,9 @@ def load_tool_docs(
 def discover_tools(tools_path: Path) -> list[dict]:
     """Scan a tools directory for standalone scripts and managed tool definitions.
 
-    Standalone scripts: files in tools_path with a ``# ---`` YAML comment header
-    containing ``name`` and ``description`` fields.
+    Standalone scripts: executable files with a ``# ---`` YAML comment header
+    containing ``name`` and ``description`` fields.  Scans tools_path and its
+    immediate subdirectories (e.g. core/, library/).
 
     Managed tools: Python modules in tools_path/definitions/ with a ``meta`` dict
     containing ``name``, ``description``, and optionally ``cost_per_call``.
@@ -154,26 +155,34 @@ def discover_tools(tools_path: Path) -> list[dict]:
     if not tools_path.exists():
         return tools
 
-    # --- Standalone scripts (top-level executable files with comment headers) ---
-    for path in sorted(tools_path.iterdir()):
-        if path.is_dir() or path.name.startswith("."):
-            continue
-        if not os.access(path, os.X_OK) and path.suffix != ".py":
-            continue
-        try:
-            text = path.read_text()
-        except Exception:
-            continue
-        header = _parse_tool_header(text)
-        if header and "name" in header:
-            entry = {
-                "name": header["name"],
-                "description": header.get("description", ""),
-                "arguments": header.get("arguments", ""),
-            }
-            if header.get("cost"):
-                entry["cost"] = header["cost"]
-            tools.append(entry)
+    # Directories to scan for standalone scripts: top-level + immediate subdirs
+    SKIP_DIRS = {"__pycache__", "definitions", "lib"}
+    scan_dirs = [tools_path]
+    for child in sorted(tools_path.iterdir()):
+        if child.is_dir() and not child.name.startswith(".") and child.name not in SKIP_DIRS:
+            scan_dirs.append(child)
+
+    # --- Standalone scripts (executable files with comment headers) ---
+    for scan_dir in scan_dirs:
+        for path in sorted(scan_dir.iterdir()):
+            if path.is_dir() or path.name.startswith("."):
+                continue
+            if not os.access(path, os.X_OK) and path.suffix != ".py":
+                continue
+            try:
+                text = path.read_text()
+            except Exception:
+                continue
+            header = _parse_tool_header(text)
+            if header and "name" in header:
+                entry = {
+                    "name": header["name"],
+                    "description": header.get("brief", header.get("description", "")),
+                    "arguments": header.get("arguments", ""),
+                }
+                if header.get("cost"):
+                    entry["cost"] = header["cost"]
+                tools.append(entry)
 
     # --- Managed tools (definitions/*.py with meta dict) ---
     defs_dir = tools_path / "definitions"
