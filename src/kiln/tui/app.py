@@ -1007,7 +1007,7 @@ class KilnApp:
                 # Start heartbeat watcher
                 self._heartbeat_task = asyncio.ensure_future(self._heartbeat_watcher())
 
-                # Drain any pre-loaded prompts (startup, maintenance, --prompt).
+                # Drain any pre-loaded prompts (startup, message queue, --prompt).
                 # The harness populates user_message_queue during start().
                 # Also handle direct prompt for ephemeral agents.
                 prompt = self._harness.config.prompt

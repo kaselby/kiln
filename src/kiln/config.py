@@ -69,7 +69,6 @@ class AgentConfig:
     # Session lifecycle
     continue_session: bool = False
     resume_session: str | None = None
-    maintenance: bool = False
     prompt: str | None = None
 
     # Permission mode
