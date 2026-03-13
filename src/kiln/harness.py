@@ -82,6 +82,7 @@ class KilnHarness:
         self.user_message_queue: list[str] = []
         self.ui_events: list[dict] = []
         self.show_thinking: bool = True
+        self._resume_uuid: str | None = None  # set in _build_options if resuming
         self._worklog_path = self._resolve_worklog_path()
 
         # Spawned subagents default to yolo — no human watching
@@ -307,6 +308,9 @@ class KilnHarness:
                 if entry.get("cwd"):
                     cwd = entry["cwd"]
 
+        # Expose resume UUID so the TUI can locate the prior conversation.
+        self._resume_uuid = resume_uuid
+
         # Stderr logging
         log_dir = self.config.home / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -440,6 +444,21 @@ class KilnHarness:
         dest = dest_dir / f"{today}-{self.agent_id}.jsonl"
         shutil.copy2(source, dest)
         return str(dest)
+
+    def get_prior_conversation_jsonl(self) -> "Path | None":
+        """Return the JSONL path for the resumed session's conversation, or None.
+
+        Used by the TUI to render prior message history when resuming.
+        Only returns a path if (a) this session was started as a resume/continue
+        and (b) the JSONL file actually exists on disk.
+        """
+        if not self._resume_uuid:
+            return None
+        cwd = self.config.project or safe_getcwd()
+        cwd = str(Path(cwd).resolve())
+        project_dir_name = cwd.replace("/", "-").replace(".", "-")
+        path = Path.home() / ".claude" / "projects" / project_dir_name / f"{self._resume_uuid}.jsonl"
+        return path if path.exists() else None
 
     def prepare_shutdown(self) -> None:
         """Called by the TUI when the user initiates shutdown.

@@ -516,6 +516,10 @@ class KilnApp:
         # Initial send task (startup + --prompt), tracked separately for cancellation
         self._initial_task: asyncio.Task | None = None
 
+        # Resume indicator: prepended to the first user message when resuming a session.
+        # Set to True in _main() after start() if the session is a resume/continue.
+        self._resume_indicator_pending: bool = False
+
         # Channel view state: "agent" or "channel:<name>"
         self._current_view: str = "agent"
 
@@ -990,6 +994,11 @@ class KilnApp:
 
         _tprint("<dim>Session started: {}</dim>\n", self._harness.agent_id)
 
+        # Resumed session: show prior conversation history and arm the indicator.
+        if getattr(self._harness, "_resume_uuid", None):
+            self._render_prior_conversation()
+            self._resume_indicator_pending = True
+
         try:
             with patch_stdout():
                 # Start inbox watcher for idle message delivery
@@ -1066,6 +1075,80 @@ class KilnApp:
             _tprint("<dim>Disconnecting...</dim>")
             await self._harness.stop()
 
+    def _render_prior_conversation(self) -> None:
+        """Render prior conversation history for resumed sessions.
+
+        Reads the conversation JSONL from the prior session and prints the last
+        few turns to scrollback so the user has context when resuming.
+        Shows at most MAX_TURNS turns (user+assistant pairs); older turns are
+        indicated by a count but not shown.
+        """
+        MAX_TURNS = 5
+        get_jsonl = getattr(self._harness, "get_prior_conversation_jsonl", None)
+        if not get_jsonl:
+            return
+        jsonl_path = get_jsonl()
+        if not jsonl_path:
+            return
+
+        # Parse user/assistant messages from JSONL (skip queue-ops, progress, etc.)
+        turns: list[tuple[str, str]] = []  # (role, text)
+        try:
+            with open(jsonl_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = entry.get("type", "")
+                    if etype not in ("user", "assistant"):
+                        continue
+                    msg = entry.get("message", {})
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    # content may be a string or a list of blocks
+                    if isinstance(content, str):
+                        text = content.strip()
+                    elif isinstance(content, list):
+                        parts = []
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                t = block.get("text", "").strip()
+                                if t:
+                                    parts.append(t)
+                        text = "\n".join(parts).strip()
+                    else:
+                        continue
+                    if text and role in ("user", "assistant"):
+                        turns.append((role, text))
+        except OSError:
+            return
+
+        if not turns:
+            return
+
+        total_turns = len(turns)
+        shown = turns[-MAX_TURNS * 2:]  # last N pairs (each pair = 2 entries)
+        skipped = total_turns - len(shown)
+
+        _tprint("<dim>\u2500\u2500\u2500 Prior conversation \u2500\u2500\u2500</dim>")
+        if skipped > 0:
+            _tprint("<dim>  ({} earlier messages not shown)</dim>", skipped)
+
+        for role, text in shown:
+            # Truncate very long messages
+            MAX_CHARS = 500
+            display = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + " \u2026"
+            if role == "user":
+                _tprint("\n<user>You:</user> {}", display)
+            else:
+                _tprint("\n<assistant>{}:</assistant> {}", self._agent_label, display)
+
+        _tprint("\n<dim>\u2500\u2500\u2500 Resuming \u2500\u2500\u2500\n</dim>")
+
     async def _send_and_receive(self, text: str, source: str = "user") -> None:
         """Send a message and render the full response."""
         self._stream_chunks = []
@@ -1075,7 +1158,13 @@ class KilnApp:
         try:
             # Inject timestamp so the agent has time awareness
             ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            stamped = f"[{ts}]\n{text}"
+            # Prepend resume indicator to the first user-typed message of a resumed session.
+            # This ensures the agent knows it's resuming without auto-firing a round-trip.
+            if self._resume_indicator_pending and source == "user":
+                self._resume_indicator_pending = False
+                stamped = f"[{ts}] [Resumed session]\n{text}"
+            else:
+                stamped = f"[{ts}]\n{text}"
             await self._harness.send(stamped)
 
             async for msg in self._harness.receive():
