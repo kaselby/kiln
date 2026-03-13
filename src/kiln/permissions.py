@@ -195,19 +195,16 @@ def _has_rm_rf(command: str) -> bool:
     # Quick exit
     if not re.search(r"\brm\s", command):
         return False
-    # Single flag group: rm -rf, rm -fr, rm -rfi, etc.
-    if re.search(r"\brm\s+.*-\w*(?:r\w*f|f\w*r)", command):
-        return True
-    # Separate flags: rm -r -f, rm -r somepath -f, etc.
-    # Collect all short flags after rm
     match = re.search(r"\brm\s(.*)", command)
-    if match:
-        after_rm = match.group(1)
-        flags = re.findall(r"-(\w+)", after_rm)
-        all_flags = "".join(flags)
-        if "r" in all_flags and "f" in all_flags:
-            return True
-    return False
+    if not match:
+        return False
+    after_rm = match.group(1)
+    # Collect only actual flag tokens — must be preceded by whitespace or at
+    # start of string. This excludes hyphens embedded in filenames like
+    # "aleph-first-bay.yml" where "-first" would be a false positive.
+    flags = re.findall(r"(?:^|\s)-(\w+)", after_rm)
+    all_flags = "".join(flags)
+    return "r" in all_flags and "f" in all_flags
 
 
 def _is_exempt(reason: str, cwd: str, agent_home: str, command: str = "") -> bool:
