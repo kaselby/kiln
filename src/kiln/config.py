@@ -107,6 +107,9 @@ class AgentConfig:
     # Keys and values are agent-defined — kiln imposes no schema.
     hooks: dict[str, dict] = field(default_factory=dict)
 
+    # TUI: show hook firings in terminal when they produce output (opt-in)
+    hook_visibility: bool = False
+
     # Tmux session prefix for agent naming
     session_prefix: str = "kiln-"
 
@@ -233,7 +236,7 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
     for field_name in [
         "identity_doc", "model", "effort", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
-        "inbox_dir", "plans_dir", "mcp_server",
+        "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
     ]:
         if field_name in raw:
             setattr(config, field_name, raw[field_name])

@@ -80,6 +80,8 @@ TUI_STYLE = Style.from_dict({
     "diff-add": "ansigreen",
     "diff-rm": "ansired",
     "diff-hunk": "ansicyan",
+    "hook": "ansiblue",
+    "hook-block": "ansired bold",
     "agent-msg": "ansimagenta",
     "agent-msg-b": "ansimagenta bold",
     "perm-prompt": "ansiyellow bold",
@@ -1435,6 +1437,23 @@ class KilnApp:
                     _tprint("\n<dim>  \u2709 [{}] \u2192 {}</dim>", channel, summary)
                 else:
                     _tprint("\n<dim>  \u2709 \u2192 {}: {}</dim>", to, summary)
+            elif etype == "hook_fired":
+                hook_name = ev.get("hook", "?")
+                decision = ev.get("decision", "")
+                ctx_preview = ev.get("context", "")
+                reason = ev.get("reason", "")
+                updated = ev.get("updated_output", False)
+                if decision == "block":
+                    msg = f"  \u26a1 hook:{hook_name} \u2192 BLOCKED"
+                    if reason:
+                        msg += f" ({reason})"
+                    _tprint("\n<hook-block>{}</hook-block>", msg)
+                elif decision:
+                    _tprint("\n<hook>  \u26a1 hook:{} \u2192 {}</hook>", hook_name, decision)
+                elif ctx_preview:
+                    _tprint("\n<hook>  \u26a1 hook:{} \u2192 {}</hook>", hook_name, ctx_preview)
+                elif updated:
+                    _tprint("\n<hook>  \u26a1 hook:{} \u2192 (output replaced)</hook>", hook_name)
 
     def _handle_sdk_message(self, msg: object) -> None:
         """Route an incoming SDK message to the appropriate handler."""

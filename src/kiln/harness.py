@@ -31,6 +31,7 @@ from .hooks import (
     create_read_tracking_hook,
     create_skill_context_hook,
     create_usage_log_hook,
+    wrap_hook_visibility,
 )
 from .names import generate_agent_name
 from .permissions import create_permission_hook
@@ -211,6 +212,18 @@ class KilnHarness:
 
         plans_path = self.config.plans_path
         plan_nudge = create_plan_nudge_hook(plans_path / f"{self.agent_id}.yml")
+
+        # Wrap output-producing hooks with terminal visibility if enabled.
+        # Silent hooks (read_tracker, usage_log, message_sent) are excluded —
+        # they never produce agent-facing output so there's nothing to show.
+        if self.config.hook_visibility:
+            ui = self.ui_events
+            inbox_check = wrap_hook_visibility(inbox_check, "inbox_check", ui)
+            queued_messages = wrap_hook_visibility(queued_messages, "queued_messages", ui)
+            context_warning = wrap_hook_visibility(context_warning, "context_warning", ui)
+            active_agents = wrap_hook_visibility(active_agents, "active_agents", ui)
+            plan_nudge = wrap_hook_visibility(plan_nudge, "plan_nudge", ui)
+            skill_context = wrap_hook_visibility(skill_context, "skill_context", ui)
 
         hooks = {
             "PostToolUse": [

@@ -589,6 +589,49 @@ def parse_message(msg_file: Path) -> dict | None:
     return result
 
 
+def wrap_hook_visibility(hook_fn, name: str, ui_events: list[dict]):
+    """Wrap a hook to push UI events when it produces visible output.
+
+    Only emits events when the hook actually does something:
+    - additionalContext injected into the agent's context
+    - updatedMCPToolOutput replacing a tool's response
+    - Stop/block decision made
+
+    Silent hooks (the majority of firings) produce no UI noise.
+    """
+
+    async def visible_hook(
+        input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        result = await hook_fn(input_data, tool_use_id, context)
+        if not result:
+            return result
+
+        hook_output = result.get("hookSpecificOutput", {})
+        ctx = hook_output.get("additionalContext", "")
+        updated_output = hook_output.get("updatedMCPToolOutput")
+        decision = result.get("decision", "")
+
+        if ctx or decision or updated_output:
+            ev: dict = {"type": "hook_fired", "hook": name}
+            if ctx:
+                # First line only, truncated — full context goes to the agent
+                first_line = ctx.split("\n")[0]
+                ev["context"] = first_line[:100] + ("..." if len(first_line) > 100 else "")
+            if decision:
+                ev["decision"] = decision
+                reason = result.get("reason", "")
+                if reason:
+                    ev["reason"] = reason[:100]
+            if updated_output:
+                ev["updated_output"] = True
+            ui_events.append(ev)
+
+        return result
+
+    return visible_hook
+
+
 def create_queued_message_hook(queue: list[str], ui_events: list[dict]):
     """Create a PostToolUse hook that delivers queued user messages mid-turn.
 
