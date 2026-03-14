@@ -633,12 +633,13 @@ def wrap_hook_visibility(hook_fn, name: str, ui_events: list[dict]):
 
 
 def create_queued_message_hook(queue: list[str], ui_events: list[dict]):
-    """Create a PostToolUse hook that delivers queued user messages mid-turn.
+    """Create a PostToolUse hook that delivers steering messages mid-turn.
 
-    When the user types while the agent is receiving, messages are appended
-    to the shared queue. This hook drains the queue after each tool call and
-    injects the messages as additionalContext so the agent sees them before
-    its next action. Also pushes followup_delivered UI events for TUI rendering.
+    Steering messages are user input typed while the agent is receiving.
+    They're injected as additionalContext so the agent sees them before
+    its next action — all at once, not one-at-a-time. Distinct from
+    followup messages, which are delivered as proper user prompts between
+    turns by the TUI.
     """
 
     async def queued_message_hook(
