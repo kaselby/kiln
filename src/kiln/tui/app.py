@@ -1343,7 +1343,37 @@ class KilnApp:
 
         Called periodically by the heartbeat watcher. Picks up changes
         made by the agent (or user) to the session config file.
+
+        Also checks file-based overrides at ``state/heartbeat-{agent_id}``
+        (per-agent) and ``state/heartbeat`` (shared fallback). These files
+        contain a plain number (minutes) or "off". Per-agent file takes
+        priority over shared fallback, which takes priority over session
+        config.
         """
+        # --- File-based override (takes priority over session config) ---
+        state_dir = self._harness.config.home / "state"
+        agent_id = self._harness.agent_id
+        file_override = self._read_heartbeat_file(
+            state_dir / f"heartbeat-{agent_id}"
+        )
+        if file_override is None:
+            file_override = self._read_heartbeat_file(state_dir / "heartbeat")
+
+        if file_override is not None:
+            if file_override == 0:
+                # "off" — disable heartbeat
+                self._heartbeat_enabled = False
+                return
+            else:
+                self._heartbeat_enabled = True
+                if file_override != self._heartbeat_interval:
+                    self._heartbeat_interval = file_override
+                    self._heartbeat_backoff = min(
+                        self._heartbeat_backoff, self._heartbeat_interval
+                    )
+                return
+
+        # --- Session config fallback ---
         sc = self._harness.session_config
         if sc is None:
             return
@@ -1364,6 +1394,27 @@ class KilnApp:
                     )
             except (ValueError, TypeError):
                 pass
+
+    @staticmethod
+    def _read_heartbeat_file(path: Path) -> float | None:
+        """Read a heartbeat override file.
+
+        Returns interval in seconds, 0 for "off", or None if file
+        doesn't exist or is unparseable.
+        """
+        try:
+            text = path.read_text().strip().lower()
+        except OSError:
+            return None
+        if text == "off":
+            return 0
+        try:
+            minutes = float(text)
+            if minutes > 0:
+                return minutes * 60
+        except ValueError:
+            pass
+        return None
 
     async def _heartbeat_watcher(self) -> None:
         """Nudge the agent after a period of inactivity."""
