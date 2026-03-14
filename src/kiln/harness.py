@@ -43,6 +43,7 @@ from .prompt import (
     resolve_model,
 )
 from .registry import lookup_session, register_session
+from .session_config import SessionConfig
 from .shell import safe_getcwd
 from .tools import FileState, SessionControl, create_mcp_server
 
@@ -79,15 +80,32 @@ class KilnHarness:
         self.restart_requested = False
         self.continue_requested = False
         self.handoff_text: str | None = None
-        self.user_message_queue: list[str] = []
+        self.steering_queue: list[str] = []
+        self.followup_queue: list[str] = []
         self.ui_events: list[dict] = []
-        self.show_thinking: bool = True
+        self.session_config: SessionConfig | None = None  # created in _build_options
         self._resume_uuid: str | None = None  # set in _build_options if resuming
         self._worklog_path = self._resolve_worklog_path()
 
         # Spawned subagents default to yolo — no human watching
         if self.config.parent and self.config.initial_mode is None:
             self.config.initial_mode = "yolo"
+
+    @property
+    def show_thinking(self) -> bool:
+        """Whether to display thinking blocks in the TUI.
+
+        Reads from session config on every access so mid-session changes
+        take effect immediately.
+        """
+        if self.session_config is not None:
+            return bool(self.session_config.get("show_thinking", True))
+        return True
+
+    @show_thinking.setter
+    def show_thinking(self, value: bool) -> None:
+        if self.session_config is not None:
+            self.session_config.set("show_thinking", value)
 
     def _resolve_worklog_path(self) -> Path:
         """Compute the worklog path for this session."""
@@ -192,6 +210,16 @@ class KilnHarness:
         file_state = FileState()
         self.session_control = SessionControl()
 
+        # Per-session runtime config — seeded from harness config, agent-writable.
+        # Agent harnesses extend with their own defaults (e.g. show_thinking).
+        self.session_config = SessionConfig(
+            path=self.config.home / "state" / f"session-config-{self.agent_id}.yml",
+            defaults={
+                "heartbeat_enabled": self.config.heartbeat,
+                "heartbeat_interval": self.config.heartbeat_interval,
+            },
+        )
+
         # Build infrastructure hooks
         inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events)
         read_tracker = create_read_tracking_hook(inbox, file_state=file_state)
@@ -207,7 +235,7 @@ class KilnHarness:
             self.config.tools_path / "bin",
         )
         queued_messages = create_queued_message_hook(
-            self.user_message_queue, self.ui_events,
+            self.steering_queue, self.ui_events,
         )
         message_sent = create_message_sent_hook(self.ui_events)
 
@@ -464,7 +492,7 @@ class KilnHarness:
         """Called by the TUI when the user initiates shutdown.
 
         Override in custom harnesses to push session-end prompts
-        onto user_message_queue (e.g. session summary, memory update).
+        onto followup_queue (e.g. session summary, memory update).
         The TUI will drain the queue before disconnecting.
         """
 
@@ -482,6 +510,8 @@ class KilnHarness:
         if self._stderr_log and self._stderr_log.exists() and self._stderr_log.stat().st_size == 0:
             self._stderr_log.unlink()
             self._stderr_log = None
+        if self.session_config:
+            self.session_config.cleanup()
 
     async def __aenter__(self):
         await self.start()

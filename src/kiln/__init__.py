@@ -21,10 +21,12 @@ from .harness import KilnHarness
 from .names import generate_agent_name
 from .prompt import load_tool_docs
 from .registry import lookup_session, register_session
+from .session_config import SessionConfig
 
 __all__ = [
     "AgentConfig",
     "KilnHarness",
+    "SessionConfig",
     "generate_agent_name",
     "load_agent_spec",
     "load_tool_docs",

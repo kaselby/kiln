@@ -508,10 +508,12 @@ class KilnApp:
         self._last_real_activity: float = time.monotonic()
         self._idle_nudge_sent: bool = False
 
-        # Queued messages: user input submitted while receiving.
-        # Uses the harness's shared queue so the PostToolUse hook can
-        # drain it mid-turn (not just at turn end).
-        self._message_queue = harness.user_message_queue
+        # Steering queue: user input submitted while receiving.
+        # Drained mid-turn by the PostToolUse hook (all at once as additionalContext).
+        self._steering_queue = harness.steering_queue
+        # Followup queue: scripted messages (thread message_queue, session-end prompts).
+        # Drained between turns, one at a time, as proper user prompts.
+        self._followup_queue = harness.followup_queue
 
         # Initial send task (startup + --prompt), tracked separately for cancellation
         self._initial_task: asyncio.Task | None = None
@@ -663,7 +665,7 @@ class KilnApp:
             text = app_ref._input_buffer.text.strip()
             if not text:
                 return
-            app_ref._message_queue.append(text)
+            app_ref._steering_queue.append(text)
             app_ref._input_buffer.reset()
             _tprint("<dim>Queued:</dim> {}", text)
 
@@ -895,10 +897,10 @@ class KilnApp:
             if pending:
                 parts.append(f"\U0001f4e8 {pending} pending")
 
-        # Queued user messages waiting for delivery
-        if self._message_queue:
-            n = len(self._message_queue)
-            parts.append(f"<tool>{n} queued</tool>")
+        # Queued messages waiting for delivery
+        n_queued = len(self._steering_queue) + len(self._followup_queue)
+        if n_queued:
+            parts.append(f"<tool>{n_queued} queued</tool>")
 
         if self._receiving and not self._pending_permission:
             parts.append("Esc to interrupt")
@@ -1007,22 +1009,21 @@ class KilnApp:
                 # Start heartbeat watcher
                 self._heartbeat_task = asyncio.ensure_future(self._heartbeat_watcher())
 
-                # Drain any pre-loaded prompts (startup, message queue, --prompt).
-                # The harness populates user_message_queue during start().
-                # Also handle direct prompt for ephemeral agents.
+                # Drain the initial prompt (startup message or --prompt).
+                # The harness populates steering_queue during start().
                 prompt = self._harness.config.prompt
-                if prompt and not self._message_queue:
+                if prompt and not self._steering_queue:
                     # No startup message queued — send prompt directly
-                    self._message_queue.append(prompt)
+                    self._steering_queue.append(prompt)
 
                 async def send_initial():
                     await asyncio.sleep(0)  # yield once to let Application start
-                    if self._message_queue:
-                        msg = self._message_queue.pop(0)
+                    if self._steering_queue:
+                        msg = self._steering_queue.pop(0)
                         _tprint("<dim>...</dim>")
                         self._receive_task = asyncio.ensure_future(self._send_and_receive(msg))
 
-                if self._message_queue:
+                if self._steering_queue:
                     self._initial_task = asyncio.ensure_future(send_initial())
 
                 await self._app.run_async()
@@ -1037,25 +1038,17 @@ class KilnApp:
                         await task
                     except asyncio.CancelledError:
                         pass
-            # Clean up per-agent heartbeat state file so it doesn't accumulate
-            # across sessions. Each session writes its own file if /heartbeat
-            # is used; remove it on exit so stale files don't pile up.
-            try:
-                self._heartbeat_file().unlink(missing_ok=True)
-            except OSError:
-                pass
-
             # Bypass permissions for unattended exit tasks (summary, archival)
             self._perm_mode = PermissionMode.YOLO
             sc = self._harness.session_control
             skip_summary = getattr(self._harness.config, "ephemeral", False) or (sc and sc.skip_summary)
             if not skip_summary:
                 self._harness.prepare_shutdown()
-                if self._message_queue:
+                if self._followup_queue:
                     _tprint("\n<dim>Running session-end protocol...</dim>")
                     try:
-                        while self._message_queue:
-                            msg = self._message_queue.pop(0)
+                        while self._followup_queue:
+                            msg = self._followup_queue.pop(0)
                             await self._harness.send(msg)
                             async for _ in self._harness.receive():
                                 pass
@@ -1204,14 +1197,18 @@ class KilnApp:
             if self._app:
                 self._app.invalidate()
 
-            # Send queued user message if any
-            if self._message_queue:
-                queued = self._message_queue.pop(0)
-                _tprint("<user>You:</user> {}", queued)
+            # Send next queued message: steering first (user-typed), then followup
+            next_msg = None
+            if self._steering_queue:
+                next_msg = self._steering_queue.pop(0)
+            elif self._followup_queue:
+                next_msg = self._followup_queue.pop(0)
+            if next_msg:
+                _tprint("<user>You:</user> {}", next_msg)
                 self._receiving = True
                 if self._app:
                     self._app.invalidate()
-                self._receive_task = asyncio.ensure_future(self._send_and_receive(queued))
+                self._receive_task = asyncio.ensure_future(self._send_and_receive(next_msg))
 
     async def _do_interrupt(self) -> None:
         """Interrupt the current response."""
@@ -1341,47 +1338,32 @@ class KilnApp:
 
     # ---- Heartbeat ----
 
-    def _heartbeat_file(self) -> Path:
-        """Return the per-agent heartbeat state file path."""
-        return self._harness.config.home / "state" / f"heartbeat-{self._harness.agent_id}"
+    def _sync_heartbeat_from_config(self) -> None:
+        """Read heartbeat settings from the per-session runtime config.
 
-    def _check_heartbeat_file(self) -> None:
-        """Read heartbeat config from per-agent state file.
-
-        Checks state/heartbeat-{agent_id} first. Only falls back to the shared
-        state/heartbeat if heartbeat was already enabled (e.g. canonical/persistent
-        sessions). Without this guard, the shared file would enable heartbeat on
-        every agent — including ephemeral ones that shouldn't have it.
+        Called periodically by the heartbeat watcher. Picks up changes
+        made by the agent (or user) to the session config file.
         """
-        per_agent = self._heartbeat_file()
-        if per_agent.exists():
-            hb_file = per_agent
-        elif self._heartbeat_enabled:
-            # Only read the shared file if heartbeat is already on —
-            # don't let a stale shared file activate heartbeat on agents
-            # that weren't configured for it.
-            shared = self._harness.config.home / "state" / "heartbeat"
-            hb_file = shared
-        else:
+        sc = self._harness.session_config
+        if sc is None:
             return
-        try:
-            if not hb_file.exists():
-                return
-            val = hb_file.read_text().strip().lower()
-            if val == "off":
-                self._heartbeat_enabled = False
-            else:
-                minutes = float(val)
-                if minutes > 0:
-                    self._heartbeat_interval = minutes * 60
-                    self._heartbeat_enabled = True
-                    # Clamp backoff to the new interval cap so a previously
-                    # large backoff doesn't block the newly reduced interval.
+
+        enabled = sc.get("heartbeat_enabled")
+        if enabled is not None:
+            self._heartbeat_enabled = bool(enabled)
+
+        interval = sc.get("heartbeat_interval")
+        if interval is not None:
+            try:
+                new_interval = float(interval)
+                if new_interval > 0 and new_interval != self._heartbeat_interval:
+                    self._heartbeat_interval = new_interval
+                    # Clamp backoff so the new interval takes effect promptly.
                     self._heartbeat_backoff = min(
                         self._heartbeat_backoff, self._heartbeat_interval
                     )
-        except (ValueError, OSError):
-            pass
+            except (ValueError, TypeError):
+                pass
 
     async def _heartbeat_watcher(self) -> None:
         """Nudge the agent after a period of inactivity."""
@@ -1416,7 +1398,7 @@ class KilnApp:
                     continue
 
             # --- Regular heartbeat ---
-            self._check_heartbeat_file()
+            self._sync_heartbeat_from_config()
             if not self._heartbeat_enabled:
                 continue
             if self._context_tokens > 150_000:
@@ -1470,21 +1452,13 @@ class KilnApp:
             state = "on" if self._heartbeat_enabled else "off"
             _tprint("<dim>Heartbeat: {} (interval {}min)</dim>",
                     state, int(self._heartbeat_interval / 60))
-        # Persist to per-agent state file so the setting survives
-        # _check_heartbeat_file polls and doesn't affect other agents.
-        self._write_heartbeat_file()
-
-    def _write_heartbeat_file(self) -> None:
-        """Write current heartbeat state to the per-agent state file."""
-        hb_file = self._heartbeat_file()
-        try:
-            hb_file.parent.mkdir(parents=True, exist_ok=True)
-            if self._heartbeat_enabled:
-                hb_file.write_text(str(int(self._heartbeat_interval / 60)))
-            else:
-                hb_file.write_text("off")
-        except OSError:
-            pass
+        # Persist to session config so changes survive and the agent can see them.
+        sc = self._harness.session_config
+        if sc is not None:
+            sc.update({
+                "heartbeat_enabled": self._heartbeat_enabled,
+                "heartbeat_interval": self._heartbeat_interval,
+            })
 
     def _pending_message_count(self) -> int:
         """Count unread messages in the inbox."""
