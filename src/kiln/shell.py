@@ -130,11 +130,14 @@ class PersistentShell:
 
     @staticmethod
     def _build_env(overrides: dict[str, str] | None) -> dict[str, str]:
-        """Build a clean environment, stripping CLAUDE* vars."""
+        """Build a clean environment, stripping CLAUDE* vars and tmux guards."""
         base = dict(os.environ)
         for key in list(base):
             if key.startswith("CLAUDE"):
                 del base[key]
+        # Strip ALEPH_IN_TMUX so subprocess-spawned `aleph` commands always
+        # create their own tmux session instead of running inside our pipe.
+        base.pop("ALEPH_IN_TMUX", None)
         if overrides:
             base.update(overrides)
         return base
