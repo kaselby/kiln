@@ -71,6 +71,13 @@ class AgentConfig:
     resume_session: str | None = None
     prompt: str | None = None
 
+    # Session messages — orientation (startup) and cleanup (shutdown) prompts.
+    # Both support template variables: {agent_id}, {today}, {now}, {summary_path}.
+    # Set to empty string to explicitly suppress (e.g. cleanup: "" disables
+    # session-end prompts even if a subclass would normally provide them).
+    orientation: str | None = None    # startup message (first user turn)
+    cleanup: str | None = None        # session-end prompt
+
     # Permission mode
     initial_mode: str | None = None   # safe, supervised, yolo (trusted is TUI-only)
 
@@ -80,7 +87,8 @@ class AgentConfig:
 
     # Heartbeat
     heartbeat: bool = False
-    heartbeat_interval: float = 1800.0
+    heartbeat_max: float = 1800.0       # cap for exponential backoff (seconds)
+    heartbeat_override: float = 0.0     # fixed interval bypassing backoff (seconds, 0 = disabled)
 
     # Idle nudge: send a message after prolonged inactivity (seconds, 0 = disabled)
     idle_nudge_timeout: float = 0.0
@@ -236,6 +244,7 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
         "identity_doc", "model", "effort", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
+        "orientation", "cleanup",
     ]:
         if field_name in raw:
             setattr(config, field_name, raw[field_name])
@@ -268,7 +277,9 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
         hb = raw["heartbeat"]
         if isinstance(hb, dict):
             config.heartbeat = hb.get("enabled", False)
-            config.heartbeat_interval = hb.get("interval", 1800.0)
+            # Accept both "max"/"interval" (interval is legacy alias)
+            config.heartbeat_max = hb.get("max", hb.get("interval", 1800.0))
+            config.heartbeat_override = hb.get("override", 0.0)
         else:
             config.heartbeat = bool(hb)
 

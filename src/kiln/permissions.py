@@ -415,6 +415,16 @@ def _notify(title: str, message: str) -> None:
         pass
 
 
+async def _headless_deny(req: "PermissionRequest") -> bool:
+    """Default permission handler for headless sessions — always deny.
+
+    Used when no TUI is present to approve confirm-tier guardrails.
+    Block-tier commands are handled before this is called and don't
+    need a handler.
+    """
+    return False
+
+
 def create_permission_hook(
     get_mode: Callable[[], PermissionMode],
     request_permission: PermissionHandler,

@@ -282,7 +282,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         config.initial_mode = args.mode
     if args.heartbeat is not None:
         config.heartbeat = True
-        config.heartbeat_interval = float(args.heartbeat) * 60
+        config.heartbeat_max = float(args.heartbeat) * 60
     if args.idle_nudge is not None:
         config.idle_nudge_timeout = float(args.idle_nudge) * 60
 
@@ -338,7 +338,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         kiln_bin = shutil.which("kiln") or sys.argv[0]
         exec_args = [kiln_bin, "run", str(spec_path.resolve()),
                      "--mode", "yolo",
-                     "--heartbeat", str(int(config.heartbeat_interval / 60)),
+                     "--heartbeat", str(int(config.heartbeat_max / 60)),
                      "--parent", harness.agent_id, "--continuation"]
         if args.model:
             exec_args += ["--model", args.model]

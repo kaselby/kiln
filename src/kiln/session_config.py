@@ -26,10 +26,10 @@ class SessionConfig:
 
         config = SessionConfig(
             path=home / "state" / f"session-config-{agent_id}.yml",
-            defaults={"heartbeat_enabled": True, "heartbeat_interval": 600},
+            defaults={"heartbeat_enabled": True, "heartbeat_max": 600},
         )
-        config.get("heartbeat_interval")  # reads from file, falls back to default
-        config.set("heartbeat_interval", 30)  # writes to file
+        config.get("heartbeat_max")  # reads from file, falls back to default
+        config.set("heartbeat_override", 300)  # writes to file
     """
 
     # Core tunables with kiln-level defaults.
@@ -37,7 +37,8 @@ class SessionConfig:
     # worklog_interval).
     CORE_DEFAULTS: dict[str, object] = {
         "heartbeat_enabled": False,
-        "heartbeat_interval": 1800,  # seconds
+        "heartbeat_max": 1800,        # seconds — cap for exponential backoff
+        "heartbeat_override": 0,      # seconds — fixed interval bypassing backoff (0 = disabled)
     }
 
     def __init__(self, path: Path, defaults: dict | None = None):

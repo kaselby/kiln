@@ -497,8 +497,10 @@ class KilnApp:
         self._watcher_task: asyncio.Task | None = None
 
         # Heartbeat: nudge agent after idle period, with exponential backoff.
+        # heartbeat_max = cap for exponential backoff; heartbeat_override = fixed interval (no backoff).
         self._heartbeat_enabled = harness.config.heartbeat
-        self._heartbeat_interval: float = harness.config.heartbeat_interval
+        self._heartbeat_max: float = harness.config.heartbeat_max
+        self._heartbeat_override: float = harness.config.heartbeat_override
         self._heartbeat_backoff: float = self._HEARTBEAT_BASE_INTERVAL
         self._heartbeat_task: asyncio.Task | None = None
         self._heartbeat_oneshot: float | None = None  # one-shot override (seconds)
@@ -1009,13 +1011,8 @@ class KilnApp:
                 # Start heartbeat watcher
                 self._heartbeat_task = asyncio.ensure_future(self._heartbeat_watcher())
 
-                # Drain the initial prompt (startup message or --prompt).
+                # Drain initial startup message (orientation or --prompt).
                 # The harness populates steering_queue during start().
-                prompt = self._harness.config.prompt
-                if prompt and not self._steering_queue:
-                    # No startup message queued — send prompt directly
-                    self._steering_queue.append(prompt)
-
                 async def send_initial():
                     await asyncio.sleep(0)  # yield once to let Application start
                     if self._steering_queue:
@@ -1352,15 +1349,23 @@ class KilnApp:
         if enabled is not None:
             self._heartbeat_enabled = bool(enabled)
 
-        interval = sc.get("heartbeat_interval")
-        if interval is not None:
+        # Override: fixed interval bypassing backoff (0 = disabled)
+        override = sc.get("heartbeat_override")
+        if override is not None:
             try:
-                new_interval = float(interval)
-                if new_interval > 0 and new_interval != self._heartbeat_interval:
-                    self._heartbeat_interval = new_interval
-                    # Clamp backoff so the new interval takes effect promptly.
+                self._heartbeat_override = float(override)
+            except (ValueError, TypeError):
+                pass
+
+        # Max: cap for exponential backoff (fall back to legacy heartbeat_interval)
+        hb_max = sc.get("heartbeat_max") or sc.get("heartbeat_interval")
+        if hb_max is not None:
+            try:
+                new_max = float(hb_max)
+                if new_max > 0 and new_max != self._heartbeat_max:
+                    self._heartbeat_max = new_max
                     self._heartbeat_backoff = min(
-                        self._heartbeat_backoff, self._heartbeat_interval
+                        self._heartbeat_backoff, self._heartbeat_max
                     )
             except (ValueError, TypeError):
                 pass
@@ -1404,7 +1409,15 @@ class KilnApp:
             if self._context_tokens > 150_000:
                 continue
             elapsed = time.monotonic() - self._last_auto_delivery
-            interval = self._heartbeat_oneshot or self._heartbeat_backoff
+
+            # Priority: oneshot > override > backoff
+            if self._heartbeat_oneshot:
+                interval = self._heartbeat_oneshot
+            elif self._heartbeat_override > 0:
+                interval = self._heartbeat_override
+            else:
+                interval = self._heartbeat_backoff
+
             if elapsed < interval:
                 continue
 
@@ -1421,9 +1434,11 @@ class KilnApp:
                 self._app.invalidate()
             await self._receive_task
 
-            self._heartbeat_backoff = min(
-                self._heartbeat_backoff * 2, self._heartbeat_interval
-            )
+            # Only increase backoff when not using override
+            if self._heartbeat_override <= 0:
+                self._heartbeat_backoff = min(
+                    self._heartbeat_backoff * 2, self._heartbeat_max
+                )
 
     def _toggle_heartbeat(self, text: str) -> None:
         """Handle /heartbeat command."""
@@ -1431,33 +1446,46 @@ class KilnApp:
         if len(parts) >= 2:
             try:
                 minutes = float(parts[1])
-                self._heartbeat_interval = minutes * 60
+                self._heartbeat_override = minutes * 60
                 self._heartbeat_enabled = True
-                # Explicit interval change: reset backoff so the new interval
-                # takes effect on the next fire, not after the old backoff expires.
-                self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
-                _tprint("<dim>Heartbeat: on, interval {}min</dim>", int(minutes))
+                _tprint("<dim>Heartbeat: on, fixed {}min (no backoff)</dim>", int(minutes))
             except ValueError:
                 if parts[1] == "off":
                     self._heartbeat_enabled = False
                     _tprint("<dim>Heartbeat: off</dim>")
                 elif parts[1] == "on":
                     self._heartbeat_enabled = True
-                    _tprint("<dim>Heartbeat: on, interval {}min</dim>",
-                            int(self._heartbeat_interval / 60))
+                    if self._heartbeat_override > 0:
+                        _tprint("<dim>Heartbeat: on, fixed {}min</dim>",
+                                int(self._heartbeat_override / 60))
+                    else:
+                        _tprint("<dim>Heartbeat: on, backoff up to {}min</dim>",
+                                int(self._heartbeat_max / 60))
+                elif parts[1] == "backoff":
+                    # Switch back to backoff mode
+                    self._heartbeat_override = 0.0
+                    self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
+                    self._heartbeat_enabled = True
+                    _tprint("<dim>Heartbeat: on, backoff up to {}min</dim>",
+                            int(self._heartbeat_max / 60))
                 else:
-                    _tprint("<dim>Usage: /heartbeat [on|off|<minutes>]</dim>")
+                    _tprint("<dim>Usage: /heartbeat [on|off|backoff|<minutes>]</dim>")
         else:
             self._heartbeat_enabled = not self._heartbeat_enabled
             state = "on" if self._heartbeat_enabled else "off"
-            _tprint("<dim>Heartbeat: {} (interval {}min)</dim>",
-                    state, int(self._heartbeat_interval / 60))
+            if self._heartbeat_override > 0:
+                _tprint("<dim>Heartbeat: {} (fixed {}min)</dim>",
+                        state, int(self._heartbeat_override / 60))
+            else:
+                _tprint("<dim>Heartbeat: {} (backoff up to {}min)</dim>",
+                        state, int(self._heartbeat_max / 60))
         # Persist to session config so changes survive and the agent can see them.
         sc = self._harness.session_config
         if sc is not None:
             sc.update({
                 "heartbeat_enabled": self._heartbeat_enabled,
-                "heartbeat_interval": self._heartbeat_interval,
+                "heartbeat_max": self._heartbeat_max,
+                "heartbeat_override": self._heartbeat_override,
             })
 
     def _pending_message_count(self) -> int:

@@ -34,7 +34,7 @@ from .hooks import (
     wrap_hook_visibility,
 )
 from .names import generate_agent_name
-from .permissions import create_permission_hook
+from .permissions import PermissionMode, _headless_deny, create_permission_hook
 from .prompt import (
     build_session_context,
     discover_skills,
@@ -216,7 +216,8 @@ class KilnHarness:
             path=self.config.home / "state" / f"session-config-{self.agent_id}.yml",
             defaults={
                 "heartbeat_enabled": self.config.heartbeat,
-                "heartbeat_interval": self.config.heartbeat_interval,
+                "heartbeat_max": self.config.heartbeat_max,
+                "heartbeat_override": self.config.heartbeat_override,
             },
         )
 
@@ -268,17 +269,22 @@ class KilnHarness:
             "Stop": [],
         }
 
-        # Permission hook
+        # Permission hook — always active, even in headless mode.
+        # TUI provides interactive callbacks; headless falls back to
+        # YOLO mode + deny-all for confirm-tier guardrails.
         if self._permission_callbacks:
             get_mode, request_permission = self._permission_callbacks
-            perm_hook = create_permission_hook(
-                get_mode=get_mode,
-                request_permission=request_permission,
-                get_cwd=lambda: self._get_shell_cwd() if self._get_shell_cwd else safe_getcwd(),
-                agent_id=self.agent_id,
-                agent_home=str(self.config.home),
-            )
-            hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[perm_hook])]
+        else:
+            get_mode = lambda: PermissionMode.YOLO
+            request_permission = _headless_deny
+        perm_hook = create_permission_hook(
+            get_mode=get_mode,
+            request_permission=request_permission,
+            get_cwd=lambda: self._get_shell_cwd() if self._get_shell_cwd else safe_getcwd(),
+            agent_id=self.agent_id,
+            agent_home=str(self.config.home),
+        )
+        hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[perm_hook])]
 
         # Resolve tools from agent spec
         resolved = self.config.resolve_tools()
@@ -365,12 +371,67 @@ class KilnHarness:
             stderr=_stderr_callback,
         )
 
+    def _template_vars(self) -> dict[str, str]:
+        """Build template variable dict for orientation and cleanup messages.
+
+        Provides: {agent_id}, {today}, {now}, {summary_path}.
+        Subclasses can override to add agent-specific variables.
+        """
+        today = date.today().strftime("%Y-%m-%d")
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+        sessions_path = self.config.sessions_path
+        summary_path = sessions_path / f"{today}-{self.agent_id}.md"
+        if summary_path.exists():
+            n = 2
+            while (sessions_path / f"{today}-{self.agent_id}_{n}.md").exists():
+                n += 1
+            summary_path = sessions_path / f"{today}-{self.agent_id}_{n}.md"
+
+        return dict(
+            agent_id=self.agent_id,
+            today=today,
+            now=now,
+            summary_path=str(summary_path),
+        )
+
     async def start(self):
-        """Start the agent session."""
+        """Start the agent session.
+
+        Queues orientation message (if configured) onto steering_queue.
+        If --prompt is also set, it goes on followup_queue so it's delivered
+        after orientation completes. If no orientation, --prompt is the
+        startup message on steering_queue (backward-compatible behavior).
+        """
         options = self._build_options()
         self._client = ClaudeSDKClient(options)
         self.register_session()
         await self._client.connect()
+
+        # Queue startup messages
+        orientation = self._build_orientation()
+        if orientation:
+            self.steering_queue.append(orientation)
+
+        if self.config.prompt:
+            if orientation:
+                # Orientation is the startup message; prompt arrives after
+                self.followup_queue.append(self.config.prompt)
+            else:
+                # No orientation — prompt is the startup message
+                self.steering_queue.append(self.config.prompt)
+
+    def _build_orientation(self) -> str | None:
+        """Build the startup orientation message.
+
+        Returns the formatted orientation string, or None if not configured.
+        Subclasses can override to provide role-based defaults.
+        """
+        if self.config.orientation is None:
+            return None
+        if not self.config.orientation.strip():
+            return None
+        return self.config.orientation.rstrip().format(**self._template_vars())
 
     async def send(self, message: str):
         """Send a user message to the agent."""
@@ -489,12 +550,27 @@ class KilnHarness:
         return path if path.exists() else None
 
     def prepare_shutdown(self) -> None:
-        """Called by the TUI when the user initiates shutdown.
+        """Push session-end prompts onto followup_queue.
 
-        Override in custom harnesses to push session-end prompts
-        onto followup_queue (e.g. session summary, memory update).
-        The TUI will drain the queue before disconnecting.
+        If config.cleanup is set, formats it with template variables and
+        queues it. If cleanup is explicitly empty string, no prompt is sent.
+        If cleanup is None (not configured), subclasses can override to
+        provide their own session-end behavior.
         """
+        for prompt in self._get_cleanup_prompts():
+            self.followup_queue.append(prompt)
+
+    def _get_cleanup_prompts(self) -> list[str]:
+        """Return formatted cleanup prompts for session end.
+
+        Subclasses can override to provide role-based defaults when
+        config.cleanup is None.
+        """
+        if self.config.cleanup is None:
+            return []
+        if not self.config.cleanup.strip():
+            return []
+        return [self.config.cleanup.format(**self._template_vars())]
 
     async def stop(self):
         """Disconnect the agent session and clean up resources."""
