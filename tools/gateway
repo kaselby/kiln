@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# name: gateway
+# arguments: "<platform> <action> [args...] | start | stop | status | logs"
+# description: Gateway daemon lifecycle + Discord messaging. Use start/stop/status/logs for daemon management, or <platform> <action> for messaging (send, read, voice, thread, channels).
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# State file discovery — find the running gateway daemon
+# ---------------------------------------------------------------------------
+
+KILN_REPO="${KILN_REPO:-$HOME/Git/kiln}"
+GATEWAY_LOG="${AGENT_HOME:-$HOME/.beth}/logs/gateway.log"
+
+get_agent_home() {
+    echo "${AGENT_HOME:-$HOME/.beth}"
+}
+
+get_pid_file() {
+    echo "$(get_agent_home)/gateway.pid"
+}
+
+is_running() {
+    local pid_file
+    pid_file=$(get_pid_file)
+    if [ -f "$pid_file" ]; then
+        local pid
+        pid=$(cat "$pid_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+find_state() {
+    local state_file
+    # Check AGENT_HOME env var first, then common locations
+    for home in "${AGENT_HOME:-}" "$HOME/.beth" "$HOME/.aleph"; do
+        [ -z "$home" ] && continue
+        state_file="$home/state/gateway.json"
+        if [ -f "$state_file" ]; then
+            echo "$state_file"
+            return 0
+        fi
+    done
+    echo "Error: No running gateway found. Start with: gateway start" >&2
+    return 1
+}
+
+read_state() {
+    local state_file
+    state_file=$(find_state) || exit 1
+    cat "$state_file"
+}
+
+get_base_url() {
+    local state
+    state=$(read_state) || exit 1
+    local bind port
+    bind=$(echo "$state" | jq -r '.bind // "127.0.0.1"')
+    port=$(echo "$state" | jq -r '.port // 18820')
+    echo "http://${bind}:${port}"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+    if is_running; then
+        echo "Gateway already running (pid=$(cat "$(get_pid_file)"))"
+        return 0
+    fi
+
+    local agent_home config_file log_dir
+    agent_home=$(get_agent_home)
+    config_file="$agent_home/services/gateway/config.json"
+    log_dir="$agent_home/logs"
+    mkdir -p "$log_dir"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: Config not found at $config_file" >&2
+        return 1
+    fi
+
+    PYTHONPATH="$KILN_REPO/services" nohup python3 -c "
+import asyncio, signal, os, sys, logging
+sys.path.insert(0, '$KILN_REPO/services')
+from gateway.config import load_config
+from gateway.daemon import GatewayDaemon
+from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
+
+async def run():
+    cfg = load_config(Path('$config_file'))
+    daemon = GatewayDaemon(cfg)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    await daemon.start()
+    await stop.wait()
+    await daemon.stop()
+
+asyncio.run(run())
+" >> "$GATEWAY_LOG" 2>&1 &
+
+    local pid=$!
+    # Wait for startup — Discord connection takes a few seconds
+    sleep 5
+    if is_running; then
+        echo "Gateway started (pid=$(cat "$(get_pid_file)"))"
+    else
+        echo "Error: Gateway failed to start. Check logs: $GATEWAY_LOG" >&2
+        tail -5 "$GATEWAY_LOG" >&2
+        return 1
+    fi
+}
+
+cmd_stop() {
+    local pid_file
+    pid_file=$(get_pid_file)
+    if [ ! -f "$pid_file" ]; then
+        echo "Gateway not running (no PID file)"
+        return 0
+    fi
+    local pid
+    pid=$(cat "$pid_file")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid"
+        echo "Sent SIGTERM to gateway (pid=$pid)"
+        # Wait for clean shutdown
+        for i in $(seq 1 10); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "Gateway stopped"
+                return 0
+            fi
+            sleep 0.5
+        done
+        echo "Warning: gateway still running after 5s"
+    else
+        echo "Gateway not running (stale PID file)"
+        rm -f "$pid_file"
+    fi
+}
+
+cmd_logs() {
+    if [ -f "$GATEWAY_LOG" ]; then
+        tail -${LIMIT:-50} "$GATEWAY_LOG"
+    else
+        echo "No log file at $GATEWAY_LOG"
+    fi
+}
+
+cmd_ensure() {
+    # Start if not running, silently succeed if already running.
+    # Designed for session startup hooks.
+    if is_running; then
+        return 0
+    fi
+    cmd_start
+}
+
+cmd_post() {
+    # Post to the current agent's branch thread.
+    # Uses KILN_AGENT_ID env var set by the harness.
+    local platform="$1" content="$2"
+    local agent_id="${3:-${KILN_AGENT_ID:-}}"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    if [ -z "$agent_id" ]; then
+        echo "Error: no agent ID. Set KILN_AGENT_ID or pass --agent <id>" >&2
+        return 1
+    fi
+
+    local payload
+    payload=$(jq -n --arg a "$agent_id" --arg c "$content" \
+        '{agent_id: $a, content: $c}')
+
+    curl -s -X POST "${base_url}/api/${platform}/branch/post" \
+        -H "Content-Type: application/json" \
+        -d "$payload" | jq .
+}
+
+cmd_status() {
+    local base_url
+    base_url=$(get_base_url) || exit 1
+    curl -s "${base_url}/api/status" | jq .
+}
+
+cmd_send() {
+    local platform="$1" target="$2" content="$3"
+    local thread="${THREAD:-}"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    local payload
+    if [ -n "$thread" ]; then
+        payload=$(jq -n --arg t "$target" --arg c "$content" --arg th "$thread" \
+            '{target: $t, content: $c, thread: $th}')
+    else
+        payload=$(jq -n --arg t "$target" --arg c "$content" \
+            '{target: $t, content: $c}')
+    fi
+
+    curl -s -X POST "${base_url}/api/${platform}/send" \
+        -H "Content-Type: application/json" \
+        -d "$payload" | jq .
+}
+
+cmd_read() {
+    local platform="$1" target="$2"
+    local limit="${LIMIT:-20}"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    local encoded_target
+    encoded_target=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$target'))")
+
+    curl -s "${base_url}/api/${platform}/read?target=${encoded_target}&limit=${limit}" | jq .
+}
+
+cmd_voice_send() {
+    local platform="$1" target="$2" text="$3"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    local payload
+    payload=$(jq -n --arg t "$target" --arg tx "$text" \
+        '{target: $t, text: $tx}')
+
+    curl -s -X POST "${base_url}/api/${platform}/voice/send" \
+        -H "Content-Type: application/json" \
+        -d "$payload" | jq .
+}
+
+cmd_thread_create() {
+    local platform="$1" channel="$2" name="$3"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    local payload
+    payload=$(jq -n --arg c "$channel" --arg n "$name" \
+        '{channel: $c, name: $n}')
+
+    curl -s -X POST "${base_url}/api/${platform}/thread/create" \
+        -H "Content-Type: application/json" \
+        -d "$payload" | jq .
+}
+
+cmd_thread_archive() {
+    local platform="$1" channel="$2" name="$3"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    local payload
+    payload=$(jq -n --arg c "$channel" --arg n "$name" \
+        '{channel: $c, name: $n}')
+
+    curl -s -X POST "${base_url}/api/${platform}/thread/archive" \
+        -H "Content-Type: application/json" \
+        -d "$payload" | jq .
+}
+
+cmd_channels() {
+    local platform="$1"
+    local base_url
+    base_url=$(get_base_url) || exit 1
+
+    curl -s "${base_url}/api/${platform}/channels" | jq .
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'EOF'
+Usage: gateway <command> [args...]
+
+Daemon lifecycle:
+  start                                     Start the gateway daemon
+  stop                                      Stop the gateway daemon
+  status                                    Show daemon status
+  logs [--limit N]                          Tail daemon logs
+  ensure                                    Start if not running (for hooks)
+
+Messaging:
+  <platform> send <target> <message>        Send a message
+  <platform> post <message> [--agent <id>]  Post to your branch thread
+  <platform> read <target> [--limit N]      Read channel history
+  <platform> voice send <target> <text>     Send voice message (TTS)
+  <platform> thread create <channel> <name> Create a thread
+  <platform> thread archive <channel> <name> Archive a thread
+  <platform> channels                       List available channels
+
+Examples:
+  gateway start
+  gateway discord send "#general" "hello world"
+  gateway discord send "@kira" "DM content"
+  gateway discord read "#general" --limit 10
+  gateway discord channels
+
+Environment:
+  AGENT_HOME    Agent home directory (default: ~/.beth)
+  KILN_REPO     Kiln repo path (default: ~/Git/kiln)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    status)
+        cmd_status
+        ;;
+    logs)
+        shift
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --limit) shift; export LIMIT="${1:-50}" ;;
+                *) ;;
+            esac
+            shift
+        done
+        cmd_logs
+        ;;
+    ensure)
+        cmd_ensure
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        platform="$1"
+        shift
+
+        if [ $# -eq 0 ]; then
+            echo "Error: missing action for platform '$platform'" >&2
+            usage
+            exit 1
+        fi
+
+        action="$1"
+        shift
+
+        # Parse --flags from remaining args
+        AGENT_OVERRIDE=""
+        args=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --limit)
+                    shift
+                    export LIMIT="${1:-20}"
+                    ;;
+                --thread)
+                    shift
+                    export THREAD="${1:-}"
+                    ;;
+                --agent)
+                    shift
+                    AGENT_OVERRIDE="${1:-}"
+                    ;;
+                *)
+                    args+=("$1")
+                    ;;
+            esac
+            shift
+        done
+
+        case "$action" in
+            send)
+                [ ${#args[@]} -lt 2 ] && { echo "Usage: gateway $platform send <target> <message>" >&2; exit 1; }
+                cmd_send "$platform" "${args[0]}" "${args[1]}"
+                ;;
+            post)
+                [ ${#args[@]} -lt 1 ] && { echo "Usage: gateway $platform post <message> [--agent <id>]" >&2; exit 1; }
+                cmd_post "$platform" "${args[0]}" "$AGENT_OVERRIDE"
+                ;;
+            read)
+                [ ${#args[@]} -lt 1 ] && { echo "Usage: gateway $platform read <target> [--limit N]" >&2; exit 1; }
+                cmd_read "$platform" "${args[0]}"
+                ;;
+            voice)
+                # gateway discord voice send <target> <text>
+                sub="${args[0]:-}"
+                if [ "$sub" = "send" ] && [ ${#args[@]} -ge 3 ]; then
+                    cmd_voice_send "$platform" "${args[1]}" "${args[2]}"
+                else
+                    echo "Usage: gateway $platform voice send <target> <text>" >&2
+                    exit 1
+                fi
+                ;;
+            thread)
+                sub="${args[0]:-}"
+                case "$sub" in
+                    create)
+                        [ ${#args[@]} -lt 3 ] && { echo "Usage: gateway $platform thread create <channel> <name>" >&2; exit 1; }
+                        cmd_thread_create "$platform" "${args[1]}" "${args[2]}"
+                        ;;
+                    archive)
+                        [ ${#args[@]} -lt 3 ] && { echo "Usage: gateway $platform thread archive <channel> <name>" >&2; exit 1; }
+                        cmd_thread_archive "$platform" "${args[1]}" "${args[2]}"
+                        ;;
+                    *)
+                        echo "Unknown thread action: $sub" >&2
+                        exit 1
+                        ;;
+                esac
+                ;;
+            channels)
+                cmd_channels "$platform"
+                ;;
+            *)
+                echo "Unknown action: $action" >&2
+                usage
+                exit 1
+                ;;
+        esac
+        ;;
+esac
