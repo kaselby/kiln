@@ -24,6 +24,10 @@ CHANNEL_POLL_INTERVAL = 1.0  # seconds
 COLOR_ACTIVE = 0x2ecc71   # green
 COLOR_IDLE = 0x95a5a6     # gray
 
+# Context window size for token usage display
+MAX_CONTEXT_TOKENS = 200_000
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+
 
 # ---------------------------------------------------------------------------
 # State persistence
@@ -104,6 +108,53 @@ def _count_inbox(agent_home: Path, agent_id: str) -> int:
     return count
 
 
+def _get_context_usage(registry_entry: dict) -> tuple[int, int] | None:
+    """Get (used_tokens, max_tokens) from Claude's conversation JSONL."""
+    session_uuid = registry_entry.get("session_uuid")
+    cwd = registry_entry.get("cwd", "")
+    if not session_uuid or not cwd:
+        return None
+
+    encoded_cwd = str(Path(cwd).resolve()).replace("/", "-").replace(".", "-")
+    jsonl_path = CLAUDE_PROJECTS / encoded_cwd / f"{session_uuid}.jsonl"
+
+    if not jsonl_path.exists():
+        return None
+
+    try:
+        last_usage = None
+        with open(jsonl_path) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "assistant":
+                    usage = obj.get("message", {}).get("usage", {})
+                    if usage:
+                        last_usage = usage
+
+        if not last_usage:
+            return None
+
+        total = (
+            last_usage.get("input_tokens", 0)
+            + last_usage.get("cache_read_input_tokens", 0)
+            + last_usage.get("cache_creation_input_tokens", 0)
+        )
+        return (total, MAX_CONTEXT_TOKENS)
+    except OSError:
+        return None
+
+
+def _format_context(usage: tuple[int, int] | None) -> str:
+    if usage is None:
+        return "?"
+    used, total = usage
+    pct = int(used / total * 100)
+    return f"{pct}%"
+
+
 def _format_uptime(started_at: str) -> str:
     try:
         start = datetime.fromisoformat(started_at)
@@ -123,7 +174,12 @@ def _build_presence_text(agents: list[dict]) -> str:
     if not agents:
         return "No agents running"
     count = len(agents)
-    return f"{count} agent{'s' if count != 1 else ''}"
+    # Show most recent agent's name and context usage
+    latest = agents[-1]  # sorted by id, but good enough
+    name = latest["id"].removeprefix(f"{latest['id'].split('-')[0]}-")
+    ctx = latest.get("context", "?")
+    text = f"{count} agent{'s' if count != 1 else ''} | {name} {ctx}"
+    return text[:128]
 
 
 def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
@@ -137,12 +193,19 @@ def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
 
     embeds = []
     for agent in agents:
+        # Staleness detection — no context data suggests idle/stale
+        context_pct = agent.get("context_pct")
+        color = COLOR_ACTIVE if context_pct is not None else COLOR_IDLE
+
         embed = discord.Embed(
             title=f"\U0001f7e2 {agent['id']}",
-            color=COLOR_ACTIVE,
+            color=color,
         )
 
-        meta = [f"**Uptime:** {agent['uptime']}"]
+        meta = [
+            f"**Uptime:** {agent['uptime']}",
+            f"**Context:** {agent.get('context', '?')}",
+        ]
         if agent["inbox"] > 0:
             meta.append(f"**Inbox:** {agent['inbox']}")
         embed.description = " \u00b7 ".join(meta)
@@ -151,15 +214,16 @@ def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
         if plan:
             tasks = plan.get("tasks", [])
             done = sum(1 for t in tasks if t.get("status") == "done")
+            in_progress = sum(1 for t in tasks if t.get("status") == "in_progress")
             total = len(tasks)
             goal = plan.get("goal", "?")
             if len(goal) > 60:
                 goal = goal[:59] + "\u2026"
-            embed.add_field(
-                name="Plan",
-                value=f"{goal} ({done}/{total})",
-                inline=False,
-            )
+            progress = f"{goal} ({done}/{total}"
+            if in_progress:
+                progress += f", {in_progress} active"
+            progress += ")"
+            embed.add_field(name="Plan", value=progress, inline=False)
 
         embeds.append(embed)
 
@@ -932,9 +996,12 @@ class _GatewayClient(discord.Client):
         registry = _read_registry(self._config.agent_home)
         agents = []
         for agent_id, entry in registry.items():
+            usage = _get_context_usage(entry)
             agents.append({
                 "id": agent_id,
                 "uptime": _format_uptime(entry.get("started_at", "")),
+                "context": _format_context(usage),
+                "context_pct": int(usage[0] / usage[1] * 100) if usage else None,
                 "inbox": _count_inbox(self._config.agent_home, agent_id),
                 "plan": _read_plan(self._config.agent_home, agent_id),
             })
