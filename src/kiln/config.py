@@ -98,8 +98,10 @@ class AgentConfig:
     mcp_server: str | None = None     # path to custom MCP server module (relative to home)
     scripts_dir: str = "tools"        # shell tools directory (relative to home)
 
-    # Context injection — files to include in the system prompt
-    context_injection: list[str] = field(default_factory=list)
+    # Context injection — files to include in the system prompt.
+    # Each entry is either a plain path string or a dict with 'path' and
+    # optional 'label' (used as the section header instead of the path).
+    context_injection: list[str | dict] = field(default_factory=list)
 
     # Skills
     skills_dir: str = "skills"        # relative to home
@@ -107,6 +109,11 @@ class AgentConfig:
     # Memory / worklogs / sessions
     worklogs_dir: str = "memory/worklogs"   # relative to home
     sessions_dir: str = "memory/sessions"   # relative to home
+
+    # Startup commands — run as subprocesses before session begins.
+    # Each entry is a shell command string. Runs with agent's env (AGENT_HOME, tools on PATH).
+    # Failures log warnings but don't block the session.
+    startup: list[str] = field(default_factory=list)
 
     # Hooks — agent-defined configuration for hook behavior.
     # The default harness reads this to configure infrastructure hooks.
@@ -174,14 +181,23 @@ class AgentConfig:
         """Load all context injection files.
 
         Returns list of (label, content) tuples. Files that don't exist
-        are silently skipped.
+        are silently skipped. Each entry in context_injection is either a
+        plain path string or a dict with 'path' and optional 'label'.
         """
         results = []
-        for rel_path in self.context_injection:
+        for entry in self.context_injection:
+            if isinstance(entry, dict):
+                rel_path = entry.get("path", "")
+                label = entry.get("label", rel_path)
+            else:
+                rel_path = entry
+                label = rel_path
+            if not rel_path:
+                continue
             full_path = self.home / rel_path
             if full_path.exists():
                 try:
-                    results.append((rel_path, full_path.read_text()))
+                    results.append((label, full_path.read_text()))
                 except OSError:
                     continue
         return results
@@ -248,6 +264,10 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
     ]:
         if field_name in raw:
             setattr(config, field_name, raw[field_name])
+
+    # Startup commands
+    if "startup" in raw:
+        config.startup = raw["startup"]
 
     # Tools — either a flat namespaced list or a structured dict
     tools_raw = raw.get("tools")

@@ -9,10 +9,14 @@ blocks directly.
 """
 
 import json
+import logging
 import os
 import shutil
+import subprocess
 from datetime import date, datetime
 from pathlib import Path
+
+log = logging.getLogger("kiln.harness")
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -395,6 +399,38 @@ class KilnHarness:
             summary_path=str(summary_path),
         )
 
+    def _run_startup_commands(self) -> None:
+        """Run startup commands from agent config before session begins.
+
+        Each command runs as a subprocess with the agent's environment
+        (AGENT_HOME set, tools dir on PATH). Failures log warnings but
+        don't block the session.
+        """
+        if not self.config.startup:
+            return
+
+        env = os.environ.copy()
+        env["AGENT_HOME"] = str(self.config.home)
+        env["KILN_AGENT_HOME"] = str(self.config.home)
+        tools_dir = str(self.config.tools_path)
+        env["PATH"] = f"{tools_dir}:{env.get('PATH', '')}"
+
+        for cmd in self.config.startup:
+            try:
+                result = subprocess.run(
+                    cmd, shell=True, env=env,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode != 0:
+                    log.warning(
+                        "Startup command failed (exit %d): %s\n%s",
+                        result.returncode, cmd, result.stderr.strip(),
+                    )
+            except subprocess.TimeoutExpired:
+                log.warning("Startup command timed out (30s): %s", cmd)
+            except Exception:
+                log.exception("Startup command error: %s", cmd)
+
     async def start(self):
         """Start the agent session.
 
@@ -403,6 +439,7 @@ class KilnHarness:
         after orientation completes. If no orientation, --prompt is the
         startup message on steering_queue (backward-compatible behavior).
         """
+        self._run_startup_commands()
         options = self._build_options()
         self._client = ClaudeSDKClient(options)
         self.register_session()
