@@ -65,11 +65,28 @@ def _save_int_state(path: Path, value: int) -> None:
 # Status helpers
 # ---------------------------------------------------------------------------
 
+_registry_cache: dict = {}
+_registry_cache_time: float = 0
+_REGISTRY_CACHE_TTL = 10  # seconds
+
+
 def _read_registry(agent_home: Path) -> dict:
-    """Read session registry, filtered to actually running sessions."""
+    """Read session registry, filtered to actually running sessions.
+
+    Results are cached for 10s to avoid repeated tmux subprocess calls
+    from multiple background tasks.
+    """
+    global _registry_cache, _registry_cache_time
+    import time
+    now = time.monotonic()
+    if now - _registry_cache_time < _REGISTRY_CACHE_TTL:
+        return _registry_cache
+
     path = agent_home / "logs" / "session-registry.json"
     raw = _load_json_state(path)
     if not raw:
+        _registry_cache = {}
+        _registry_cache_time = now
         return {}
 
     # Filter to sessions with active tmux sessions
@@ -83,7 +100,9 @@ def _read_registry(agent_home: Path) -> dict:
     except (subprocess.SubprocessError, FileNotFoundError):
         active_tmux = set()
 
-    return {k: v for k, v in raw.items() if k in active_tmux}
+    _registry_cache = {k: v for k, v in raw.items() if k in active_tmux}
+    _registry_cache_time = now
+    return _registry_cache
 
 
 def _read_plan(agent_home: Path, agent_id: str) -> dict | None:
@@ -109,7 +128,11 @@ def _count_inbox(agent_home: Path, agent_id: str) -> int:
 
 
 def _get_context_usage(registry_entry: dict) -> tuple[int, int] | None:
-    """Get (used_tokens, max_tokens) from Claude's conversation JSONL."""
+    """Get (used_tokens, max_tokens) from Claude's conversation JSONL.
+
+    Reads from the end of the file to avoid scanning megabytes of JSON
+    on every status update.
+    """
     session_uuid = registry_entry.get("session_uuid")
     cwd = registry_entry.get("cwd", "")
     if not session_uuid or not cwd:
@@ -122,17 +145,27 @@ def _get_context_usage(registry_entry: dict) -> tuple[int, int] | None:
         return None
 
     try:
+        # Read the last ~32KB — enough to find the most recent assistant message
+        tail_size = 32 * 1024
+        with open(jsonl_path, "rb") as f:
+            f.seek(0, 2)  # end
+            size = f.tell()
+            f.seek(max(0, size - tail_size))
+            tail = f.read().decode("utf-8", errors="replace")
+
         last_usage = None
-        with open(jsonl_path) as f:
-            for line in f:
-                try:
-                    obj = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    continue
-                if obj.get("type") == "assistant":
-                    usage = obj.get("message", {}).get("usage", {})
-                    if usage:
-                        last_usage = usage
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "assistant":
+                usage = obj.get("message", {}).get("usage", {})
+                if usage:
+                    last_usage = usage
 
         if not last_usage:
             return None
@@ -164,7 +197,7 @@ def _format_uptime(started_at: str) -> str:
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes = remainder // 60
         if hours > 0:
-            return f"{hours}h{minutes}m"
+            return f"{hours}h{minutes:02d}m"
         return f"{minutes}m"
     except (ValueError, TypeError):
         return "?"
@@ -1033,7 +1066,8 @@ class _GatewayClient(discord.Client):
 
         paths = []
         for att in attachments:
-            dest = download_dir / f"{sender_name}-{att.filename}"
+            import uuid as _uuid
+            dest = download_dir / f"{sender_name}-{_uuid.uuid4().hex[:6]}-{att.filename}"
             try:
                 await att.save(dest)
                 paths.append(str(dest))
