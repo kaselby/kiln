@@ -445,7 +445,14 @@ class DiscordChannel(Channel):
             return self._client.get_channel(channel_id)
 
         if target.isdigit():
-            return self._client.get_channel(int(target))
+            ch = self._client.get_channel(int(target))
+            if ch:
+                return ch
+            # Cache miss — try API fetch (needed for DM channels)
+            try:
+                return await self._client.fetch_channel(int(target))
+            except discord.NotFound:
+                return None
 
         if target.startswith("@"):
             user_ref = target[1:]
