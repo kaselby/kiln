@@ -64,6 +64,9 @@ from ..permissions import (
 # Max lines of tool result output to show inline
 TOOL_RESULT_MAX_LINES = 10
 
+# Context token threshold for pausing auto-delivery and heartbeats
+CONTEXT_PAUSE_THRESHOLD = 180_000
+
 
 # Semantic style map for the TUI
 TUI_STYLE = Style.from_dict({
@@ -890,7 +893,7 @@ class KilnApp:
             parts.append(f"{_fmt_tokens(self._context_tokens)} / 200k")
 
         # Context budget warning
-        if self._context_tokens > 150_000:
+        if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
             parts.append("<err>\u26a0 auto-delivery paused</err>")
 
         # Pending message count
@@ -1265,7 +1268,7 @@ class KilnApp:
         min_wait = 2.0 if self._last_turn_source == "user" else 1.0
         if elapsed < min_wait:
             return False
-        if self._context_tokens > 150_000:
+        if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
             return False
         if not inbox.exists():
             return False
@@ -1406,7 +1409,7 @@ class KilnApp:
             self._sync_heartbeat_from_config()
             if not self._heartbeat_enabled:
                 continue
-            if self._context_tokens > 150_000:
+            if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
                 continue
             elapsed = time.monotonic() - self._last_auto_delivery
 
