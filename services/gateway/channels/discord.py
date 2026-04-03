@@ -388,7 +388,7 @@ class DiscordChannel(Channel):
             return {"ok": False, "error": f"Could not resolve target: {target}"}
 
         try:
-            from ...voice import generate_speech, send_voice_message
+            from voice import generate_speech, send_voice_message
         except ImportError:
             return {"ok": False, "error": "Voice service not available"}
 
@@ -1008,7 +1008,7 @@ class _GatewayClient(discord.Client):
         self, audio_path: str, content: str, sender_name: str
     ) -> str:
         try:
-            from ...voice.openai import transcribe
+            from voice.openai import transcribe
         except ImportError:
             return (
                 f"[Voice message received — transcription unavailable. "
