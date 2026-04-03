@@ -79,7 +79,6 @@ class GatewayConfig:
     port: int = DEFAULT_PORT
     agent_home: Path = field(default_factory=lambda: Path.home())
     default_agent: str = ""
-    preferred_session_file: Path | None = None  # file containing preferred agent ID
     discord: DiscordConfig | None = None
 
     @property
@@ -112,16 +111,12 @@ def load_config(path: Path) -> GatewayConfig:
     agent_home = Path(raw.get("agent_home", "~")).expanduser()
 
     routing = raw.get("routing", {})
-    preferred_file = routing.get("preferred_session_file")
-    if preferred_file:
-        preferred_file = (agent_home / preferred_file).resolve()
 
     cfg = GatewayConfig(
         bind=raw.get("bind", DEFAULT_BIND),
         port=raw.get("port", DEFAULT_PORT),
         agent_home=agent_home,
         default_agent=routing.get("default_agent", ""),
-        preferred_session_file=preferred_file,
     )
 
     if "channels" in raw and "discord" in raw["channels"]:
