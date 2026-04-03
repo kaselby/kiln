@@ -1015,15 +1015,19 @@ class KilnApp:
                 self._heartbeat_task = asyncio.ensure_future(self._heartbeat_watcher())
 
                 # Drain initial startup message (orientation or --prompt).
-                # The harness populates steering_queue during start().
+                # The harness populates followup_queue during start().
                 async def send_initial():
                     await asyncio.sleep(0)  # yield once to let Application start
-                    if self._steering_queue:
+                    msg = None
+                    if self._followup_queue:
+                        msg = self._followup_queue.pop(0)
+                    elif self._steering_queue:
                         msg = self._steering_queue.pop(0)
+                    if msg:
                         _tprint("<dim>...</dim>")
                         self._receive_task = asyncio.ensure_future(self._send_and_receive(msg))
 
-                if self._steering_queue:
+                if self._followup_queue or self._steering_queue:
                     self._initial_task = asyncio.ensure_future(send_initial())
 
                 await self._app.run_async()

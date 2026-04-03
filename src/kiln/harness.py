@@ -438,10 +438,10 @@ class KilnHarness:
     async def start(self):
         """Start the agent session.
 
-        Queues orientation message (if configured) onto steering_queue.
-        If --prompt is also set, it goes on followup_queue so it's delivered
-        after orientation completes. If no orientation, --prompt is the
-        startup message on steering_queue (backward-compatible behavior).
+        Queues orientation message (if configured) onto followup_queue.
+        If --prompt is also set, it's delivered as an inbox message so the
+        agent discovers it naturally during orientation (via inbox_check hook).
+        If no orientation, --prompt is the startup message on followup_queue.
         """
         self._run_startup_commands()
         options = self._build_options()
@@ -449,18 +449,43 @@ class KilnHarness:
         self.register_session()
         await self._client.connect()
 
-        # Queue startup messages
+        # Queue startup messages onto followup_queue (programmatic user turns).
+        # steering_queue is for user-typed mid-turn input only.
         orientation = self._build_orientation()
         if orientation:
-            self.steering_queue.append(orientation)
+            self.followup_queue.append(orientation)
 
         if self.config.prompt:
             if orientation:
-                # Orientation is the startup message; prompt arrives after
-                self.followup_queue.append(self.config.prompt)
+                # Deliver as inbox message — discovered naturally during orientation
+                self._deliver_prompt_to_inbox()
             else:
                 # No orientation — prompt is the startup message
-                self.steering_queue.append(self.config.prompt)
+                self.followup_queue.append(self.config.prompt)
+
+    def _deliver_prompt_to_inbox(self) -> None:
+        """Write --prompt text as an inbox message for discovery during orientation.
+
+        When both orientation and --prompt are set, the prompt is delivered as
+        an inbox message rather than queued as a followup. This way the agent
+        discovers it naturally via the inbox_check hook during its first turn,
+        instead of waiting for the entire turn to complete.
+        """
+        inbox = self.config.agent_inbox(self.agent_id)
+        inbox.mkdir(parents=True, exist_ok=True)
+
+        sender = self.config.parent or "system"
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        msg_path = inbox / f"msg-{ts}-prompt.md"
+        msg_path.write_text(
+            f"---\n"
+            f"from: {sender}\n"
+            f'summary: "Startup prompt"\n'
+            f"priority: high\n"
+            f"timestamp: {datetime.now().isoformat()}\n"
+            f"---\n\n"
+            f"{self.config.prompt}\n"
+        )
 
     def _build_orientation(self) -> str | None:
         """Build the startup orientation message.
