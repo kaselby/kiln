@@ -44,9 +44,15 @@ class SessionConfig:
     def __init__(self, path: Path, defaults: dict | None = None):
         self._path = path
         self._defaults = {**self.CORE_DEFAULTS, **(defaults or {})}
-        # Write initial config only if the file doesn't already exist
-        # (a resumed session may already have one).
-        if not self._path.exists():
+        # Ensure defaults are present in the file.  If the file already
+        # exists (e.g. gateway wrote subscriptions before the harness
+        # started), merge missing defaults into it rather than skipping.
+        if self._path.exists():
+            data = self._read()
+            merged = {**self._defaults, **data}
+            if merged != data:
+                self._write(merged)
+        else:
             self._write(dict(self._defaults))
 
     @property
