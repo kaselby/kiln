@@ -440,8 +440,18 @@ class DiscordChannel(Channel):
             return self._client.get_channel(int(target))
 
         if target.startswith("@"):
-            user_id = target[1:]
-            if user_id.isdigit():
+            user_ref = target[1:]
+            # Resolve by numeric ID or by name from users registry
+            if user_ref.isdigit():
+                user_id = user_ref
+            else:
+                # Reverse lookup: find user ID by name
+                user_id = None
+                for uid, entry in self._discord_config.users.items():
+                    if entry.get("name") == user_ref:
+                        user_id = uid
+                        break
+            if user_id:
                 user = await self._client.fetch_user(int(user_id))
                 if user:
                     return await user.create_dm()
@@ -532,15 +542,16 @@ class _GatewayClient(discord.Client):
 
         # Access control
         is_dm = isinstance(message.channel, discord.DMChannel)
-        access = self._discord_config.dm_access if is_dm else self._discord_config.access
+        access = self._discord_config.dm_access if is_dm else self._discord_config.channel_access
         if not access.is_allowed(sender_id):
             log.debug("Blocked message from %s (%s) — access denied",
                       message.author, sender_id)
             return
 
-        sender_entry = access.allowlist.get(sender_id, {})
-        sender_name = sender_entry.get("name", message.author.name)
-        trust = sender_entry.get("trust", "unknown")
+        # Identity resolution — always from the shared users registry
+        sender_name, trust = self._discord_config.resolve_user(
+            sender_id, fallback_name=message.author.name
+        )
 
         content = message.content
         if not content.strip() and not message.attachments:
@@ -574,7 +585,7 @@ class _GatewayClient(discord.Client):
         # --- Default routing ---
 
         if is_dm:
-            channel_desc = "DM"
+            channel_desc = f"dm/{sender_name}"
         elif hasattr(message.channel, "name"):
             channel_desc = f"#{message.channel.name}"
         else:

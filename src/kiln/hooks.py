@@ -59,11 +59,8 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
             # Extract sender and channel from frontmatter
             parsed = parse_message(msg_file)
             if parsed:
-                sender = parsed["from"] or "unknown"
-                if parsed["channel"]:
-                    ping = f"[Notification] Message from {sender} in {parsed['channel']} — {msg_file}"
-                else:
-                    ping = f"[Notification] Message from {sender} — {msg_file}"
+                source = format_message_source(parsed)
+                ping = f"[Notification] Message from {source} — {msg_file}"
                 summaries.append(ping)
                 _injected.add(path_str)
                 read_marker.touch()  # prevent watcher re-delivery
@@ -587,6 +584,13 @@ def parse_message(msg_file: Path) -> dict | None:
 
     result["body"] = "\n".join(lines[fm_end + 1:]).strip()
     return result
+
+
+def format_message_source(msg: dict) -> str:
+    """Format a parsed message's source as 'sender in channel' or just 'sender'."""
+    sender = msg.get("from") or "unknown"
+    channel = msg.get("channel", "")
+    return f"{sender} in {channel}" if channel else sender
 
 
 def wrap_hook_visibility(hook_fn, name: str, ui_events: list[dict]):

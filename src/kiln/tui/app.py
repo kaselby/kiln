@@ -54,7 +54,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import StreamEvent
 
-from ..hooks import parse_message
+from ..hooks import format_message_source, parse_message
 from ..permissions import (
     PermissionMode,
     PermissionRequest,
@@ -1304,11 +1304,11 @@ class KilnApp:
         marker = msg_path.with_suffix(".read")
         marker.touch()  # write early to prevent concurrent re-queue; removed on failure
 
-        sender = msg.get("from", "unknown")
+        source = format_message_source(msg)
         summary = msg.get("summary", "")
         body = msg.get("body", "")
 
-        _tprint("\n<agent-msg-b>\U0001f4e8 {}:</agent-msg-b>", sender)
+        _tprint("\n<agent-msg-b>\U0001f4e8 {}:</agent-msg-b>", source)
         if summary:
             _tprint("<agent-msg>{}</agent-msg>", summary)
         if body and body != summary:
@@ -1316,7 +1316,7 @@ class KilnApp:
             _tprint("<agent-msg>{}</agent-msg>", display_body)
 
         model_text = body or summary
-        formatted = f"[Message from {sender}]\n{model_text}"
+        formatted = f"[Message from {source}]\n{model_text}"
 
         if len(model_text) < 200:
             cooldown = 5.0

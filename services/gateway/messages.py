@@ -65,6 +65,7 @@ def write_to_inbox(
         f'summary: "{summary}"\n'
         f"priority: normal\n"
         f"source: {platform}\n"
+        f"channel: {channel_desc}\n"
         f"trust: {trust}\n"
         f'{platform}-user-id: "{sender_id}"\n'
         f'{platform}-user: "{sender_name}"\n'

@@ -12,11 +12,11 @@ DEFAULT_BIND = "127.0.0.1"
 
 
 @dataclass
-class ChannelAccess:
-    """Per-channel access policy."""
+class AccessPolicy:
+    """Access control policy for a message surface (channels or DMs)."""
 
     mode: str = "open"  # open, allowlist, read_only, post_restricted
-    allowlist: dict[str, dict] = field(default_factory=dict)  # user_id -> {name, trust}
+    allowlist: set[str] = field(default_factory=set)  # user IDs (only used in allowlist/post_restricted modes)
 
     def is_allowed(self, user_id: str) -> bool:
         if self.mode == "open":
@@ -33,9 +33,20 @@ class DiscordConfig:
     enabled: bool = True
     guild_id: str = ""
     channels: dict[str, str] = field(default_factory=dict)  # name -> channel_id
-    access: ChannelAccess = field(default_factory=ChannelAccess)
-    dm_access: ChannelAccess = field(default_factory=ChannelAccess)
+    users: dict[str, dict] = field(default_factory=dict)  # user_id -> {name, trust}
+    channel_access: AccessPolicy = field(default_factory=AccessPolicy)
+    dm_access: AccessPolicy = field(default_factory=AccessPolicy)
     voice_enabled: bool = False
+
+    def resolve_user(self, user_id: str, fallback_name: str = "") -> tuple[str, str]:
+        """Look up a user's display name and trust level.
+
+        Returns (name, trust). Falls back to fallback_name/user_id if unknown.
+        """
+        entry = self.users.get(user_id, {})
+        name = entry.get("name", fallback_name or user_id)
+        trust = entry.get("trust", "unknown")
+        return name, trust
 
     @classmethod
     def from_dict(cls, data: dict) -> "DiscordConfig":
@@ -43,24 +54,19 @@ class DiscordConfig:
             enabled=data.get("enabled", True),
             guild_id=str(data.get("guild_id", "")),
             channels=data.get("channels", {}),
+            users=data.get("users", {}),
             voice_enabled=data.get("voice", {}).get("enabled", False),
         )
 
         # Channel access
-        access_mode = data.get("access", "open")
-        allowlist = {}
-        if "allowlist" in data:
-            allowlist = data["allowlist"]
-        cfg.access = ChannelAccess(mode=access_mode, allowlist=allowlist)
+        channel_mode = data.get("channel_access", "open")
+        channel_allowlist = set(data.get("channel_allowlist", cfg.users.keys()))
+        cfg.channel_access = AccessPolicy(mode=channel_mode, allowlist=channel_allowlist)
 
         # DM access
         dm_mode = data.get("dm_access", "allowlist")
-        dm_allowlist = {}
-        if "dm_allowlist" in data:
-            dm_allowlist = {uid: {"name": uid, "trust": "known"} for uid in data["dm_allowlist"]}
-        elif dm_mode == "allowlist":
-            dm_allowlist = allowlist  # fall back to channel allowlist
-        cfg.dm_access = ChannelAccess(mode=dm_mode, allowlist=dm_allowlist)
+        dm_allowlist = set(data.get("dm_allowlist", cfg.users.keys()))
+        cfg.dm_access = AccessPolicy(mode=dm_mode, allowlist=dm_allowlist)
 
         return cfg
 

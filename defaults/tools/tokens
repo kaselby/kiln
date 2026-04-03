@@ -1,0 +1,75 @@
+#!/Users/kaselby/.beth/venv/bin/python3
+# ---
+# name: tokens
+# brief: Count tokens in files using tiktoken
+# description: Count tokens in files using tiktoken. Useful for estimating context usage and API costs.
+# arguments: "<file...> [--encoding <name>] [--total-only]"
+# ---
+#
+# Usage:
+#   tokens file.md                     Count tokens in a single file
+#   tokens *.md                        Count tokens in multiple files with total
+#   tokens --total-only a.md b.md      Just the total
+#   echo "hello" | tokens -            Read from stdin
+#
+# Default encoding: cl100k_base (GPT-4/Claude approximate).
+
+import sys
+import tiktoken
+
+def main():
+    args = sys.argv[1:]
+    encoding_name = "cl100k_base"
+    total_only = False
+    files = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--encoding" and i + 1 < len(args):
+            encoding_name = args[i + 1]
+            i += 2
+        elif args[i] == "--total-only":
+            total_only = True
+            i += 1
+        elif args[i] in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        else:
+            files.append(args[i])
+            i += 1
+
+    if not files:
+        print("Usage: tokens <file...> [--encoding <name>] [--total-only]", file=sys.stderr)
+        sys.exit(1)
+
+    enc = tiktoken.get_encoding(encoding_name)
+    total = 0
+    results = []
+
+    for f in files:
+        try:
+            if f == "-":
+                text = sys.stdin.read()
+                name = "<stdin>"
+            else:
+                with open(f) as fh:
+                    text = fh.read()
+                name = f
+            count = len(enc.encode(text))
+            total += count
+            results.append((name, count))
+        except Exception as e:
+            print(f"Error reading {f}: {e}", file=sys.stderr)
+
+    if total_only:
+        print(total)
+    elif len(results) == 1:
+        print(f"{results[0][1]:,} tokens")
+    else:
+        max_width = max(len(r[0]) for r in results)
+        for name, count in results:
+            print(f"  {name:<{max_width}}  {count:>8,}")
+        print(f"  {'TOTAL':<{max_width}}  {total:>8,}")
+
+if __name__ == "__main__":
+    main()

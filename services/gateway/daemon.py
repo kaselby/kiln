@@ -103,6 +103,7 @@ class GatewayDaemon:
         app.router.add_post("/api/{platform}/thread/archive", self._handle_thread_archive)
         app.router.add_get("/api/{platform}/channels", self._handle_list_channels)
         app.router.add_post("/api/{platform}/branch/post", self._handle_branch_post)
+        app.router.add_post("/api/{platform}/reply", self._handle_reply)
         return app
 
     def _get_channel(self, platform: str) -> Channel | None:
@@ -294,6 +295,68 @@ class GatewayDaemon:
             result = await channel.post_to_branch(agent_id, content)
             return web.json_response(result)
         return web.json_response({"ok": False, "error": "Branch posts not supported"}, status=501)
+
+    async def _handle_reply(self, request: web.Request) -> web.Response:
+        """Reply to an inbox message, routing to the original source."""
+        platform = request.match_info["platform"]
+        channel = self._get_channel(platform)
+        if not channel:
+            return web.json_response(
+                {"ok": False, "error": f"Platform '{platform}' not connected"},
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+        msg_id = body.get("msg_id", "")
+        content = body.get("content", "")
+        if not msg_id or not content:
+            return web.json_response(
+                {"ok": False, "error": "Missing 'msg_id' or 'content'"}, status=400
+            )
+
+        # Find the message file by ID prefix match
+        inbox_root = self.config.agent_home / "inbox"
+        msg_file = None
+        for agent_dir in inbox_root.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            for f in agent_dir.glob(f"*{msg_id}*"):
+                if f.suffix == ".md":
+                    msg_file = f
+                    break
+            if msg_file:
+                break
+
+        if not msg_file:
+            return web.json_response(
+                {"ok": False, "error": f"Message not found: {msg_id}"}, status=404
+            )
+
+        # Parse frontmatter for routing info
+        text = msg_file.read_text()
+        meta = {}
+        if text.startswith("---"):
+            lines = text.split("\n")
+            for line in lines[1:]:
+                if line.strip() == "---":
+                    break
+                if ":" in line:
+                    key, _, val = line.partition(":")
+                    meta[key.strip()] = val.strip().strip('"').strip("'")
+
+        # Route to the original channel
+        channel_id = meta.get(f"{platform}-channel-id", "")
+        if not channel_id:
+            return web.json_response(
+                {"ok": False, "error": "No channel ID in original message"}, status=400
+            )
+
+        result = await channel.send_message(channel_id, content)
+        return web.json_response(result)
 
 
 # ---------------------------------------------------------------------------
