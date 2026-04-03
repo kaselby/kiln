@@ -359,7 +359,7 @@ class KilnHarness:
             self._stderr_fh.write(line)
             self._stderr_fh.flush()
 
-        return ClaudeAgentOptions(
+        opts = dict(
             system_prompt=full_prompt,
             tools=base_tools,
             allowed_tools=[],
@@ -373,7 +373,11 @@ class KilnHarness:
             continue_conversation=self.config.continue_session and not resume_uuid,
             resume=resume_uuid,
             stderr=_stderr_callback,
+            extra_args={"setting-sources": ""},  # don't inherit user's CLI settings/MCP servers
         )
+        if self.config.effort:
+            opts["effort"] = self.config.effort
+        return ClaudeAgentOptions(**opts)
 
     def _template_vars(self) -> dict[str, str]:
         """Build template variable dict for orientation and cleanup messages.

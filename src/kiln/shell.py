@@ -163,6 +163,7 @@ class PersistentShell:
             stderr=asyncio.subprocess.STDOUT,
             cwd=effective_cwd,
             env=self._env,
+            limit=10 * 1024 * 1024,  # 10MB — default 64KB breaks on long lines
         )
 
     async def _ensure_alive(self) -> list[str]:
@@ -391,6 +392,21 @@ class PersistentShell:
                 except ProcessLookupError:
                     pass
                 # Remove dead entry, will respawn/pop on next call
+                if self._stack and self._stack[-1] is entry:
+                    self._stack.pop()
+            except (asyncio.LimitOverrunError, ValueError):
+                # StreamReader corrupted by a line exceeding the buffer limit.
+                # Kill the shell so the next command gets a fresh process.
+                exit_code = -1
+                cwd = entry.cwd
+                output_lines.append(
+                    "\n[Shell killed: output line exceeded buffer limit. "
+                    "Next command will start a fresh shell.]\n"
+                )
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
                 if self._stack and self._stack[-1] is entry:
                     self._stack.pop()
 
