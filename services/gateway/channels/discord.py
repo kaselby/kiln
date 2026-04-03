@@ -591,8 +591,14 @@ class _GatewayClient(discord.Client):
                 attachment_paths[0], content, sender_name
             )
 
-        # Default target: agent name catch-all inbox
-        agent_id = self._config.default_agent or self._find_active_agent() or "gateway-pending"
+        # Route to preferred session (e.g. canonical), then catch-all.
+        # The subscription model (v2) will replace this with per-session
+        # channel subscriptions.
+        agent_id = (
+            self._find_preferred_agent()
+            or self._config.default_agent
+            or "gateway-pending"
+        )
 
         write_to_inbox(
             self._config.agent_home, agent_id,
@@ -1051,6 +1057,28 @@ class _GatewayClient(discord.Client):
         if not channel_id:
             return None
         return self.get_channel(int(channel_id))
+
+    def _find_preferred_agent(self) -> str | None:
+        """Read the preferred session file and verify the session is alive.
+
+        The preferred session file is configured in the gateway config
+        (routing.preferred_session_file). It contains a single agent ID.
+        The agent manages the file — the gateway just reads it.
+        """
+        path = self._config.preferred_session_file
+        if not path or not path.exists():
+            return None
+        try:
+            agent_id = path.read_text().strip()
+        except OSError:
+            return None
+        if not agent_id:
+            return None
+        # Verify it's actually running
+        registry = _read_registry(self._config.agent_home)
+        if agent_id in registry:
+            return agent_id
+        return None
 
     def _find_active_agent(self) -> str | None:
         registry = _read_registry(self._config.agent_home)
