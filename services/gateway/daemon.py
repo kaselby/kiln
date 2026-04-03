@@ -16,8 +16,10 @@ from pathlib import Path
 
 from aiohttp import web
 
+from .bridges import BridgeManager
 from .config import GatewayConfig, load_config
 from .channels.base import Channel
+from .subscriptions import SubscriptionManager
 
 log = logging.getLogger("gateway")
 
@@ -28,6 +30,8 @@ class GatewayDaemon:
     def __init__(self, config: GatewayConfig):
         self.config = config
         self.channels: dict[str, Channel] = {}
+        self.bridge_manager = BridgeManager(config.agent_home)
+        self.subscription_manager = SubscriptionManager(config.agent_home / "state")
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
 
@@ -38,7 +42,9 @@ class GatewayDaemon:
         # Initialize channel plugins
         if self.config.discord and self.config.discord.enabled:
             from .channels.discord import DiscordChannel
-            discord_channel = DiscordChannel(self.config)
+            discord_channel = DiscordChannel(
+                self.config, self.bridge_manager, self.subscription_manager
+            )
             await discord_channel.connect()
             self.channels["discord"] = discord_channel
             log.info("Discord channel connected")
@@ -104,6 +110,8 @@ class GatewayDaemon:
         app.router.add_get("/api/{platform}/channels", self._handle_list_channels)
         app.router.add_post("/api/{platform}/branch/post", self._handle_branch_post)
         app.router.add_post("/api/{platform}/reply", self._handle_reply)
+        app.router.add_post("/api/subscribe", self._handle_subscribe)
+        app.router.add_post("/api/unsubscribe", self._handle_unsubscribe)
         return app
 
     def _get_channel(self, platform: str) -> Channel | None:
@@ -357,6 +365,42 @@ class GatewayDaemon:
 
         result = await channel.send_message(channel_id, content)
         return web.json_response(result)
+
+    async def _handle_subscribe(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+        agent_id = body.get("agent_id", "")
+        surface_id = body.get("surface_id", "")
+        if not agent_id or not surface_id:
+            return web.json_response(
+                {"ok": False, "error": "Missing 'agent_id' or 'surface_id'"}, status=400
+            )
+
+        state_dir = self.config.agent_home / "state"
+        SubscriptionManager.subscribe(state_dir, agent_id, surface_id)
+        self.subscription_manager.refresh(force=True)
+        return web.json_response({"ok": True, "agent_id": agent_id, "surface_id": surface_id})
+
+    async def _handle_unsubscribe(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+        agent_id = body.get("agent_id", "")
+        surface_id = body.get("surface_id", "")
+        if not agent_id or not surface_id:
+            return web.json_response(
+                {"ok": False, "error": "Missing 'agent_id' or 'surface_id'"}, status=400
+            )
+
+        state_dir = self.config.agent_home / "state"
+        SubscriptionManager.unsubscribe(state_dir, agent_id, surface_id)
+        self.subscription_manager.refresh(force=True)
+        return web.json_response({"ok": True, "agent_id": agent_id, "surface_id": surface_id})
 
 
 # ---------------------------------------------------------------------------

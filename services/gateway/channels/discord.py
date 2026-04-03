@@ -11,8 +11,10 @@ from zoneinfo import ZoneInfo
 
 import discord
 
+from ..bridges import BridgeManager, Bridge
 from ..config import DiscordConfig, GatewayConfig
 from ..messages import split_message, write_to_inbox
+from ..subscriptions import SubscriptionManager
 from .base import Channel
 
 log = logging.getLogger("gateway.discord")
@@ -270,9 +272,13 @@ def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
 class DiscordChannel(Channel):
     """Discord integration via discord.py."""
 
-    def __init__(self, config: GatewayConfig):
+    def __init__(self, config: GatewayConfig,
+                 bridge_manager: BridgeManager,
+                 subscription_manager: SubscriptionManager):
         self._config = config
         self._discord_config: DiscordConfig = config.discord
+        self._bridge_manager = bridge_manager
+        self._subscription_manager = subscription_manager
         self._client: _GatewayClient | None = None
         self._ready = asyncio.Event()
 
@@ -285,6 +291,8 @@ class DiscordChannel(Channel):
 
         self._client = _GatewayClient(
             config=self._config,
+            bridge_manager=self._bridge_manager,
+            subscription_manager=self._subscription_manager,
             ready_event=self._ready,
         )
         connect_task = asyncio.create_task(self._client.start(token))
@@ -487,37 +495,35 @@ class _GatewayClient(discord.Client):
     Handles inbound messages, branch threads, channel mirroring, and status.
     """
 
-    def __init__(self, config: GatewayConfig, ready_event: asyncio.Event, **kwargs):
+    def __init__(self, config: GatewayConfig,
+                 bridge_manager: BridgeManager,
+                 subscription_manager: SubscriptionManager,
+                 ready_event: asyncio.Event, **kwargs):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents, **kwargs)
 
         self._config = config
         self._discord_config = config.discord
+        self._bridge_manager = bridge_manager
+        self._subscription_manager = subscription_manager
         self._ready_event = ready_event
 
         state_dir = config.agent_home / "state"
         session_prefix = config.default_agent + "-" if config.default_agent else ""
         self._session_prefix = session_prefix
 
-        # Branch threads: agent_id -> thread_id
+        # Branch threads: agent_id -> thread_id (for thread lifecycle management)
         self._branch_threads_path = state_dir / "discord-branch-threads.json"
         self._branch_threads: dict[str, int] = {
             k: int(v) for k, v in _load_json_state(self._branch_threads_path).items()
         }
-        self._thread_to_agent: dict[int, str] = {
-            v: k for k, v in self._branch_threads.items()
-        }
 
-        # Channel threads: channel_name -> thread_id
+        # Channel threads: channel_name -> thread_id (for bridge lifecycle)
         self._channel_threads_path = state_dir / "discord-channel-threads.json"
         self._channel_threads: dict[str, int] = {
             k: int(v) for k, v in _load_json_state(self._channel_threads_path).items()
         }
-        self._channel_thread_to_name: dict[int, str] = {
-            v: k for k, v in self._channel_threads.items()
-        }
-        self._channel_file_positions: dict[str, int] = {}
 
         # Status message ID
         self._status_msg_path = state_dir / "discord-status-msg-id"
@@ -527,6 +533,7 @@ class _GatewayClient(discord.Client):
         """Start background tasks after connection."""
         self.loop.create_task(self._sync_branch_threads_loop())
         self.loop.create_task(self._sync_channel_threads_loop())
+        self.loop.create_task(self._outbound_bridge_loop())
         self.loop.create_task(self._update_presence_loop())
         self.loop.create_task(self._update_status_loop())
 
@@ -557,39 +564,16 @@ class _GatewayClient(discord.Client):
         if not content.strip() and not message.attachments:
             return
 
-        # --- Route based on thread type ---
-
-        if isinstance(message.channel, discord.Thread):
-            thread_id = message.channel.id
-
-            # Channel thread? Inject into the Kiln channel
-            if thread_id in self._channel_thread_to_name:
-                channel_name = self._channel_thread_to_name[thread_id]
-                self._inject_channel_message(channel_name, sender_name, content)
-                log.info("Discord -> channel '%s' from %s", channel_name, sender_name)
-                return
-
-            # Branch thread? Route to that agent's inbox
-            if thread_id in self._thread_to_agent:
-                agent_id = self._thread_to_agent[thread_id]
-                log.info("Discord -> branch inbox %s from %s", agent_id, sender_name)
-                write_to_inbox(
-                    self._config.agent_home, agent_id,
-                    sender_name=sender_name, sender_id=sender_id,
-                    content=content, platform="discord",
-                    channel_desc=f"#branches/{message.channel.name}",
-                    channel_id=str(thread_id), trust=trust,
-                )
-                return
-
-        # --- Default routing ---
-
+        # Determine surface ID for routing
         if is_dm:
+            surface_id = f"dm/{sender_id}"
             channel_desc = f"dm/{sender_name}"
-        elif hasattr(message.channel, "name"):
-            channel_desc = f"#{message.channel.name}"
         else:
-            channel_desc = "unknown"
+            surface_id = str(message.channel.id)
+            if hasattr(message.channel, "name"):
+                channel_desc = f"#{message.channel.name}"
+            else:
+                channel_desc = "unknown"
 
         # Download attachments
         attachment_paths: list[str] = []
@@ -602,22 +586,26 @@ class _GatewayClient(discord.Client):
                 attachment_paths[0], content, sender_name
             )
 
-        # Route to preferred session (e.g. canonical), then catch-all.
-        # The subscription model (v2) will replace this with per-session
-        # channel subscriptions.
-        agent_id = (
-            self._find_preferred_agent()
-            or self._config.default_agent
-            or "gateway-pending"
-        )
+        # --- Routing ---
 
-        write_to_inbox(
-            self._config.agent_home, agent_id,
-            sender_name=sender_name, sender_id=sender_id,
-            content=content, platform="discord",
-            channel_desc=channel_desc, channel_id=str(message.channel.id),
-            trust=trust, attachment_paths=attachment_paths or None,
-        )
+        # 1. Bridge: inject into Kiln channel if this surface is bridged
+        self._bridge_manager.inject_inbound(surface_id, sender_name, content)
+
+        # 2. Subscriptions: deliver to all subscribers
+        self._subscription_manager.refresh()
+        subscribers = self._subscription_manager.get_subscribers(surface_id)
+        for agent_id in subscribers:
+            write_to_inbox(
+                self._config.agent_home, agent_id,
+                sender_name=sender_name, sender_id=sender_id,
+                content=content, platform="discord",
+                channel_desc=channel_desc, channel_id=str(message.channel.id),
+                trust=trust, attachment_paths=attachment_paths or None,
+            )
+
+        if subscribers:
+            log.info("Discord -> %d subscriber(s) from %s in %s",
+                     len(subscribers), sender_name, channel_desc)
 
     # -----------------------------------------------------------------------
     # Branch threads
@@ -650,6 +638,7 @@ class _GatewayClient(discord.Client):
         """Rebuild thread mapping from Discord state on startup."""
         registry = _read_registry(self._config.agent_home)
         active_agents = set(registry.keys())
+        state_dir = self._config.agent_home / "state"
 
         try:
             all_threads = await branches_ch.guild.active_threads()
@@ -662,7 +651,8 @@ class _GatewayClient(discord.Client):
             agent_id = f"{self._session_prefix}{thread.name}"
             if agent_id in active_agents:
                 self._branch_threads[agent_id] = thread.id
-                self._thread_to_agent[thread.id] = agent_id
+                # Register subscription so messages route to this session
+                SubscriptionManager.subscribe(state_dir, agent_id, str(thread.id))
                 log.info("Reconciled thread '%s' -> %s", thread.name, agent_id)
             else:
                 try:
@@ -678,6 +668,7 @@ class _GatewayClient(discord.Client):
         """Create threads for new sessions, archive threads for ended ones."""
         registry = _read_registry(self._config.agent_home)
         active_agents = set(registry.keys())
+        state_dir = self._config.agent_home / "state"
         changed = False
 
         # Create threads for new sessions
@@ -691,9 +682,11 @@ class _GatewayClient(discord.Client):
                     type=discord.ChannelType.public_thread,
                 )
                 self._branch_threads[agent_id] = thread.id
-                self._thread_to_agent[thread.id] = agent_id
                 changed = True
                 log.info("Created branch thread '%s' for %s", short_name, agent_id)
+
+                # Register subscription so messages route to this session
+                SubscriptionManager.subscribe(state_dir, agent_id, str(thread.id))
 
                 # Post intro
                 plan = _read_plan(self._config.agent_home, agent_id)
@@ -708,7 +701,6 @@ class _GatewayClient(discord.Client):
         dead = set(self._branch_threads.keys()) - active_agents
         for agent_id in dead:
             thread_id = self._branch_threads.pop(agent_id)
-            self._thread_to_agent.pop(thread_id, None)
             changed = True
             try:
                 thread = self.get_channel(thread_id)
@@ -724,18 +716,31 @@ class _GatewayClient(discord.Client):
             _save_json_state(self._branch_threads_path, self._branch_threads)
 
     # -----------------------------------------------------------------------
-    # Channel mirroring
+    # Channel bridges (Kiln channel ↔ Discord thread)
     # -----------------------------------------------------------------------
 
     async def _sync_channel_threads_loop(self) -> None:
+        """Manage Discord thread lifecycle for Kiln channel bridges."""
         await self.wait_until_ready()
 
         channels_ch = self._resolve_config_channel("channels")
         if not channels_ch:
-            log.warning("No #channels channel configured — channel mirroring disabled")
+            log.warning("No #channels channel configured — channel bridges disabled")
             return
 
-        log.info("Channel thread manager started")
+        log.info("Channel bridge manager started")
+
+        # Register send callback for outbound bridge messages
+        async def send_to_surface(surface_id: str, content: str) -> None:
+            thread = self.get_channel(int(surface_id))
+            if not thread:
+                thread = await self.fetch_channel(int(surface_id))
+            if hasattr(thread, "archived") and thread.archived:
+                await thread.edit(archived=False)
+            for chunk in split_message(content):
+                await thread.send(chunk)
+
+        self._bridge_manager.register_send_callback("discord", send_to_surface)
 
         # Reconcile
         try:
@@ -743,17 +748,22 @@ class _GatewayClient(discord.Client):
         except Exception:
             log.exception("Channel thread reconciliation error")
 
-        iteration = 0
+        # Lifecycle sync loop (thread creation/archival only)
         while not self.is_closed():
             try:
-                # Lifecycle sync every 30 iterations (~30s at 1s poll)
-                if iteration % 30 == 0:
-                    await self._sync_channel_lifecycle(channels_ch)
-                await self._forward_channel_messages()
+                await self._sync_channel_lifecycle(channels_ch)
             except Exception:
                 log.exception("Channel thread sync error")
+            await asyncio.sleep(STATUS_UPDATE_INTERVAL)
 
-            iteration += 1
+    async def _outbound_bridge_loop(self) -> None:
+        """Poll bridged Kiln channels and forward new messages to platforms."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self._bridge_manager.forward_outbound()
+            except Exception:
+                log.exception("Outbound bridge error")
             await asyncio.sleep(CHANNEL_POLL_INTERVAL)
 
     async def _reconcile_channel_threads(self, channels_ch: discord.TextChannel) -> None:
@@ -770,11 +780,13 @@ class _GatewayClient(discord.Client):
             name = thread.name
             if name in active:
                 self._channel_threads[name] = thread.id
-                self._channel_thread_to_name[thread.id] = name
-                # Skip to end of history to avoid replaying
-                history = self._config.agent_home / "channels" / name / "history.jsonl"
-                if history.exists():
-                    self._channel_file_positions[name] = history.stat().st_size
+                # Register bridge: Discord thread ↔ Kiln channel
+                self._bridge_manager.register(Bridge(
+                    kiln_channel=name,
+                    platform="discord",
+                    surface_id=str(thread.id),
+                    surface_desc=f"#channels/{name}",
+                ))
                 log.info("Reconciled channel thread '%s'", name)
             else:
                 try:
@@ -799,9 +811,17 @@ class _GatewayClient(discord.Client):
                     type=discord.ChannelType.public_thread,
                 )
                 self._channel_threads[name] = thread.id
-                self._channel_thread_to_name[thread.id] = name
                 changed = True
                 log.info("Created channel thread '%s'", name)
+
+                # Register bridge
+                bridge = Bridge(
+                    kiln_channel=name,
+                    platform="discord",
+                    surface_id=str(thread.id),
+                    surface_desc=f"#channels/{name}",
+                )
+                self._bridge_manager.register(bridge)
 
                 # Post catch-up history
                 history = self._config.agent_home / "channels" / name / "history.jsonl"
@@ -814,7 +834,7 @@ class _GatewayClient(discord.Client):
                             continue
                         try:
                             msg = json.loads(line)
-                            formatted = self._format_channel_msg(msg)
+                            formatted = BridgeManager._format_outbound(msg)
                             if formatted:
                                 parts.append(formatted)
                         except json.JSONDecodeError:
@@ -823,7 +843,6 @@ class _GatewayClient(discord.Client):
                         catchup = "**[history]**\n" + "\n".join(parts)
                         for chunk in split_message(catchup):
                             await thread.send(chunk)
-                    self._channel_file_positions[name] = history.stat().st_size
             except discord.HTTPException as e:
                 log.error("Failed to create channel thread '%s': %s", name, e)
 
@@ -831,8 +850,7 @@ class _GatewayClient(discord.Client):
         dead = set(self._channel_threads.keys()) - set(active.keys())
         for name in dead:
             thread_id = self._channel_threads.pop(name)
-            self._channel_thread_to_name.pop(thread_id, None)
-            self._channel_file_positions.pop(name, None)
+            self._bridge_manager.unregister_channel(name)
             changed = True
             try:
                 thread = self.get_channel(thread_id)
@@ -847,32 +865,7 @@ class _GatewayClient(discord.Client):
         if changed:
             _save_json_state(self._channel_threads_path, self._channel_threads)
 
-    async def _forward_channel_messages(self) -> None:
-        """Forward new Kiln channel messages to Discord threads."""
-        for name, thread_id in list(self._channel_threads.items()):
-            messages = self._read_new_channel_messages(name)
-            if not messages:
-                continue
 
-            try:
-                thread = self.get_channel(thread_id)
-                if not thread:
-                    thread = await self.fetch_channel(thread_id)
-                if hasattr(thread, "archived") and thread.archived:
-                    await thread.edit(archived=False)
-            except (discord.NotFound, discord.Forbidden):
-                continue
-
-            for msg in messages:
-                if msg.get("source") == "discord":
-                    continue  # prevent echo
-                formatted = self._format_channel_msg(msg)
-                if formatted:
-                    for chunk in split_message(formatted):
-                        try:
-                            await thread.send(chunk)
-                        except discord.HTTPException as e:
-                            log.error("Failed to forward channel message: %s", e)
 
     def _get_active_channels(self) -> dict[str, Path]:
         """Get channels with recent activity (history.jsonl modified in last hour)."""
@@ -890,90 +883,7 @@ class _GatewayClient(discord.Client):
                 result[d.name] = history
         return result
 
-    def _read_new_channel_messages(self, name: str) -> list[dict]:
-        history = self._config.agent_home / "channels" / name / "history.jsonl"
-        if not history.exists():
-            return []
 
-        pos = self._channel_file_positions.get(name, 0)
-        current_size = history.stat().st_size
-        if current_size <= pos:
-            return []
-
-        messages = []
-        with open(history) as f:
-            f.seek(pos)
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    messages.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            self._channel_file_positions[name] = f.tell()
-
-        return messages
-
-    def _format_channel_msg(self, msg: dict) -> str | None:
-        sender = msg.get("from", "unknown")
-        body = msg.get("body", "")
-        summary = msg.get("summary", "")
-        text = body or summary
-        if not text:
-            return None
-        return f"**{sender}:** {text}"
-
-    def _inject_channel_message(self, channel_name: str, sender_name: str, content: str) -> None:
-        """Inject a Discord message into a Kiln channel.
-
-        Two steps:
-        1. Deliver to all subscriber inboxes (via Kiln's send_to_inbox)
-        2. Append to channel history with source=discord to prevent echo
-
-        We can't use do_send_message directly because it doesn't support
-        the source tag needed for echo prevention in channel mirroring.
-        """
-        from kiln.tools import send_to_inbox, _resolve_recipient_inbox
-
-        inbox_root = self._config.agent_home / "inbox"
-        channels_path = self._config.agent_home / "channels.json"
-        sender_id = f"discord-{sender_name}"
-        summary = content[:200]
-
-        # 1. Deliver to subscriber inboxes
-        try:
-            ch_data = json.loads(channels_path.read_text()) if channels_path.exists() else {}
-        except (json.JSONDecodeError, OSError):
-            ch_data = {}
-
-        subscribers = ch_data.get(channel_name, [])
-        delivered = 0
-        for subscriber in subscribers:
-            recipient_inbox_root = _resolve_recipient_inbox(subscriber, inbox_root)
-            send_to_inbox(
-                recipient_inbox_root, subscriber, sender_id,
-                summary, content, "normal", channel=channel_name,
-            )
-            delivered += 1
-
-        if delivered:
-            log.info("Delivered channel '%s' message to %d subscriber(s)", channel_name, delivered)
-
-        # 2. Append to channel history with source tag for echo prevention
-        history_dir = self._config.agent_home / "channels" / channel_name
-        history_dir.mkdir(parents=True, exist_ok=True)
-
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "from": sender_id,
-            "summary": summary,
-            "body": content,
-            "priority": "normal",
-            "source": "discord",
-        }
-        with open(history_dir / "history.jsonl", "a") as f:
-            f.write(json.dumps(entry) + "\n")
 
     # -----------------------------------------------------------------------
     # Status display
@@ -1068,34 +978,6 @@ class _GatewayClient(discord.Client):
         if not channel_id:
             return None
         return self.get_channel(int(channel_id))
-
-    def _find_preferred_agent(self) -> str | None:
-        """Read the preferred session file and verify the session is alive.
-
-        The preferred session file is configured in the gateway config
-        (routing.preferred_session_file). It contains a single agent ID.
-        The agent manages the file — the gateway just reads it.
-        """
-        path = self._config.preferred_session_file
-        if not path or not path.exists():
-            return None
-        try:
-            agent_id = path.read_text().strip()
-        except OSError:
-            return None
-        if not agent_id:
-            return None
-        # Verify it's actually running
-        registry = _read_registry(self._config.agent_home)
-        if agent_id in registry:
-            return agent_id
-        return None
-
-    def _find_active_agent(self) -> str | None:
-        registry = _read_registry(self._config.agent_home)
-        if not registry:
-            return None
-        return max(registry, key=lambda k: registry[k].get("started_at", ""))
 
     async def _download_attachments(
         self, attachments: list[discord.Attachment], sender_name: str
