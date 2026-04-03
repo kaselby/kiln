@@ -138,6 +138,92 @@ def load_tool_docs(
 # Tool and skill discovery
 # ---------------------------------------------------------------------------
 
+def discover_tool_layout(tools_path: Path) -> list[dict] | dict:
+    """Discover tools with core/library awareness.
+
+    If tools_path contains core/ or library/ subdirectories, returns a tiered
+    dict::
+
+        {"core": [tool_dicts], "library": {"name": "one-liner", ...}}
+
+    Core tools are discovered via headers (full specs). Library tools come from
+    library/registry.yml (one-liner descriptions only).
+
+    If no core/ or library/ dirs exist, falls back to flat discovery and returns
+    a plain list[dict] (same as discover_tools).
+    """
+    if not tools_path.exists():
+        return []
+
+    core_dir = tools_path / "core"
+    lib_dir = tools_path / "library"
+
+    if not core_dir.exists() and not lib_dir.exists():
+        return discover_tools(tools_path)
+
+    result: dict = {"core": [], "library": {}}
+
+    if core_dir.exists():
+        result["core"] = discover_tools(core_dir)
+
+    if lib_dir.exists():
+        registry_path = lib_dir / "registry.yml"
+        if registry_path.exists():
+            try:
+                raw = yaml.safe_load(registry_path.read_text()) or {}
+                result["library"] = {k: v for k, v in raw.items() if isinstance(v, str)}
+            except Exception:
+                pass
+
+    return result
+
+
+def discover_skill_layout(skills_path: Path) -> list[dict] | dict:
+    """Discover skills with core/library awareness.
+
+    If skills_path contains core/ or library/ subdirectories, returns a tiered
+    dict::
+
+        {"core": [skill_dicts], "library": {"name": "one-liner", ...}}
+
+    Core skills have full description + path. Library skills come from
+    library/registry.yml, falling back to truncated SKILL.md descriptions.
+
+    If no core/ or library/ dirs exist, falls back to flat discovery.
+    """
+    if not skills_path.exists():
+        return []
+
+    core_dir = skills_path / "core"
+    lib_dir = skills_path / "library"
+
+    if not core_dir.exists() and not lib_dir.exists():
+        return discover_skills(skills_path)
+
+    result: dict = {"core": [], "library": {}}
+
+    if core_dir.exists():
+        result["core"] = discover_skills(core_dir)
+
+    if lib_dir.exists():
+        registry_path = lib_dir / "registry.yml"
+        if registry_path.exists():
+            try:
+                raw = yaml.safe_load(registry_path.read_text()) or {}
+                result["library"] = {k: v for k, v in raw.items() if isinstance(v, str)}
+            except Exception:
+                pass
+
+        # Fall back to SKILL.md frontmatter if no registry
+        if not result["library"]:
+            lib_skills = discover_skills(lib_dir)
+            result["library"] = {
+                s["name"]: s["description"][:80] for s in lib_skills
+            }
+
+    return result
+
+
 def discover_tools(tools_path: Path) -> list[dict]:
     """Scan a tools directory for standalone scripts and managed tool definitions.
 
@@ -303,12 +389,76 @@ def discover_skills(skills_path: Path) -> list[dict]:
 # Session context building
 # ---------------------------------------------------------------------------
 
+def _render_tool_listing(tools: list[dict] | dict | None) -> str:
+    """Render tool listing from flat list or tiered dict."""
+    if not tools:
+        return ""
+
+    ctx = ""
+    if isinstance(tools, dict):
+        # Tiered: core (full specs) + library (one-liners)
+        core = tools.get("core", [])
+        library = tools.get("library", {})
+
+        if core:
+            ctx += "\nCustom tools (invoke via Bash):\n"
+            for t in core:
+                cost_tag = f" **[${t['cost']}/call]**" if t.get("cost") else ""
+                args = f" `{t['arguments']}`" if t.get("arguments") else ""
+                desc = " ".join(t.get("description", "").split())
+                ctx += f"- **{t['name']}**{args} — {desc}{cost_tag}\n"
+
+        if library:
+            ctx += "\nTool library (use `tool-info <name>` for details):\n"
+            for name in sorted(library):
+                ctx += f"- **{name}** — {library[name]}\n"
+    else:
+        # Flat: all tools with full descriptions
+        ctx += "\nCustom tools (invoke via Bash):\n"
+        for t in tools:
+            cost_tag = f" **[${t['cost']}/call]**" if t.get("cost") else ""
+            args = f" `{t['arguments']}`" if t.get("arguments") else ""
+            ctx += f"- **{t['name']}**{args} — {t['description']}{cost_tag}\n"
+
+    return ctx
+
+
+def _render_skill_listing(skills: list[dict] | dict | None) -> str:
+    """Render skill listing from flat list or tiered dict."""
+    if not skills:
+        return ""
+
+    ctx = ""
+    if isinstance(skills, dict):
+        core = skills.get("core", [])
+        library = skills.get("library", {})
+
+        if core:
+            ctx += "\nAvailable skills:\n"
+            for s in core:
+                ctx += f"- **{s['name']}** ({s['path']}): {s['description']}\n"
+
+        if library:
+            ctx += "\nSkill library:\n"
+            for name in sorted(library):
+                ctx += f"- **{name}** — {library[name]}\n"
+    else:
+        ctx += "\nAvailable skills:\n"
+        for s in skills:
+            ctx += f"- **{s['name']}** ({s['path']}): {s['description']}\n"
+
+    if ctx:
+        ctx += "\nUse `activate_skill` to load a skill before using it.\n"
+
+    return ctx
+
+
 def build_session_context(
     agent_id: str,
     model: str | None = None,
     *,
-    tools: list[dict] | None = None,
-    skills: list[dict] | None = None,
+    tools: list[dict] | dict | None = None,
+    skills: list[dict] | dict | None = None,
     parent: str | None = None,
     depth: int = 0,
     cwd: str | None = None,
@@ -323,8 +473,10 @@ def build_session_context(
     Args:
         agent_id: The agent's session ID.
         model: Model name or alias (resolved internally).
-        tools: List of tool metadata dicts from discover_tools().
-        skills: List of skill metadata dicts from discover_skills().
+        tools: Tool data — flat list[dict] from discover_tools(), or tiered
+            dict from discover_tool_layout() with "core" and "library" keys.
+        skills: Skill data — flat list[dict] from discover_skills(), or tiered
+            dict from discover_skill_layout().
         parent: Parent agent ID if spawned.
         depth: Spawn depth.
         cwd: Working directory.
@@ -356,20 +508,8 @@ def build_session_context(
     ctx += f"Shell: {os.environ.get('SHELL', 'unknown')}\n"
     ctx += f"Working directory: {cwd or os.getcwd()}\n"
 
-    # Tool listing
-    if tools:
-        ctx += "\nCustom tools (invoke via Bash):\n"
-        for t in tools:
-            cost_tag = f" **[${t['cost']}/call]**" if t.get("cost") else ""
-            args = f" `{t['arguments']}`" if t.get("arguments") else ""
-            ctx += f"- **{t['name']}**{args} — {t['description']}{cost_tag}\n"
-
-    # Skill listing
-    if skills:
-        ctx += "\nAvailable skills:\n"
-        for s in skills:
-            ctx += f"- **{s['name']}** ({s['path']}): {s['description']}\n"
-        ctx += "\nUse `activate_skill` to load a skill before using it.\n"
+    ctx += _render_tool_listing(tools)
+    ctx += _render_skill_listing(skills)
 
     ctx += f"\nToday's date is **{date.today().strftime('%B %d, %Y')}**."
 

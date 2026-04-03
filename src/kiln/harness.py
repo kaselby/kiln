@@ -41,7 +41,9 @@ from .names import generate_agent_name
 from .permissions import PermissionMode, _headless_deny, create_permission_hook
 from .prompt import (
     build_session_context,
+    discover_skill_layout,
     discover_skills,
+    discover_tool_layout,
     discover_tools,
     load_tool_docs,
     resolve_model,
@@ -155,8 +157,8 @@ class KilnHarness:
 
         # Build session context
         cwd = self.config.project or safe_getcwd()
-        custom_tools = discover_tools(self.config.tools_path)
-        skills = discover_skills(self.config.skills_path)
+        custom_tools = discover_tool_layout(self.config.tools_path)
+        skills = discover_skill_layout(self.config.skills_path)
 
         extra_lines = [f"Inbox: {self.config.agent_inbox(self.agent_id)}"]
         session_ctx = build_session_context(
