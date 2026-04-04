@@ -352,7 +352,9 @@ class DiscordChannel(Channel):
         if not channel or not hasattr(channel, "create_thread"):
             return {"ok": False, "error": f"Cannot create thread in {channel_name}"}
 
-        thread = await channel.create_thread(name=name)
+        thread = await channel.create_thread(
+            name=name, type=discord.ChannelType.public_thread,
+        )
         return {"ok": True, "thread_id": str(thread.id), "name": name}
 
     async def archive_thread(self, channel_name: str, name: str) -> None:
