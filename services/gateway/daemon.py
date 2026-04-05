@@ -112,16 +112,29 @@ class GatewayDaemon:
         app.router.add_post("/api/{platform}/reply", self._handle_reply)
         app.router.add_post("/api/subscribe", self._handle_subscribe)
         app.router.add_post("/api/unsubscribe", self._handle_unsubscribe)
+        app.router.add_post("/api/permission/request", self._handle_permission_request)
+        app.router.add_post("/api/permission/resolve", self._handle_permission_resolve)
         return app
 
     def _get_channel(self, platform: str) -> Channel | None:
         return self.channels.get(platform)
+
+    def _permissions_available(self) -> bool:
+        """Check if remote permission approval is configured and the platform is online."""
+        perm = self.config.permissions
+        if not perm.enabled or not perm.platform:
+            return False
+        channel = self.channels.get(perm.platform)
+        if not channel:
+            return False
+        return "request_permission" in channel.capabilities()
 
     async def _handle_status(self, request: web.Request) -> web.Response:
         status = {
             "running": True,
             "pid": os.getpid(),
             "channels": {},
+            "permissions": self._permissions_available(),
         }
         for name, ch in self.channels.items():
             status["channels"][name] = {
@@ -401,6 +414,60 @@ class GatewayDaemon:
         SubscriptionManager.unsubscribe(state_dir, agent_id, surface_id)
         self.subscription_manager.refresh(force=True)
         return web.json_response({"ok": True, "agent_id": agent_id, "surface_id": surface_id})
+
+    async def _handle_permission_request(self, request: web.Request) -> web.Response:
+        """Handle a permission approval request. Long-polls until resolved."""
+        if not self._permissions_available():
+            return web.json_response(
+                {"ok": False, "error": "Remote permissions not configured or platform offline"},
+                status=503,
+            )
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+        agent_id = body.get("agent_id", "")
+        command = body.get("command", "")
+        reason = body.get("reason", "")
+        timeout = body.get("timeout", 300)
+        if not agent_id or not command:
+            return web.json_response(
+                {"ok": False, "error": "Missing 'agent_id' or 'command'"}, status=400
+            )
+
+        platform = self.config.permissions.platform
+        channel = self.channels[platform]
+
+        log.info("Permission request from %s: %s", agent_id, reason)
+        result = await channel.request_permission(agent_id, command, reason, timeout=timeout)
+        log.info("Permission result for %s: %s", agent_id, result)
+        return web.json_response({"ok": True, **result})
+
+    async def _handle_permission_resolve(self, request: web.Request) -> web.Response:
+        """Externally resolve a pending permission request (e.g. terminal won the race)."""
+        if not self._permissions_available():
+            return web.json_response(
+                {"ok": False, "error": "Remote permissions not configured"}, status=503
+            )
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+        agent_id = body.get("agent_id", "")
+        status = body.get("status", "")
+        if not agent_id or status not in ("approved", "rejected", "timed_out"):
+            return web.json_response(
+                {"ok": False, "error": "Missing 'agent_id' or invalid 'status'"}, status=400
+            )
+
+        platform = self.config.permissions.platform
+        channel = self.channels[platform]
+        result = await channel.resolve_permission(agent_id, status)
+        return web.json_response(result)
 
 
 # ---------------------------------------------------------------------------

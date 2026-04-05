@@ -72,6 +72,14 @@ class DiscordConfig:
 
 
 @dataclass
+class PermissionsConfig:
+    """Remote permission approval configuration."""
+
+    enabled: bool = False
+    platform: str = ""  # which channel platform handles approvals (e.g. "discord")
+
+
+@dataclass
 class GatewayConfig:
     """Top-level gateway configuration."""
 
@@ -80,6 +88,7 @@ class GatewayConfig:
     agent_home: Path = field(default_factory=lambda: Path.home())
     default_agent: str = ""
     discord: DiscordConfig | None = None
+    permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
 
     @property
     def credentials_dir(self) -> Path:
@@ -121,5 +130,12 @@ def load_config(path: Path) -> GatewayConfig:
 
     if "channels" in raw and "discord" in raw["channels"]:
         cfg.discord = DiscordConfig.from_dict(raw["channels"]["discord"])
+
+    if "permissions" in raw:
+        perm = raw["permissions"]
+        cfg.permissions = PermissionsConfig(
+            enabled=perm.get("enabled", False),
+            platform=perm.get("platform", ""),
+        )
 
     return cfg

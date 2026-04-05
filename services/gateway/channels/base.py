@@ -61,11 +61,45 @@ class Channel(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support list_channels")
 
+    async def request_permission(
+        self, agent_id: str, command: str, reason: str, timeout: float = 300
+    ) -> dict:
+        """Request interactive approval for a guardrail-blocked command.
+
+        Posts an approval prompt (e.g. with buttons) in the agent's
+        session surface and waits for a response.
+
+        Args:
+            agent_id: The agent session ID requesting approval.
+            command: The bash command that triggered the guardrail.
+            reason: Human-readable description of why it was flagged.
+            timeout: Seconds to wait for a response before timing out.
+
+        Returns:
+            {"approved": bool, "timed_out": bool, "responder": str}
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support request_permission")
+
+    async def resolve_permission(self, agent_id: str, status: str) -> dict:
+        """Externally resolve a pending permission request.
+
+        Called when the approval is resolved from another source (e.g. terminal)
+        before the platform's interactive prompt was answered.
+
+        Args:
+            agent_id: The agent whose pending request to resolve.
+            status: One of "approved", "rejected", "timed_out".
+
+        Returns:
+            {"ok": bool}
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support resolve_permission")
+
     def capabilities(self) -> set[str]:
         """Declare supported operations beyond send_message."""
         caps = {"send_message"}
         for method_name in ("read_history", "create_thread", "archive_thread",
-                            "send_voice", "list_channels"):
+                            "send_voice", "list_channels", "request_permission"):
             method = getattr(type(self), method_name)
             base_method = getattr(Channel, method_name)
             if method is not base_method:

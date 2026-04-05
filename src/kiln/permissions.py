@@ -5,15 +5,21 @@ Includes guardrails for dangerous commands that fire regardless of permission mo
 
 import asyncio
 import difflib
+import json
+import logging
 import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import HookContext, HookInput, HookJSONOutput
+
+_log = logging.getLogger("kiln.permissions")
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +421,93 @@ def _notify(title: str, message: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Gateway remote approval
+# ---------------------------------------------------------------------------
+
+
+async def _check_gateway(agent_home: str) -> str | None:
+    """Check if gateway is online and supports remote permission approval.
+
+    Reads the gateway state file for connection info, then hits the status
+    endpoint. Returns the gateway base URL if permissions are available,
+    None otherwise. Fast path — should complete in <50ms for local gateway.
+    """
+    state_file = Path(agent_home) / "state" / "gateway.json"
+    if not state_file.exists():
+        return None
+    try:
+        state = json.loads(state_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    url = f"http://{state.get('bind', '127.0.0.1')}:{state.get('port', 18820)}"
+
+    def _check():
+        req = urllib.request.Request(f"{url}/api/status")
+        try:
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read())
+                if data.get("permissions"):
+                    return url
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _check)
+
+
+async def _gateway_approval(
+    gateway_url: str, agent_id: str, command: str, reason: str, timeout: float = 300
+) -> dict:
+    """POST a permission request to the gateway. Long-polls until resolved.
+
+    Runs the blocking HTTP call in a thread executor so it doesn't block
+    the event loop. Returns {"approved": bool, "timed_out": bool} or
+    {"error": str} on failure.
+    """
+    def _request():
+        payload = json.dumps({
+            "agent_id": agent_id,
+            "command": command,
+            "reason": reason,
+            "timeout": timeout,
+        }).encode()
+        req = urllib.request.Request(
+            f"{gateway_url}/api/permission/request",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            # timeout slightly longer than the gateway's internal timeout
+            with urllib.request.urlopen(req, timeout=timeout + 15) as resp:
+                return json.loads(resp.read())
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as e:
+            _log.warning("Gateway permission request failed: %s", e)
+            return {"error": str(e)}
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _request)
+
+
+def _resolve_gateway_permission(gateway_url: str, agent_id: str, status: str) -> None:
+    """Tell the gateway to resolve a pending permission request. Best-effort, fire-and-forget."""
+    try:
+        payload = json.dumps({"agent_id": agent_id, "status": status}).encode()
+        req = urllib.request.Request(
+            f"{gateway_url}/api/permission/resolve",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception:
+        pass  # best-effort cleanup
+
+
 async def _headless_deny(req: "PermissionRequest") -> bool:
     """Default permission handler for headless sessions — always deny.
 
@@ -422,6 +515,86 @@ async def _headless_deny(req: "PermissionRequest") -> bool:
     Block-tier commands are handled before this is called and don't
     need a handler.
     """
+    return False
+
+
+async def _resolve_approval(
+    req: "PermissionRequest",
+    request_permission: "PermissionHandler",
+    agent_home: str,
+    agent_id: str,
+    command: str,
+    reason: str,
+) -> bool:
+    """Resolve a confirm-tier guardrail using all available approval sources.
+
+    Races the terminal handler (TUI or headless) against the gateway
+    (if available). First response wins. In headless mode without a
+    gateway, denies immediately.
+    """
+    has_terminal = request_permission is not _headless_deny
+
+    # Check gateway availability (fast — reads state file + local HTTP)
+    gateway_url = await _check_gateway(agent_home)
+
+    # Collect approval sources
+    tasks: dict[asyncio.Task, str] = {}
+
+    if has_terminal:
+        tasks[asyncio.create_task(request_permission(req))] = "terminal"
+
+    if gateway_url:
+        async def _gw():
+            result = await _gateway_approval(gateway_url, agent_id, command, reason)
+            if "error" in result:
+                return None  # gateway failed, not a decision
+            return result.get("approved", False)
+        tasks[asyncio.create_task(_gw())] = "gateway"
+
+    if not tasks:
+        # Headless with no gateway — deny
+        _log.info("No approval sources available — denying guardrail")
+        return False
+
+    # Race all sources
+    while tasks:
+        done, _ = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+
+        for completed in done:
+            source = tasks.pop(completed)
+            try:
+                result = completed.result()
+            except Exception:
+                _log.exception("Approval source '%s' raised", source)
+                continue
+
+            if result is None:
+                # Source failed (e.g. gateway error) — ignore, keep waiting
+                continue
+
+            allowed = bool(result)
+            _log.info("Guardrail resolved by %s: %s", source, "approved" if allowed else "denied")
+
+            # Dismiss the TUI prompt if gateway won
+            if source == "gateway" and not req.event.is_set():
+                req.decide(allowed)
+
+            # Tell the gateway to update the Discord message if terminal won
+            if source == "terminal" and gateway_url:
+                status = "approved" if allowed else "rejected"
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(
+                    None, _resolve_gateway_permission, gateway_url, agent_id, status
+                )
+
+            # Cancel remaining sources
+            for t in tasks:
+                t.cancel()
+
+            return allowed
+
+    # All sources failed without producing a decision
+    _log.warning("All approval sources failed — denying guardrail")
     return False
 
 
@@ -513,7 +686,9 @@ def create_permission_hook(
                     diff_text=diff_text,
                     is_guardrail=True,
                 )
-                allowed = await request_permission(req)
+                allowed = await _resolve_approval(
+                    req, request_permission, agent_home, agent_id, command, reason
+                )
                 decision = "allow" if allowed else "deny"
                 result: HookJSONOutput = {
                     "hookSpecificOutput": {

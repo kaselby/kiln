@@ -32,6 +32,51 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 
 # ---------------------------------------------------------------------------
+# Permission approval UI
+# ---------------------------------------------------------------------------
+
+
+class _PermissionView(discord.ui.View):
+    """Discord view with Approve/Reject buttons for guardrail approval."""
+
+    def __init__(self, future: asyncio.Future, discord_config: DiscordConfig):
+        super().__init__(timeout=None)  # timeout handled by the caller
+        self._future = future
+        self._discord_config = discord_config
+
+    def _check_trust(self, user_id: str) -> bool:
+        """Only users with 'full' trust can approve permissions."""
+        entry = self._discord_config.users.get(str(user_id), {})
+        return entry.get("trust") == "full"
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, emoji="\u2705")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_trust(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "You don't have permission to approve commands.", ephemeral=True
+            )
+            return
+        if not self._future.done():
+            name = interaction.user.display_name
+            self._future.set_result((True, name))
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, emoji="\u274c")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_trust(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "You don't have permission to reject commands.", ephemeral=True
+            )
+            return
+        if not self._future.done():
+            name = interaction.user.display_name
+            self._future.set_result((False, name))
+        await interaction.response.defer()
+        self.stop()
+
+
+# ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
 
@@ -281,6 +326,7 @@ class DiscordChannel(Channel):
         self._subscription_manager = subscription_manager
         self._client: _GatewayClient | None = None
         self._ready = asyncio.Event()
+        self._pending_permissions: dict[str, dict] = {}  # agent_id -> {future, message, embed}
 
     async def connect(self) -> None:
         token = self._config.load_credential("DISCORD_BOT_TOKEN")
@@ -434,6 +480,125 @@ class DiscordChannel(Channel):
             return {"ok": True}
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             return {"ok": False, "error": str(e)}
+
+    async def request_permission(
+        self, agent_id: str, command: str, reason: str, timeout: float = 300
+    ) -> dict:
+        if not self._client:
+            return {"approved": False, "timed_out": False, "responder": ""}
+
+        thread_id = self._client._branch_threads.get(agent_id)
+        if not thread_id:
+            return {"approved": False, "timed_out": False, "responder": ""}
+
+        try:
+            thread = self._client.get_channel(thread_id)
+            if not thread:
+                thread = await self._client.fetch_channel(thread_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.error("Failed to get branch thread for %s: %s", agent_id, e)
+            return {"approved": False, "timed_out": False, "responder": ""}
+
+        # Build the approval prompt
+        embed = discord.Embed(
+            title="\u26a0\ufe0f Permission Required",
+            description=f"**{reason}**\n```\n{command[:1500]}\n```",
+            color=0xe74c3c,  # red
+        )
+        embed.set_footer(text=f"Agent: {agent_id}")
+
+        # Create view with buttons; the Future resolves when a button is clicked
+        future: asyncio.Future[tuple[bool, str]] = asyncio.get_event_loop().create_future()
+        view = _PermissionView(future, self._discord_config)
+
+        try:
+            msg = await thread.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.error("Failed to send permission prompt: %s", e)
+            return {"approved": False, "timed_out": False, "responder": ""}
+
+        # Register as pending so resolve_permission can find it
+        pending = {
+            "future": future,
+            "message": msg,
+            "embed": embed,
+            "externally_resolved": False,
+        }
+        self._pending_permissions[agent_id] = pending
+
+        try:
+            approved, responder = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            view.stop()
+            if not pending["externally_resolved"]:
+                try:
+                    embed.color = 0x95a5a6  # gray
+                    embed.title = "\u23f0 Permission Timed Out"
+                    await msg.edit(embed=embed, view=None)
+                except discord.HTTPException:
+                    pass
+            return {"approved": False, "timed_out": True, "responder": ""}
+        finally:
+            self._pending_permissions.pop(agent_id, None)
+
+        # Update the message only if not already updated by resolve_permission
+        if not pending["externally_resolved"]:
+            try:
+                if approved:
+                    embed.color = 0x2ecc71  # green
+                    embed.title = "\u2705 Approved"
+                else:
+                    embed.color = 0xe74c3c  # red
+                    embed.title = "\u274c Rejected"
+                embed.set_footer(text=f"Agent: {agent_id} | By: {responder}")
+                await msg.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        return {"approved": approved, "timed_out": False, "responder": responder}
+
+    async def resolve_permission(self, agent_id: str, status: str) -> dict:
+        """Externally resolve a pending permission request.
+
+        Called when the terminal (or timeout) resolves the approval before
+        Discord. Updates the Discord message and unblocks the waiting handler.
+
+        Args:
+            agent_id: The agent whose pending request to resolve.
+            status: One of "approved", "rejected", "timed_out".
+
+        Returns:
+            {"ok": bool, "error": str | None}
+        """
+        pending = self._pending_permissions.get(agent_id)
+        if not pending:
+            return {"ok": False, "error": f"No pending permission for {agent_id}"}
+
+        pending["externally_resolved"] = True
+        future = pending["future"]
+        msg = pending["message"]
+        embed = pending["embed"]
+
+        # Update the Discord message
+        status_display = {
+            "approved": ("\u2705 Approved (terminal)", 0x2ecc71),
+            "rejected": ("\u274c Rejected (terminal)", 0xe74c3c),
+            "timed_out": ("\u23f0 Timed Out", 0x95a5a6),
+        }
+        title, color = status_display.get(status, (f"\u2139\ufe0f {status}", 0x95a5a6))
+        try:
+            embed.title = title
+            embed.color = color
+            await msg.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+
+        # Resolve the future to unblock request_permission
+        if not future.done():
+            approved = status == "approved"
+            future.set_result((approved, "terminal"))
+
+        return {"ok": True}
 
     # --- Internal helpers ---
 
@@ -1023,7 +1188,7 @@ class _GatewayClient(discord.Client):
             audio_path, agent_home=self._config.agent_home
         )
         if transcript:
-            voice_prefix = f"[Voice message transcript]\n{transcript}"
+            voice_prefix = f"[Voice message transcript — may contain errors]\n{transcript}"
             if content.strip():
                 return f"{voice_prefix}\n\n{content}"
             return voice_prefix
