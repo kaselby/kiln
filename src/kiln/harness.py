@@ -54,6 +54,22 @@ from .shell import safe_getcwd
 from .tools import FileState, SessionControl, create_mcp_server
 
 
+def _tools_path_dirs(tools_path: Path) -> str:
+    """Build a colon-separated PATH string for the agent's tools directory.
+
+    When using a tiered layout (core/ and/or library/ subdirs), includes
+    those subdirectories on the PATH so tools are callable by name.
+    Always includes bin/ if it exists (for manually managed scripts).
+    The top-level tools dir is always included.
+    """
+    dirs = [str(tools_path)]
+    for subdir in ("core", "library", "bin"):
+        p = tools_path / subdir
+        if p.is_dir():
+            dirs.append(str(p))
+    return ":".join(dirs)
+
+
 class KilnHarness:
     """Default session manager for agents using agent.yml configuration.
 
@@ -298,7 +314,8 @@ class KilnHarness:
 
         # Environment
         venv_path = self.config.home / "venv"
-        tools_dir = str(self.config.tools_path)
+        tools_path = self.config.tools_path
+        tools_dirs = _tools_path_dirs(tools_path)
         base_path = os.environ.get("PATH", "")
         env = {
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
@@ -310,9 +327,9 @@ class KilnHarness:
         if venv_path.exists():
             venv_bin = venv_path / "bin"
             env["VIRTUAL_ENV"] = str(venv_path)
-            env["PATH"] = f"{tools_dir}:{venv_bin}:{base_path}"
+            env["PATH"] = f"{tools_dirs}:{venv_bin}:{base_path}"
         else:
-            env["PATH"] = f"{tools_dir}:{base_path}"
+            env["PATH"] = f"{tools_dirs}:{base_path}"
 
         # Build MCP server
         mcp_server, self._shell_cleanup, self._get_shell_cwd = create_mcp_server(
@@ -418,8 +435,8 @@ class KilnHarness:
         env = os.environ.copy()
         env["AGENT_HOME"] = str(self.config.home)
         env["KILN_AGENT_HOME"] = str(self.config.home)
-        tools_dir = str(self.config.tools_path)
-        env["PATH"] = f"{tools_dir}:{env.get('PATH', '')}"
+        tools_dirs = _tools_path_dirs(self.config.tools_path)
+        env["PATH"] = f"{tools_dirs}:{env.get('PATH', '')}"
 
         for cmd in self.config.startup:
             try:

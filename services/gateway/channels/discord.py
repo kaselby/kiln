@@ -491,7 +491,7 @@ class DiscordChannel(Channel):
             if thread.name == name:
                 await thread.edit(archived=False)
                 return thread
-        return await channel.create_thread(name=name)
+        return await channel.create_thread(name=name, type=discord.ChannelType.public_thread)
 
 
 # ---------------------------------------------------------------------------
