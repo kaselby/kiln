@@ -96,6 +96,12 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         "--continuation", action="store_true",
         help=argparse.SUPPRESS,  # internal: set by self-continuation exec
     )
+    parser.add_argument(
+        "--effort",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Thinking effort level (low, medium, high). Default: high.",
+    )
 
 
 def _parse_init_args(parser: argparse.ArgumentParser) -> None:
@@ -164,6 +170,8 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--heartbeat", args.heartbeat]
     if args.idle_nudge is not None:
         cmd_parts += ["--idle-nudge", args.idle_nudge]
+    if getattr(args, "effort", None):
+        cmd_parts += ["--effort", args.effort]
     return shlex.join(cmd_parts)
 
 
@@ -285,6 +293,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         config.heartbeat_max = float(args.heartbeat) * 60
     if args.idle_nudge is not None:
         config.idle_nudge_timeout = float(args.idle_nudge) * 60
+    if getattr(args, "effort", None):
+        config.effort = args.effort
 
     # Resolve prompt
     if args.prompt and getattr(args, "prompt_file", None):
@@ -342,6 +352,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                      "--parent", harness.agent_id, "--continuation"]
         if args.model:
             exec_args += ["--model", args.model]
+        if getattr(args, "effort", None):
+            exec_args += ["--effort", args.effort]
         if args.persistent:
             exec_args.append("--persistent")
         if config.idle_nudge_timeout > 0:
