@@ -62,17 +62,22 @@ class Channel(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not support list_channels")
 
     async def request_permission(
-        self, agent_id: str, command: str, reason: str, timeout: float = 300
+        self, agent_id: str, *, title: str, preview: str,
+        detail: str | None = None, severity: str = "info",
+        timeout: float = 300,
     ) -> dict:
-        """Request interactive approval for a guardrail-blocked command.
+        """Request interactive approval for a tool invocation.
 
         Posts an approval prompt (e.g. with buttons) in the agent's
-        session surface and waits for a response.
+        session surface and waits for a response. The gateway renders
+        fields as-is — Kiln owns the presentation text.
 
         Args:
             agent_id: The agent session ID requesting approval.
-            command: The bash command that triggered the guardrail.
-            reason: Human-readable description of why it was flagged.
+            title: Embed title text (e.g. "Edit requires approval").
+            preview: Short summary visible in the embed body.
+            detail: Full diff/content for a "Details" button. Optional.
+            severity: "warn" (dangerous) or "info" (routine approval).
             timeout: Seconds to wait for a response before timing out.
 
         Returns:

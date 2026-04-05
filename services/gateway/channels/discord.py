@@ -37,12 +37,19 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 
 
 class _PermissionView(discord.ui.View):
-    """Discord view with Approve/Reject buttons for guardrail approval."""
+    """Discord view with Approve/Reject/Details buttons for permission approval."""
 
-    def __init__(self, future: asyncio.Future, discord_config: DiscordConfig):
+    def __init__(
+        self, future: asyncio.Future, discord_config: DiscordConfig,
+        detail: str | None = None,
+    ):
         super().__init__(timeout=None)  # timeout handled by the caller
         self._future = future
         self._discord_config = discord_config
+        self._detail = detail
+        if not detail:
+            self.details.disabled = True
+            self.details.style = discord.ButtonStyle.secondary
 
     def _check_trust(self, user_id: str) -> bool:
         """Only users with 'full' trust can approve permissions."""
@@ -74,6 +81,23 @@ class _PermissionView(discord.ui.View):
             self._future.set_result((False, name))
         await interaction.response.defer()
         self.stop()
+
+    @discord.ui.button(label="Details", style=discord.ButtonStyle.secondary, emoji="\U0001f50d")
+    async def details(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._detail:
+            await interaction.response.send_message("No details available.", ephemeral=True)
+            return
+        if len(self._detail) < 1800:
+            await interaction.response.send_message(
+                f"```\n{self._detail}\n```", ephemeral=True,
+            )
+        else:
+            import io
+            buf = io.BytesIO(self._detail.encode("utf-8"))
+            buf.seek(0)
+            await interaction.response.send_message(
+                file=discord.File(buf, filename="details.txt"), ephemeral=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +506,9 @@ class DiscordChannel(Channel):
             return {"ok": False, "error": str(e)}
 
     async def request_permission(
-        self, agent_id: str, command: str, reason: str, timeout: float = 300
+        self, agent_id: str, *, title: str, preview: str,
+        detail: str | None = None, severity: str = "info",
+        timeout: float = 300,
     ) -> dict:
         if not self._client:
             return {"approved": False, "timed_out": False, "responder": ""}
@@ -499,17 +525,20 @@ class DiscordChannel(Channel):
             log.error("Failed to get branch thread for %s: %s", agent_id, e)
             return {"approved": False, "timed_out": False, "responder": ""}
 
-        # Build the approval prompt
+        # Severity-based coloring
+        color = 0xe74c3c if severity == "warn" else 0x3498db  # red or blue
+
+        # Build the approval prompt — gateway renders blind, Kiln owns text
         embed = discord.Embed(
-            title="\u26a0\ufe0f Permission Required",
-            description=f"**{reason}**\n```\n{command[:1500]}\n```",
-            color=0xe74c3c,  # red
+            title=title or "Permission Required",
+            description=preview[:2000],
+            color=color,
         )
         embed.set_footer(text=f"Agent: {agent_id}")
 
         # Create view with buttons; the Future resolves when a button is clicked
         future: asyncio.Future[tuple[bool, str]] = asyncio.get_event_loop().create_future()
-        view = _PermissionView(future, self._discord_config)
+        view = _PermissionView(future, self._discord_config, detail=detail)
 
         try:
             msg = await thread.send(embed=embed, view=view)

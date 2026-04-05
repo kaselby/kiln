@@ -38,7 +38,7 @@ from .hooks import (
     wrap_hook_visibility,
 )
 from .names import generate_agent_name
-from .permissions import PermissionMode, _headless_deny, create_permission_hook
+from .permissions import PermissionHandler, PermissionMode
 from .prompt import (
     build_session_context,
     discover_skill_layout,
@@ -291,22 +291,22 @@ class KilnHarness:
             "Stop": [],
         }
 
-        # Permission hook — always active, even in headless mode.
-        # TUI provides interactive callbacks; headless falls back to
-        # YOLO mode + deny-all for confirm-tier guardrails.
+        # Permission handler — always active, even in headless mode.
+        # TUI provides interactive callbacks; headless passes no terminal
+        # handler (YOLO mode + gateway-only for confirm-tier guardrails).
         if self._permission_callbacks:
-            get_mode, request_permission = self._permission_callbacks
+            get_mode, terminal_handler = self._permission_callbacks
         else:
             get_mode = lambda: PermissionMode.YOLO
-            request_permission = _headless_deny
-        perm_hook = create_permission_hook(
+            terminal_handler = None
+        self._permission_handler = PermissionHandler(
             get_mode=get_mode,
-            request_permission=request_permission,
+            terminal_handler=terminal_handler,
             get_cwd=lambda: self._get_shell_cwd() if self._get_shell_cwd else safe_getcwd(),
             agent_id=self.agent_id,
             agent_home=str(self.config.home),
         )
-        hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[perm_hook])]
+        hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[self._permission_handler.hook])]
 
         # Resolve tools from agent spec
         resolved = self.config.resolve_tools()
@@ -470,16 +470,17 @@ class KilnHarness:
 
         # Queue startup messages onto followup_queue (programmatic user turns).
         # steering_queue is for user-typed mid-turn input only.
+        # Skip orientation on resume — the prior conversation already has it.
         orientation = self._build_orientation()
-        if orientation:
+        if orientation and not self._resume_uuid:
             self.followup_queue.append(orientation)
 
         if self.config.prompt:
-            if orientation:
+            if orientation and not self._resume_uuid:
                 # Deliver as inbox message — discovered naturally during orientation
                 self._deliver_prompt_to_inbox()
             else:
-                # No orientation — prompt is the startup message
+                # No orientation (or resumed) — prompt is the startup message
                 self.followup_queue.append(self.config.prompt)
 
     def _deliver_prompt_to_inbox(self) -> None:

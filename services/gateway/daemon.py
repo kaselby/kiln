@@ -429,19 +429,27 @@ class GatewayDaemon:
             return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
 
         agent_id = body.get("agent_id", "")
-        command = body.get("command", "")
-        reason = body.get("reason", "")
         timeout = body.get("timeout", 300)
-        if not agent_id or not command:
+
+        # New fields: title/preview/detail/severity. Backward compat: command/reason.
+        title = body.get("title") or body.get("reason", "")
+        preview = body.get("preview") or body.get("command", "")
+        detail = body.get("detail")  # optional, may be None
+        severity = body.get("severity", "info")  # "warn" or "info"
+
+        if not agent_id or not preview:
             return web.json_response(
-                {"ok": False, "error": "Missing 'agent_id' or 'command'"}, status=400
+                {"ok": False, "error": "Missing 'agent_id' or 'preview' (or 'command')"}, status=400
             )
 
         platform = self.config.permissions.platform
         channel = self.channels[platform]
 
-        log.info("Permission request from %s: %s", agent_id, reason)
-        result = await channel.request_permission(agent_id, command, reason, timeout=timeout)
+        log.info("Permission request from %s: %s", agent_id, title)
+        result = await channel.request_permission(
+            agent_id, title=title, preview=preview,
+            detail=detail, severity=severity, timeout=timeout,
+        )
         log.info("Permission result for %s: %s", agent_id, result)
         return web.json_response({"ok": True, **result})
 
