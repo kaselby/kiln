@@ -148,6 +148,18 @@ class KilnHarness:
     def worklog_path(self) -> Path:
         return self._worklog_path
 
+    @staticmethod
+    def _dedup_path(path: Path) -> Path:
+        """Return a non-colliding path, appending _2, _3, etc. if needed."""
+        if not path.exists():
+            return path
+        stem, suffix = path.stem, path.suffix
+        parent = path.parent
+        n = 2
+        while (parent / f"{stem}_{n}{suffix}").exists():
+            n += 1
+        return parent / f"{stem}_{n}{suffix}"
+
     @property
     def _registry_path(self) -> Path:
         return self.config.home / "logs" / "session-registry.json"
@@ -620,7 +632,7 @@ class KilnHarness:
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         today = date.today().strftime("%Y-%m-%d")
-        dest = dest_dir / f"{today}-{self.agent_id}.jsonl"
+        dest = self._dedup_path(dest_dir / f"{today}-{self.agent_id}.jsonl")
         shutil.copy2(source, dest)
         return str(dest)
 
