@@ -45,6 +45,7 @@ from .prompt import (
     discover_skills,
     discover_tool_layout,
     discover_tools,
+    get_knowledge_cutoff,
     load_tool_docs,
     resolve_model,
 )
@@ -555,10 +556,17 @@ class KilnHarness:
         self._model_verified = True
         if actual_model == self._expected_model:
             return None
-        return (
+        warning = (
             f"Model mismatch: expected '{self._expected_model}' "
             f"but got '{actual_model}'. Update MODEL_ALIASES in prompt.py."
         )
+        cutoff = get_knowledge_cutoff(actual_model)
+        if cutoff == "unknown":
+            warning += (
+                f" Knowledge cutoff for '{actual_model}' is also unknown — "
+                f"update KNOWLEDGE_CUTOFFS too."
+            )
+        return warning
 
     async def interrupt(self):
         """Interrupt the agent's current turn."""
