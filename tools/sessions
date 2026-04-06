@@ -43,8 +43,31 @@ MAX_TOKENS = 200_000
 
 # --- Data sources ---
 
+def is_session_alive(session_name: str) -> bool:
+    """Check if the agent process is still running inside its tmux session.
+
+    After an agent exits, the tmux pane shows 'Agent exited with status'
+    and waits briefly before auto-closing. This catches those zombie
+    sessions that look alive but aren't.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-5"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return True  # Can't tell, assume alive
+        return "Agent exited with status" not in result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # Can't tell, assume alive
+
+
 def get_tmux_sessions(prefix: str = "") -> dict[str, int]:
-    """Return {agent_id: creation_epoch} for running tmux sessions matching prefix."""
+    """Return {agent_id: creation_epoch} for running tmux sessions matching prefix.
+
+    Filters out zombie sessions where the agent has exited but the tmux
+    pane is still open (waiting for Enter or auto-close timeout).
+    """
     try:
         result = subprocess.run(
             ["tmux", "list-sessions", "-F", "#{session_name} #{session_created}"],
@@ -61,7 +84,8 @@ def get_tmux_sessions(prefix: str = "") -> dict[str, int]:
         if len(parts) == 2:
             name = parts[0]
             if not prefix or name.startswith(prefix):
-                sessions[name] = int(parts[1])
+                if is_session_alive(name):
+                    sessions[name] = int(parts[1])
     return sessions
 
 
