@@ -485,10 +485,7 @@ class KilnApp:
         self._receiving = False
         self._interrupt_in_flight = False
         self._receive_task: asyncio.Task | None = None
-        if harness.config.initial_mode:
-            self._perm_mode = PermissionMode(harness.config.initial_mode)
-        else:
-            self._perm_mode = PermissionMode.SUPERVISED
+        # Permission mode lives on the harness; TUI provides a property alias.
         self._pending_permission: PermissionRequest | None = None
         self._mode_override_dir = self._harness.config.home / "control"
         self._app: Application | None = None
@@ -849,6 +846,14 @@ class KilnApp:
             f.write(json.dumps(entry) + "\n")
 
         _tprint("<dim>Sent to {} ({} recipients)</dim>", channel, len(recipients))
+
+    @property
+    def _perm_mode(self) -> PermissionMode:
+        return self._harness.permission_mode
+
+    @_perm_mode.setter
+    def _perm_mode(self, value: PermissionMode) -> None:
+        self._harness.permission_mode = value
 
     @property
     def _in_channel_view(self) -> bool:

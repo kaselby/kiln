@@ -257,17 +257,19 @@ def create_context_warning_hook(session_control, max_tokens: int = 200_000):
 
 
 
-def create_active_agents_hook(
+def create_session_state_hook(
+    harness,
     interval: int = 15,
     channels_path: Path | None = None,
     session_prefix: str = "kiln-",
 ):
-    """Create a PostToolUse hook that periodically shows running agent sessions and channels.
+    """Create a PostToolUse hook that periodically shows session state.
 
-    Fires every `interval` tool calls. Skips if there's only one session
-    (just the current agent — no useful info to show) and no active channels.
+    Shows permission mode, active agent sessions, and active channels.
+    Fires every `interval` tool calls.
 
     Args:
+        harness: The KilnHarness instance (for permission mode, etc.).
         interval: Number of tool calls between checks.
         channels_path: Path to channels.json (for listing active channels).
         session_prefix: Tmux session name prefix for agent sessions.
@@ -275,7 +277,7 @@ def create_active_agents_hook(
     call_count = 0
     ephemeral_prefix = f"_{session_prefix}"
 
-    async def active_agents_hook(
+    async def session_state_hook(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
         nonlocal call_count
@@ -284,48 +286,45 @@ def create_active_agents_hook(
         if call_count % interval != 0:
             return {}
 
+        parts = [f"mode={harness.permission_mode.value}"]
+        parts.extend(harness.session_state_labels())
+
         # Get running agent sessions
         try:
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}"],
                 capture_output=True, text=True, timeout=5,
             )
-            if result.returncode != 0:
-                return {}
+            if result.returncode == 0:
+                sessions = [
+                    s for s in result.stdout.strip().splitlines()
+                    if s.startswith(session_prefix) or s.startswith(ephemeral_prefix)
+                ]
+                if len(sessions) > 1:
+                    display = [f"{s} (you)" if s == harness.agent_id else s for s in sessions]
+                    parts.append(f"Agents: {', '.join(display)} ({len(sessions)} total)")
         except (OSError, subprocess.TimeoutExpired):
-            return {}
-
-        sessions = [
-            s for s in result.stdout.strip().splitlines()
-            if s.startswith(session_prefix) or s.startswith(ephemeral_prefix)
-        ]
+            pass
 
         # Get active channels
-        channels = []
         if channels_path and channels_path.exists():
             try:
                 data = json.loads(channels_path.read_text())
                 channels = [name for name, subs in data.items() if subs]
+                if channels:
+                    parts.append(f"Channels: {', '.join(channels)}")
             except (json.JSONDecodeError, OSError):
                 pass
 
-        if len(sessions) <= 1 and not channels:
-            return {}
-
-        parts = []
-        if len(sessions) > 1:
-            parts.append(f"Agents: {', '.join(sessions)} ({len(sessions)} total)")
-        if channels:
-            parts.append(f"Channels: {', '.join(channels)}")
-
+        # Always fire — at minimum shows permission mode
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": f"[Active agents] {' | '.join(parts)}",
+                "additionalContext": f"[Session state] {' | '.join(parts)}",
             }
         }
 
-    return active_agents_hook
+    return session_state_hook
 
 
 # ---------------------------------------------------------------------------

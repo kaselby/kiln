@@ -485,15 +485,16 @@ def cmd_init(args: argparse.Namespace) -> None:
     target.mkdir(parents=True)
 
     # agent.yml
+    doc_name = f"{args.name.upper()}.md"
     spec = (
         f"name: {args.name}\n"
-        f"identity_doc: identity.md\n"
+        f"identity_doc: {doc_name}\n"
         f"model: {args.model}\n"
     )
     (target / "agent.yml").write_text(spec)
 
-    # identity.md
-    (target / "identity.md").write_text(
+    # Identity doc
+    (target / doc_name).write_text(
         f"# {args.name}\n\nYou are {args.name}, an AI agent.\n"
     )
 

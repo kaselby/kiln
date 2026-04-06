@@ -26,7 +26,7 @@ from claude_agent_sdk import (
 
 from .config import AgentConfig
 from .hooks import (
-    create_active_agents_hook,
+    create_session_state_hook,
     create_context_warning_hook,
     create_inbox_check_hook,
     create_message_sent_hook,
@@ -95,6 +95,7 @@ class KilnHarness:
         self._model_verified = False
         self._permission_hook = None
         self._permission_callbacks = None
+        self.permission_mode = PermissionMode(config.initial_mode) if config.initial_mode else PermissionMode.SUPERVISED
         self._shell_cleanup = None
         self._get_shell_cwd = None
         self._stderr_log: Path | None = None
@@ -260,7 +261,8 @@ class KilnHarness:
         inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events)
         read_tracker = create_read_tracking_hook(inbox, file_state=file_state)
         context_warning = create_context_warning_hook(self.session_control)
-        active_agents = create_active_agents_hook(
+        session_state = create_session_state_hook(
+            self,
             interval=15,
             channels_path=self.config.home / "channels.json",
             session_prefix=self.config.session_prefix,
@@ -286,7 +288,7 @@ class KilnHarness:
             inbox_check = wrap_hook_visibility(inbox_check, "inbox_check", ui)
             queued_messages = wrap_hook_visibility(queued_messages, "queued_messages", ui)
             context_warning = wrap_hook_visibility(context_warning, "context_warning", ui)
-            active_agents = wrap_hook_visibility(active_agents, "active_agents", ui)
+            session_state = wrap_hook_visibility(session_state, "session_state", ui)
             plan_nudge = wrap_hook_visibility(plan_nudge, "plan_nudge", ui)
             skill_context = wrap_hook_visibility(skill_context, "skill_context", ui)
 
@@ -294,7 +296,7 @@ class KilnHarness:
             "PostToolUse": [
                 HookMatcher(matcher=None, hooks=[
                     inbox_check, queued_messages, context_warning,
-                    active_agents, usage_log, plan_nudge,
+                    session_state, usage_log, plan_nudge,
                 ]),
                 HookMatcher(matcher="Read", hooks=[read_tracker]),
                 HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker]),
@@ -530,6 +532,10 @@ class KilnHarness:
             f"---\n\n"
             f"{self.config.prompt}\n"
         )
+
+    def session_state_labels(self) -> list[str]:
+        """Extra labels for the session state hook. Override in subclasses."""
+        return []
 
     def _build_orientation(self) -> str | None:
         """Build the startup orientation message.
