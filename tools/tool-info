@@ -6,12 +6,12 @@
 #   Show tool headers and reference docs. Default shows header only (name,
 #   description, arguments). Use --full for complete reference docs including
 #   usage examples and subcommands.
-# arguments: "<tool-name> [--full] | --list [--full]"
+# arguments: "<tool-name> | --list [--full]"
 # ---
 #
 # Usage:
-#   tool-info fetch          Show header for 'fetch' (name, description, args)
-#   tool-info gateway --full Show header + full reference docs (subcommands, examples)
+#   tool-info fetch          Show header + reference docs for 'fetch'
+#   tool-info gateway        Show header + full reference docs (subcommands, examples)
 #   tool-info --list         List all tools with brief descriptions
 #   tool-info --list --full  List all tools with full descriptions
 #
@@ -171,9 +171,6 @@ case "$1" in
         list_tools "$full"
         ;;
     *)
-        name="$1"
-        full="false"
-        [[ "${2:-}" == "--full" ]] && full="true"
-        show_tool "$name" "$full"
+        show_tool "$1" "true"
         ;;
 esac
