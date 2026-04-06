@@ -115,6 +115,10 @@ def _parse_init_args(parser: argparse.ArgumentParser) -> None:
         "--model", default="claude-sonnet-4-6",
         help="Model (default: claude-sonnet-4-6)",
     )
+    parser.add_argument(
+        "--harness", action="store_true",
+        help="Scaffold a custom harness project (for agents with their own CLI)",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,9 +147,15 @@ def parse_args() -> argparse.Namespace:
 # kiln run
 # ---------------------------------------------------------------------------
 
+def _cli_bin() -> str:
+    """Resolve the current CLI binary for use in subprocesses and continuations."""
+    name = Path(sys.argv[0]).name
+    return shutil.which(name) or sys.argv[0]
+
+
 def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Path) -> str:
     """Build the shell command that runs inside the tmux session."""
-    cmd_parts = [shutil.which("kiln") or "kiln", "run", str(spec_path), "--id", agent_id]
+    cmd_parts = [_cli_bin(), "run", str(spec_path), "--id", agent_id]
     if args.project:
         cmd_parts += ["--project", args.project]
     if args.model:
@@ -262,8 +272,13 @@ def _most_recent_agent_id(config: AgentConfig) -> str | None:
     return most_recent_agent_id(registry_path)
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    """Handle 'kiln run'."""
+def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
+    """Handle 'kiln run'.
+
+    Custom agent CLIs can pass their own harness_class to override
+    KilnHarness. The binary name for self-continuation is derived
+    from sys.argv[0].
+    """
     spec_path = _find_agent_spec(args.spec)
     config = load_agent_spec(spec_path)
 
@@ -323,8 +338,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # --- Inner execution (inside tmux) ---
 
-    from .harness import KilnHarness
-    harness = KilnHarness(config)
+    if harness_class is None:
+        from .harness import KilnHarness
+        harness_class = KilnHarness
+    harness = harness_class(config)
 
     # Rename tmux session on self-continuation
     if args.continuation and args.parent and os.environ.get("TMUX"):
@@ -345,8 +362,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         _stop_caffeinate(_caffeinate_pid)
 
     if harness.continue_requested:
-        kiln_bin = shutil.which("kiln") or sys.argv[0]
-        exec_args = [kiln_bin, "run", str(spec_path.resolve()),
+        cli_bin = _cli_bin()
+        exec_args = [cli_bin, "run", str(spec_path.resolve()),
                      "--mode", "yolo",
                      "--heartbeat", str(int(config.heartbeat_max / 60)),
                      "--parent", harness.agent_id, "--continuation"]
@@ -364,16 +381,99 @@ def cmd_run(args: argparse.Namespace) -> None:
             os.write(fd, harness.handoff_text.encode())
             os.close(fd)
             exec_args += ["--prompt-file", path]
-        os.execvp(kiln_bin, exec_args)
+        os.execvp(cli_bin, exec_args)
 
     if harness.restart_requested:
-        kiln_bin = shutil.which("kiln") or sys.argv[0]
-        os.execvp(kiln_bin, [kiln_bin, "run", str(spec_path.resolve())])
+        cli_bin = _cli_bin()
+        os.execvp(cli_bin, [cli_bin, "run", str(spec_path.resolve())])
 
 
 # ---------------------------------------------------------------------------
 # kiln init
 # ---------------------------------------------------------------------------
+
+def _scaffold_harness(target: Path, name: str) -> None:
+    """Create a custom harness project inside the agent home."""
+    harness_dir = target / "harness"
+    pkg_dir = harness_dir / "src" / name
+    pkg_dir.mkdir(parents=True)
+
+    # pyproject.toml
+    (harness_dir / "pyproject.toml").write_text(
+        f'[build-system]\n'
+        f'requires = ["hatchling"]\n'
+        f'build-backend = "hatchling.build"\n'
+        f'\n'
+        f'[project]\n'
+        f'name = "{name}"\n'
+        f'version = "0.1.0"\n'
+        f'requires-python = ">=3.12"\n'
+        f'dependencies = [\n'
+        f'    "kiln",\n'
+        f']\n'
+        f'\n'
+        f'[project.scripts]\n'
+        f'{name} = "{name}.cli:main"\n'
+        f'\n'
+        f'[tool.hatch.build.targets.wheel]\n'
+        f'packages = ["src/{name}"]\n'
+        f'\n'
+        f'[tool.uv.sources]\n'
+        f'kiln = {{ path = "{Path(__file__).resolve().parent.parent.parent}", editable = true }}\n'
+    )
+
+    # __init__.py
+    (pkg_dir / "__init__.py").write_text("")
+
+    # cli.py
+    (pkg_dir / "cli.py").write_text(
+        f'"""CLI for {name} — wraps kiln with a custom harness."""\n'
+        f'\n'
+        f'import argparse\n'
+        f'import sys\n'
+        f'from pathlib import Path\n'
+        f'\n'
+        f'from kiln.cli import _parse_run_args, cmd_list, cmd_run\n'
+        f'\n'
+        f'from {name}.harness import {name.title()}Harness\n'
+        f'\n'
+        f'{name.upper()}_HOME = Path.home() / ".{name}"\n'
+        f'\n'
+        f'\n'
+        f'def parse_args() -> argparse.Namespace:\n'
+        f'    parser = argparse.ArgumentParser(prog="{name}")\n'
+        f'    sub = parser.add_subparsers(dest="command")\n'
+        f'    run_parser = sub.add_parser("run", help="Launch a session")\n'
+        f'    _parse_run_args(run_parser)\n'
+        f'    sub.add_parser("list", help="List known sessions")\n'
+        f'    if not sys.argv[1:] or sys.argv[1] not in ("run", "list", "-h", "--help"):\n'
+        f'        run_ns = argparse.Namespace(command="run")\n'
+        f'        run_parser.parse_args(sys.argv[1:], namespace=run_ns)\n'
+        f'        return run_ns\n'
+        f'    return parser.parse_args()\n'
+        f'\n'
+        f'\n'
+        f'def main():\n'
+        f'    args = parse_args()\n'
+        f'    if args.command == "run":\n'
+        f'        args.spec = args.spec or str({name.upper()}_HOME)\n'
+        f'        cmd_run(args, harness_class={name.title()}Harness)\n'
+        f'    elif args.command == "list":\n'
+        f'        cmd_list(args)\n'
+    )
+
+    # harness.py
+    (pkg_dir / "harness.py").write_text(
+        f'"""Custom harness for {name}."""\n'
+        f'\n'
+        f'from kiln.harness import KilnHarness\n'
+        f'\n'
+        f'\n'
+        f'class {name.title()}Harness(KilnHarness):\n'
+        f'    """Extend KilnHarness with {name}-specific behavior."""\n'
+        f'    pass\n'
+    )
+
 
 def cmd_init(args: argparse.Namespace) -> None:
     """Scaffold a new agent home directory."""
@@ -398,7 +498,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     )
 
     # Standard directories
-    for d in ["inbox", "plans", "logs"]:
+    for d in ["inbox", "logs", "memory", "plans", "scratch", "state"]:
         (target / d).mkdir()
 
     # Copy standard library (tools + skills) from kiln defaults.
@@ -412,8 +512,16 @@ def cmd_init(args: argparse.Namespace) -> None:
         else:
             dst.mkdir()
 
+    # Optional: custom harness project
+    if args.harness:
+        _scaffold_harness(target, args.name)
+
     print(f"Agent scaffolded at {target}/")
-    print(f"  Edit identity.md and agent.yml, then: kiln run {target}")
+    if args.harness:
+        print(f"  Install the harness:  uv tool install --editable {target}/harness")
+        print(f"  Then launch with:     {args.name}")
+    else:
+        print(f"  Edit identity.md and agent.yml, then: kiln run {target}")
 
 
 # ---------------------------------------------------------------------------

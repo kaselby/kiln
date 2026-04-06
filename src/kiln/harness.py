@@ -453,7 +453,14 @@ class KilnHarness:
         env["AGENT_HOME"] = str(self.config.home)
         env["KILN_AGENT_HOME"] = str(self.config.home)
         tools_dirs = _tools_path_dirs(self.config.tools_path)
-        env["PATH"] = f"{tools_dirs}:{env.get('PATH', '')}"
+        base_path = env.get("PATH", "")
+        venv_path = self.config.home / "venv"
+        if venv_path.exists():
+            venv_bin = str(venv_path / "bin")
+            env["VIRTUAL_ENV"] = str(venv_path)
+            env["PATH"] = f"{tools_dirs}:{venv_bin}:{base_path}"
+        else:
+            env["PATH"] = f"{tools_dirs}:{base_path}"
 
         for cmd in self.config.startup:
             try:
