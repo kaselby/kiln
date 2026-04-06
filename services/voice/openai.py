@@ -13,7 +13,7 @@ from .base import STTBackend, TTSBackend
 log = logging.getLogger("voice.openai")
 
 DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
-DEFAULT_TTS_VOICE = "fable"
+DEFAULT_TTS_VOICE = "marin"
 
 
 def _load_api_key(agent_home: Path) -> str | None:
