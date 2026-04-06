@@ -261,12 +261,7 @@ class KilnHarness:
         inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events)
         read_tracker = create_read_tracking_hook(inbox, file_state=file_state)
         context_warning = create_context_warning_hook(self.session_control)
-        session_state = create_session_state_hook(
-            self,
-            interval=15,
-            channels_path=self.config.home / "channels.json",
-            session_prefix=self.config.session_prefix,
-        )
+        session_state = self._create_session_state_hook()
         skill_context = create_skill_context_hook(self.config.skills_path)
         usage_log = create_usage_log_hook(
             self.config.home / "logs", self.agent_id,
@@ -531,6 +526,15 @@ class KilnHarness:
             f"timestamp: {datetime.now().isoformat()}\n"
             f"---\n\n"
             f"{self.config.prompt}\n"
+        )
+
+    def _create_session_state_hook(self):
+        """Create the periodic session state hook. Override for custom state display."""
+        return create_session_state_hook(
+            self,
+            interval=15,
+            channels_path=self.config.home / "channels.json",
+            session_prefix=self.config.session_prefix,
         )
 
     def session_state_labels(self) -> list[str]:
