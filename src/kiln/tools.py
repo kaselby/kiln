@@ -850,8 +850,6 @@ EXIT_SESSION_DESC = (
     "Appropriate uses:\n"
     "- Ephemeral agents that have completed their task\n"
     "- Autonomous agents handing off to a continuation\n\n"
-    "Set `skip_summary` to true when doing autonomous self-continuation — "
-    "the summary protocol is redundant overhead.\n\n"
     "Set `continue` to true for self-continuation: the harness will run "
     "the normal shutdown (summary, volatile update, commit), then "
     "automatically launch a fresh session. If the current session is "
@@ -870,7 +868,7 @@ EXIT_SESSION_SCHEMA = {
             "type": "boolean",
             "description": (
                 "Skip the session summary and memory update protocol. "
-                "Use when handing off to a continuation session."
+                "Rarely needed — most sessions benefit from the cleanup step."
             ),
             "default": False,
         },
