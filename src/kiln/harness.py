@@ -714,6 +714,7 @@ class KilnHarness:
             self._stderr_log.unlink()
             self._stderr_log = None
         if self.session_config:
+            self._continuation_state = self.session_config.all
             self.session_config.cleanup()
 
     async def __aenter__(self):

@@ -877,8 +877,8 @@ EXIT_SESSION_SCHEMA = {
             "description": (
                 "Self-continuation: after clean shutdown, automatically "
                 "launch a new session that picks up from the handoff. "
-                "The new session inherits canonical status and runs in "
-                "yolo mode with heartbeat enabled."
+                "The new session inherits canonical status, runs in "
+                "yolo mode, and inherits heartbeat settings."
             ),
             "default": False,
         },

@@ -209,16 +209,16 @@ def _launch_in_tmux(args: argparse.Namespace, config: AgentConfig, spec_path: Pa
             'EXIT_CODE=$?\n'
             'if [ $EXIT_CODE -ne 0 ]; then\n'
             '    echo ""\n'
-            '    echo "Agent exited with status $EXIT_CODE. Press Enter to close."\n'
-            '    read\n'
+            '    echo "Agent exited with status $EXIT_CODE. Closing in 30s (Enter to close now)."\n'
+            '    read -t 30\n'
             'fi'
         )
     else:
         shell_script = (
             f'{inner_cmd}\n'
             'echo ""\n'
-            'echo "Agent exited with status $?. Press Enter to close."\n'
-            'read'
+            'echo "Agent exited with status $?. Closing in 30s (Enter to close now)."\n'
+            'read -t 30'
         )
 
     result = subprocess.run(
@@ -363,10 +363,12 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
 
     if harness.continue_requested:
         cli_bin = _cli_bin()
+        cont = getattr(harness, '_continuation_state', {})
         exec_args = [cli_bin, "run", str(spec_path.resolve()),
                      "--mode", "yolo",
-                     "--heartbeat", str(int(config.heartbeat_max / 60)),
                      "--parent", harness.agent_id, "--continuation"]
+        if cont.get('heartbeat_enabled'):
+            exec_args += ["--heartbeat", str(int(cont.get('heartbeat_max', 600) / 60))]
         if args.model:
             exec_args += ["--model", args.model]
         if getattr(args, "effort", None):
