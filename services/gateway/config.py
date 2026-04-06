@@ -37,6 +37,8 @@ class DiscordConfig:
     channel_access: AccessPolicy = field(default_factory=AccessPolicy)
     dm_access: AccessPolicy = field(default_factory=AccessPolicy)
     voice_enabled: bool = False
+    voice_default: str = ""  # default TTS voice (e.g. "marin")
+    voice_instructions: str = ""  # default TTS instructions/persona
 
     def resolve_user(self, user_id: str, fallback_name: str = "") -> tuple[str, str]:
         """Look up a user's display name and trust level.
@@ -56,6 +58,8 @@ class DiscordConfig:
             channels=data.get("channels", {}),
             users=data.get("users", {}),
             voice_enabled=data.get("voice", {}).get("enabled", False),
+            voice_default=data.get("voice", {}).get("default_voice", ""),
+            voice_instructions=data.get("voice", {}).get("default_instructions", ""),
         )
 
         # Channel access

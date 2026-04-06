@@ -417,6 +417,22 @@ class DiscordChannel(Channel):
         messages.reverse()
         return messages
 
+    async def delete_message(self, target: str, message_id: str) -> dict:
+        channel = await self._resolve_target(target)
+        if not channel:
+            return {"ok": False, "error": f"Could not resolve target: {target}"}
+
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            await msg.delete()
+            return {"ok": True}
+        except discord.NotFound:
+            return {"ok": False, "error": f"Message {message_id} not found"}
+        except discord.Forbidden:
+            return {"ok": False, "error": "Bot lacks permission to delete this message"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     async def create_thread(self, channel_name: str, name: str) -> dict:
         channel = await self._resolve_target(channel_name)
         if not channel or not hasattr(channel, "create_thread"):
@@ -464,15 +480,22 @@ class DiscordChannel(Channel):
         except ImportError:
             return {"ok": False, "error": "Voice service not available"}
 
+        # Voice and instructions: kwargs override config defaults
+        discord_cfg = self._config.discord
+        voice = kwargs.get("voice") or (discord_cfg.voice_default if discord_cfg else "") or None
+        instructions = kwargs.get("instructions") or (discord_cfg.voice_instructions if discord_cfg else "") or None
+
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
             audio_path = Path(f.name)
 
         try:
-            result = await generate_speech(
-                text, audio_path,
-                agent_home=self._config.agent_home,
-                voice=kwargs.get("voice", "fable"),
-            )
+            tts_kwargs: dict[str, Any] = {"agent_home": self._config.agent_home}
+            if voice:
+                tts_kwargs["voice"] = voice
+            if instructions:
+                tts_kwargs["instructions"] = instructions
+
+            result = await generate_speech(text, audio_path, **tts_kwargs)
             if not result:
                 return {"ok": False, "error": "TTS generation failed"}
 

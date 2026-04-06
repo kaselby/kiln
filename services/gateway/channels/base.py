@@ -54,6 +54,18 @@ class Channel(ABC):
         """Send a voice message (TTS) to a channel."""
         raise NotImplementedError(f"{type(self).__name__} does not support send_voice")
 
+    async def delete_message(self, channel: str, message_id: str) -> dict:
+        """Delete a message by ID from a channel.
+
+        Args:
+            channel: Channel name or ID where the message lives.
+            message_id: The message ID to delete.
+
+        Returns:
+            {"ok": bool} on success, {"ok": False, "error": str} on failure.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support delete_message")
+
     async def list_channels(self) -> list[dict]:
         """List available channels on the platform.
 

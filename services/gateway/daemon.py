@@ -110,6 +110,7 @@ class GatewayDaemon:
         app.router.add_get("/api/{platform}/channels", self._handle_list_channels)
         app.router.add_post("/api/{platform}/branch/post", self._handle_branch_post)
         app.router.add_post("/api/{platform}/reply", self._handle_reply)
+        app.router.add_post("/api/{platform}/delete", self._handle_delete)
         app.router.add_post("/api/subscribe", self._handle_subscribe)
         app.router.add_post("/api/unsubscribe", self._handle_unsubscribe)
         app.router.add_post("/api/permission/request", self._handle_permission_request)
@@ -378,6 +379,34 @@ class GatewayDaemon:
 
         result = await channel.send_message(channel_id, content)
         return web.json_response(result)
+
+    async def _handle_delete(self, request: web.Request) -> web.Response:
+        """Delete a message by ID from a channel."""
+        platform = request.match_info["platform"]
+        channel = self._get_channel(platform)
+        if not channel:
+            return web.json_response(
+                {"ok": False, "error": f"Platform '{platform}' not connected"},
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
+
+        target = body.get("target", "")
+        message_id = body.get("message_id", "")
+        if not target or not message_id:
+            return web.json_response(
+                {"ok": False, "error": "Missing 'target' or 'message_id'"}, status=400
+            )
+
+        try:
+            result = await channel.delete_message(target, message_id)
+            return web.json_response(result)
+        except NotImplementedError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=501)
 
     async def _handle_subscribe(self, request: web.Request) -> web.Response:
         try:
