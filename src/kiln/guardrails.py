@@ -203,12 +203,16 @@ def is_exempt(reason: str, cwd: str, agent_home: str, command: str = "") -> bool
     or `git -C ~/.<agent> push`).
     """
     if reason == "git push":
-        try:
-            real_cwd = os.path.realpath(cwd)
-            if real_cwd == agent_home or real_cwd.startswith(agent_home + os.sep):
-                return True
-        except (OSError, ValueError):
-            pass
+        # If the command contains a `cd` before the push, the effective
+        # directory may differ from CWD — only trust CWD when there's no cd.
+        has_cd = command and re.search(r"\bcd\s+", command)
+        if not has_cd:
+            try:
+                real_cwd = os.path.realpath(cwd)
+                if real_cwd == agent_home or real_cwd.startswith(agent_home + os.sep):
+                    return True
+            except (OSError, ValueError):
+                pass
         # Check if the command itself targets the agent's home repo
         if command:
             home = os.path.expanduser("~")
