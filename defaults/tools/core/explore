@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# ---
+# name: explore
+# brief: Explore files and code via lightweight Haiku subagent
+# description: |
+#   Spawns a Haiku subagent to explore files, search codebases, and
+#   summarize content — without loading it all into your context.
+#   Use this instead of reading large files directly.
+# arguments: "<query> [--dir <path>] [--model <model>] [--tools <tools>]"
+# ---
+#
+# Usage:
+#   explore "Find where context compaction is handled in the harness"
+#   explore "Summarize the architecture of src/aleph/hooks.py"
+#   explore "What functions in this project deal with session lifecycle?" --dir ~/Git/kiln
+#   explore "List all TODO comments in the codebase" --dir ./src
+#   explore "Read config.py and explain the AgentConfig dataclass"
+#
+# The subagent has its own context window — it can read large files,
+# search broadly, and return only the relevant findings. This keeps
+# your main context clean.
+#
+# Options:
+#   --dir <path>    Working directory for the subagent (default: current dir)
+#   --model <model> Override model (default: haiku)
+#   --tools <tools> Override tool set (default: Read,Grep,Glob,Bash)
+
+set -euo pipefail
+
+# Defaults
+MODEL="haiku"
+TOOLS="Read,Grep,Glob,Bash"
+DIR=""
+QUERY=""
+
+_usage() {
+    echo "Usage: explore <query> [--dir <path>] [--model <model>] [--tools <tools>]"
+    echo ""
+    echo "Spawn a lightweight Haiku subagent to explore files and code."
+    echo "Returns concise findings without loading full files into your context."
+    echo ""
+    echo "Options:"
+    echo "  --dir <path>    Working directory (default: cwd)"
+    echo "  --model <model> Model override (default: haiku)"
+    echo "  --tools <tools> Comma-separated tools (default: Read,Grep,Glob,Bash)"
+    exit 1
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dir)
+            DIR="$2"
+            shift 2
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --tools)
+            TOOLS="$2"
+            shift 2
+            ;;
+        --help|-h)
+            _usage
+            ;;
+        *)
+            if [[ -z "$QUERY" ]]; then
+                QUERY="$1"
+            else
+                QUERY="$QUERY $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$QUERY" ]]; then
+    echo "Error: No query provided." >&2
+    _usage
+fi
+
+# System prompt — lean, focused on exploration and concise output
+SYSTEM_PROMPT='You are a code explorer. Your job is to search, read, and understand files, then report back concisely.
+
+Rules:
+- Use Grep and Glob to find files BEFORE reading them. Never read files blindly.
+- When you read a file, focus on the relevant sections. Use offset/limit for large files.
+- Your answer will be injected into another agent'"'"'s context. Be concise.
+- Report: what you found, where it is (file paths + line numbers), and a brief explanation.
+- Do NOT include large code dumps unless specifically asked. Summarize instead.
+- If you find nothing relevant, say so clearly.'
+
+# Build the command
+CMD=(claude -p --model "$MODEL"
+    --system-prompt "$SYSTEM_PROMPT"
+    --tools "$TOOLS"
+    --strict-mcp-config
+    --dangerously-skip-permissions)
+
+# Add working directory if specified
+if [[ -n "$DIR" ]]; then
+    # Resolve to absolute path
+    DIR="$(cd "$DIR" 2>/dev/null && pwd)" || {
+        echo "Error: Directory not found: $DIR" >&2
+        exit 1
+    }
+    CMD+=(--add-dir "$DIR")
+fi
+
+# Run the subagent
+echo "$QUERY" | "${CMD[@]}" 2>/dev/null

@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+# ---
+# name: sessions
+# brief: List running agent sessions with status
+# description: |
+#   Dashboard of running agent sessions. Shows uptime, context usage,
+#   plan progress, inbox count, and last activity. Drill down into a
+#   specific session for detailed view.
+#
+#   All data is file-based — no API calls. Reads tmux sessions, session
+#   registry, plan files, worklogs, and conversation JSONL.
+# arguments: "[agent-id] [--all] [--prefix PREFIX]"
+# ---
+"""Running session dashboard.
+
+Usage:
+  sessions                     Dashboard: all running sessions
+  sessions <agent-id>          Drill-down: detailed view of one session
+  sessions --all               Include current session in dashboard
+  sessions --prefix PREFIX     Filter to sessions with this prefix (default: from AGENT_HOME)
+
+Shows plan progress, context usage, inbox status, and more —
+all from local files, no API calls.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path(os.environ.get("AGENT_HOME", os.environ.get("KILN_AGENT_HOME", Path.home())))
+PLANS_DIR = HOME / "plans"
+WORKLOGS_DIR = HOME / "memory" / "worklogs"
+INBOX_DIR = HOME / "inbox"
+REGISTRY_PATH = HOME / "logs" / "session-registry.json"
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+MAX_TOKENS = 200_000
+
+
+# --- Data sources ---
+
+def get_tmux_sessions(prefix: str = "") -> dict[str, int]:
+    """Return {agent_id: creation_epoch} for running tmux sessions matching prefix."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name} #{session_created}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return {}
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+    sessions = {}
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            name = parts[0]
+            if not prefix or name.startswith(prefix):
+                sessions[name] = int(parts[1])
+    return sessions
+
+
+def get_registry() -> dict:
+    """Load the session registry."""
+    if not REGISTRY_PATH.exists():
+        return {}
+    try:
+        return json.loads(REGISTRY_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def get_plan(agent_id: str) -> dict | None:
+    """Load a plan file. Returns {goal, tasks} or None."""
+    plan_path = PLANS_DIR / f"{agent_id}.yml"
+    if not plan_path.exists():
+        return None
+    try:
+        import yaml
+        return yaml.safe_load(plan_path.read_text())
+    except ImportError:
+        return _parse_plan_simple(plan_path)
+    except Exception:
+        return _parse_plan_simple(plan_path)
+
+
+def _parse_plan_simple(path: Path) -> dict | None:
+    """Simple YAML parser for plan files (avoids pyyaml dependency)."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+
+    goal = ""
+    tasks = []
+    goal_match = re.search(r'^goal:\s*(.+)$', text, re.MULTILINE)
+    if goal_match:
+        goal = goal_match.group(1).strip().strip("'\"")
+
+    for m in re.finditer(r'-\s+description:\s*[\'"]?(.+?)[\'"]?\s*\n\s+status:\s*(\w+)', text):
+        tasks.append({"description": m.group(1).strip(), "status": m.group(2).strip()})
+
+    if not goal and not tasks:
+        return None
+    return {"goal": goal, "tasks": tasks}
+
+
+def get_context_usage(agent_id: str, registry: dict) -> tuple[int, int] | None:
+    """Get (used_tokens, max_tokens) from live JSONL. Returns None if unavailable."""
+    entry = registry.get(agent_id)
+    if not entry:
+        return None
+
+    session_uuid = entry.get("session_uuid")
+    cwd = entry.get("cwd", "")
+    if not session_uuid or not cwd:
+        return None
+
+    encoded_cwd = str(Path(cwd).resolve()).replace("/", "-").replace(".", "-")
+    jsonl_path = CLAUDE_PROJECTS / encoded_cwd / f"{session_uuid}.jsonl"
+
+    if not jsonl_path.exists():
+        return None
+
+    try:
+        last_usage = None
+        with open(jsonl_path) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "assistant":
+                    usage = obj.get("message", {}).get("usage", {})
+                    if usage:
+                        last_usage = usage
+
+        if not last_usage:
+            return None
+
+        total = (
+            last_usage.get("input_tokens", 0)
+            + last_usage.get("cache_read_input_tokens", 0)
+            + last_usage.get("cache_creation_input_tokens", 0)
+        )
+        return (total, MAX_TOKENS)
+    except OSError:
+        return None
+
+
+def get_inbox_count(agent_id: str) -> int:
+    """Count unread messages in an agent's inbox."""
+    inbox_path = INBOX_DIR / agent_id
+    if not inbox_path.exists():
+        return 0
+    try:
+        return len([
+            f for f in inbox_path.iterdir()
+            if f.is_file() and f.suffix == ".md"
+            and not (inbox_path / (f.stem + ".read")).exists()
+        ])
+    except OSError:
+        return 0
+
+
+def get_last_activity(agent_id: str) -> str | None:
+    """Get timestamp of last worklog activity."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    worklog_path = WORKLOGS_DIR / f"worklog-{today}-{agent_id}.md"
+    if not worklog_path.exists():
+        return None
+
+    try:
+        text = worklog_path.read_text()
+    except OSError:
+        return None
+
+    ts_pattern = re.compile(r'\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\]')
+    last_ts = None
+    for line in reversed(text.splitlines()):
+        m = ts_pattern.search(line)
+        if m:
+            last_ts = m.group(1)
+            break
+    return last_ts
+
+
+# --- Formatting ---
+
+def format_uptime(epoch: int) -> str:
+    elapsed = int(time.time()) - epoch
+    if elapsed < 60:
+        return f"{elapsed}s"
+    elif elapsed < 3600:
+        return f"{elapsed // 60}m"
+    else:
+        h = elapsed // 3600
+        m = (elapsed % 3600) // 60
+        return f"{h}h{m:02d}m"
+
+
+def format_context(usage: tuple[int, int] | None) -> str:
+    if usage is None:
+        return "?"
+    used, total = usage
+    pct = int(used / total * 100)
+    return f"{pct}%"
+
+
+def format_time(ts: str | None) -> str:
+    if not ts:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(ts)
+        return dt.strftime("%H:%M")
+    except ValueError:
+        return ts[-8:-3] if len(ts) > 8 else ts
+
+
+# --- Session info (used by both dashboard and extensions) ---
+
+def get_session_info(agent_id: str, created_at: int, registry: dict) -> dict:
+    """Gather all info for a session. Returns a dict that display functions consume."""
+    return {
+        "agent_id": agent_id,
+        "created_at": created_at,
+        "uptime": format_uptime(created_at),
+        "context": format_context(get_context_usage(agent_id, registry)),
+        "plan": get_plan(agent_id),
+        "inbox": get_inbox_count(agent_id),
+        "last_activity": format_time(get_last_activity(agent_id)),
+        "model": registry.get(agent_id, {}).get("model", ""),
+    }
+
+
+# --- Display ---
+
+def format_session_line(info: dict, annotations: list[str] | None = None) -> str:
+    """Format a single session as a compact dashboard line."""
+    lines = []
+
+    # Line 1: agent ID, uptime, context, inbox, annotations
+    meta_parts = [f"up {info['uptime']}", f"ctx {info['context']}"]
+    if info["inbox"] > 0:
+        meta_parts.append(f"{info['inbox']} msg")
+    if annotations:
+        meta_parts.extend(annotations)
+    meta = ", ".join(meta_parts)
+    lines.append(f"{info['agent_id']}  ({meta})")
+
+    # Line 2: plan status
+    plan = info["plan"]
+    if plan:
+        tasks = plan.get("tasks", [])
+        done = sum(1 for t in tasks if t.get("status") == "done")
+        total = len(tasks)
+        goal = plan.get("goal", "?")
+        if len(goal) > 70:
+            goal = goal[:69] + "\u2026"
+        lines.append(f"  plan: {goal} ({done}/{total})")
+    else:
+        lines.append(f"  plan: none")
+
+    return "\n".join(lines)
+
+
+def dashboard(prefix: str = "", include_self: bool = False):
+    """Show all running sessions as compact cards."""
+    sessions = get_tmux_sessions(prefix)
+    registry = get_registry()
+
+    if not sessions:
+        print("No running sessions.")
+        return
+
+    current_agent = os.environ.get("KILN_AGENT_ID", "")
+
+    agents = []
+    for agent_id, created_at in sorted(sessions.items()):
+        if not include_self and agent_id == current_agent:
+            continue
+        agents.append((agent_id, created_at))
+
+    if not agents:
+        print("No other running sessions.")
+        return
+
+    for i, (agent_id, created_at) in enumerate(agents):
+        info = get_session_info(agent_id, created_at, registry)
+        print(format_session_line(info))
+        if i < len(agents) - 1:
+            print()
+
+
+def drilldown(agent_id: str, prefix: str = ""):
+    """Show detailed info for a single session."""
+    sessions = get_tmux_sessions(prefix)
+    registry = get_registry()
+
+    is_running = agent_id in sessions
+    if not is_running:
+        matches = [s for s in sessions if agent_id in s]
+        if len(matches) == 1:
+            agent_id = matches[0]
+            is_running = True
+        elif len(matches) > 1:
+            print(f"Multiple matches for '{agent_id}':")
+            for m in matches:
+                print(f"  {m}")
+            return
+
+    if is_running:
+        info = get_session_info(agent_id, sessions[agent_id], registry)
+        usage = get_context_usage(agent_id, registry)
+        if usage:
+            used, total = usage
+            pct = int(used / total * 100)
+            ctx_str = f"context {pct}% ({used // 1000}k/{total // 1000}k)"
+        else:
+            ctx_str = "context unknown"
+        print(f"{agent_id} \u2014 running {info['uptime']}, {ctx_str}, model: {info['model'] or 'default'}")
+    else:
+        print(f"{agent_id} \u2014 not running")
+
+    inbox = get_inbox_count(agent_id)
+    if inbox > 0:
+        print(f"Inbox: {inbox} message{'s' if inbox != 1 else ''}")
+    print()
+
+    plan = get_plan(agent_id)
+    if plan:
+        print(f"Plan: {plan.get('goal', '?')}")
+        for task in plan.get("tasks", []):
+            status = task.get("status", "?")
+            desc = task.get("description", "?")
+            icon = {
+                "done": "\u2713",
+                "in_progress": "\u2192",
+            }.get(status, "\u00b7")
+            print(f"  {icon} {desc}")
+        print()
+    else:
+        print("Plan: none\n")
+
+
+# --- Main ---
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        sys.exit(0)
+
+    include_self = "--all" in args
+    args = [a for a in args if a != "--all"]
+
+    # Parse --prefix
+    prefix = ""
+    if "--prefix" in args:
+        idx = args.index("--prefix")
+        if idx + 1 < len(args):
+            prefix = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        else:
+            args = args[:idx]
+
+    # Default prefix from AGENT_HOME directory name
+    if not prefix:
+        home_name = HOME.name.lstrip(".")
+        if home_name:
+            prefix = home_name + "-"
+
+    if args:
+        drilldown(args[0], prefix)
+    else:
+        dashboard(prefix, include_self)
+
+
+if __name__ == "__main__":
+    main()

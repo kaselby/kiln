@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# ---
+# name: tool-info
+# brief: Show tool headers and reference docs
+# description: |
+#   Show tool headers and reference docs — description, arguments, usage
+#   examples, subcommands. Complements the brief listing in your context.
+# arguments: "<tool-name> | --list"
+# ---
+#
+# Usage:
+#   tool-info fetch          Show header + reference docs for 'fetch'
+#   tool-info gateway        Show header + subcommands/examples for 'gateway'
+#   tool-info --list         List all tools (brief descriptions)
+#
+
+set -euo pipefail
+
+TOOLS_DIR="${AGENT_HOME:-$HOME}/tools"
+
+find_tool() {
+    local name="$1"
+    for dir in "$TOOLS_DIR/core" "$TOOLS_DIR/library" "$TOOLS_DIR"; do
+        if [[ -f "$dir/$name" ]]; then
+            echo "$dir/$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+parse_header() {
+    local tool_path="$1"
+    local in_header=false
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
+            if $in_header; then break; fi
+            in_header=true
+            continue
+        fi
+        if $in_header && [[ "$line" =~ ^[[:space:]]*#[[:space:]] ]]; then
+            echo "${line#*# }"
+        fi
+    done < "$tool_path"
+}
+
+extract_reference_docs() {
+    local tool_path="$1"
+    local past_header=false
+    local found_end=false
+    local in_docs=false
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
+            if $past_header; then
+                found_end=true
+                continue
+            fi
+            past_header=true
+            continue
+        fi
+        if $found_end; then
+            if [[ "$line" =~ ^[[:space:]]*#(.*)$ ]]; then
+                local comment="${BASH_REMATCH[1]}"
+                # Skip leading blank comment lines
+                if [[ -z "$comment" ]] && ! $in_docs; then
+                    continue
+                fi
+                in_docs=true
+                echo "$comment"
+            elif [[ -z "$line" ]] && $in_docs; then
+                echo ""
+            else
+                break
+            fi
+        fi
+    done < "$tool_path"
+}
+
+show_tool() {
+    local name="$1"
+    local full="${2:-false}"
+
+    local tool_path
+    tool_path=$(find_tool "$name") || {
+        echo "Error: tool '$name' not found in $TOOLS_DIR" >&2
+        exit 1
+    }
+
+    local header
+    header=$(parse_header "$tool_path")
+
+    if [[ -z "$header" ]]; then
+        echo "No header found for tool '$name'"
+        return
+    fi
+
+    echo "=== $name ==="
+    echo "$header"
+
+    if [[ "$full" == "true" ]]; then
+        local docs
+        docs=$(extract_reference_docs "$tool_path")
+        if [[ -n "$docs" ]]; then
+            echo ""
+            echo "$docs"
+        fi
+    fi
+}
+
+list_tools() {
+    for tool_path in "$TOOLS_DIR"/core/* "$TOOLS_DIR"/library/* "$TOOLS_DIR"/*; do
+        [[ -f "$tool_path" ]] || continue
+        [[ "$(basename "$tool_path")" == "registry.yml" ]] && continue
+
+        local name
+        name=$(basename "$tool_path")
+
+        # Parse header
+        local in_header=false
+        local tool_name="" brief="" description="" arguments="" cost=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
+                if $in_header; then break; fi
+                in_header=true
+                continue
+            fi
+            if $in_header && [[ "$line" =~ ^[[:space:]]*#[[:space:]](.+)$ ]]; then
+                local content="${BASH_REMATCH[1]}"
+                case "$content" in
+                    name:*) tool_name="${content#name: }" ;;
+                    brief:*) brief="${content#brief: }" ;;
+                    description:*) description="${content#description: }" ;;
+                    arguments:*) arguments="${content#arguments: }"; arguments="${arguments//\"/}" ;;
+                    cost:*) cost="${content#cost: }" ;;
+                esac
+            fi
+        done < "$tool_path"
+
+        [[ -z "$tool_name" ]] && continue
+
+        local display="${brief:-$description}"
+        local cost_tag=""
+        [[ -n "$cost" ]] && cost_tag=" [\$$cost/call]"
+        echo "- **${tool_name}** — ${display}${cost_tag}"
+    done
+}
+
+# --- Main ---
+if [[ $# -eq 0 ]]; then
+    echo "Usage: tool-info <tool-name> | --list"
+    exit 1
+fi
+
+case "$1" in
+    --list)
+        list_tools
+        ;;
+    *)
+        show_tool "$1" "true"
+        ;;
+esac
