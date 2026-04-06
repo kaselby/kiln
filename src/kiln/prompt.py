@@ -351,9 +351,10 @@ def discover_skills(skills_path: Path) -> list[dict]:
         return skills
 
     # Directories to scan: top-level + immediate subdirs
+    SKIP_DIRS = {"__pycache__", "archived"}
     scan_dirs = [skills_path]
     for child in sorted(skills_path.iterdir()):
-        if child.is_dir() and not child.name.startswith(".") and child.name != "__pycache__":
+        if child.is_dir() and not child.name.startswith(".") and child.name not in SKIP_DIRS:
             scan_dirs.append(child)
 
     seen_names: set[str] = set()

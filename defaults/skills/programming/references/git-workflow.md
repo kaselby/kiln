@@ -17,8 +17,6 @@ Pass commit messages via HEREDOC for clean formatting:
 ```bash
 git commit -m "$(cat <<'EOF'
 Commit message here.
-
-Co-Authored-By: Agent <noreply@example.com>
 EOF
 )"
 ```
