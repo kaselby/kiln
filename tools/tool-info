@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ---
 # name: tool-info
-# brief: Show full tool details on demand
-# description: Show full tool details (description, arguments, usage) on demand. Use when you need parameter syntax or usage guidance for a tool. Complements the brief tool listing in your context.
-# arguments: "<tool-name> | --list [--full]"
+# brief: Show tool headers and reference docs
+# description: |
+#   Show tool headers and reference docs. Default shows header only (name,
+#   description, arguments). Use --full for complete reference docs including
+#   usage examples and subcommands.
+# arguments: "<tool-name> [--full] | --list [--full]"
 # ---
 #
 # Usage:
-#   tool-info fetch          Show full header for 'fetch'
+#   tool-info fetch          Show header for 'fetch' (name, description, args)
+#   tool-info gateway --full Show header + full reference docs (subcommands, examples)
 #   tool-info --list         List all tools with brief descriptions
 #   tool-info --list --full  List all tools with full descriptions
 #
@@ -27,33 +31,66 @@ find_tool() {
     return 1
 }
 
+parse_header() {
+    local tool_path="$1"
+    local in_header=false
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
+            if $in_header; then break; fi
+            in_header=true
+            continue
+        fi
+        if $in_header && [[ "$line" =~ ^[[:space:]]*#[[:space:]] ]]; then
+            echo "${line#*# }"
+        fi
+    done < "$tool_path"
+}
+
+extract_reference_docs() {
+    local tool_path="$1"
+    local past_header=false
+    local found_end=false
+    local in_docs=false
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
+            if $past_header; then
+                found_end=true
+                continue
+            fi
+            past_header=true
+            continue
+        fi
+        if $found_end; then
+            if [[ "$line" =~ ^[[:space:]]*#(.*)$ ]]; then
+                local comment="${BASH_REMATCH[1]}"
+                # Skip leading blank comment lines
+                if [[ -z "$comment" ]] && ! $in_docs; then
+                    continue
+                fi
+                in_docs=true
+                echo "$comment"
+            elif [[ -z "$line" ]] && $in_docs; then
+                echo ""
+            else
+                break
+            fi
+        fi
+    done < "$tool_path"
+}
+
 show_tool() {
     local name="$1"
+    local full="${2:-false}"
+
     local tool_path
     tool_path=$(find_tool "$name") || {
         echo "Error: tool '$name' not found in $TOOLS_DIR" >&2
         exit 1
     }
 
-    # Extract header block between # --- delimiters
-    local in_header=false
-    local header=""
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
-            if $in_header; then
-                break
-            fi
-            in_header=true
-            continue
-        fi
-        if $in_header; then
-            if [[ "$line" =~ ^[[:space:]]*#[[:space:]] ]]; then
-                header+="${line#*# }"$'\n'
-            else
-                break
-            fi
-        fi
-    done < "$tool_path"
+    local header
+    header=$(parse_header "$tool_path")
 
     if [[ -z "$header" ]]; then
         echo "No header found for tool '$name'"
@@ -63,33 +100,14 @@ show_tool() {
     echo "=== $name ==="
     echo "$header"
 
-    # Also show usage comments after the header (lines starting with # before code)
-    local past_header=false
-    local in_usage=false
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*---[[:space:]]*$ ]]; then
-            if $past_header; then
-                past_header="done"
-                continue
-            fi
-            past_header=true
-            continue
+    if [[ "$full" == "true" ]]; then
+        local docs
+        docs=$(extract_reference_docs "$tool_path")
+        if [[ -n "$docs" ]]; then
+            echo ""
+            echo "$docs"
         fi
-        if [[ "$past_header" == "done" ]]; then
-            if [[ "$line" =~ ^[[:space:]]*#(.*)$ ]]; then
-                local comment="${BASH_REMATCH[1]}"
-                if [[ -z "$comment" ]] && ! $in_usage; then
-                    continue
-                fi
-                in_usage=true
-                echo "$comment"
-            elif [[ -z "$line" ]] && $in_usage; then
-                echo ""
-            else
-                break
-            fi
-        fi
-    done < "$tool_path"
+    fi
 }
 
 list_tools() {
@@ -142,7 +160,7 @@ list_tools() {
 
 # --- Main ---
 if [[ $# -eq 0 ]]; then
-    echo "Usage: tool-info <tool-name> | --list [--full]"
+    echo "Usage: tool-info <tool-name> [--full] | --list [--full]"
     exit 1
 fi
 
@@ -153,6 +171,9 @@ case "$1" in
         list_tools "$full"
         ;;
     *)
-        show_tool "$1"
+        name="$1"
+        full="false"
+        [[ "${2:-}" == "--full" ]] && full="true"
+        show_tool "$name" "$full"
         ;;
 esac
