@@ -3,17 +3,15 @@
 # name: tool-info
 # brief: Show tool headers and reference docs
 # description: |
-#   Show tool headers and reference docs. Default shows header only (name,
-#   description, arguments). Use --full for complete reference docs including
-#   usage examples and subcommands.
-# arguments: "<tool-name> | --list [--full]"
+#   Show tool headers and reference docs — description, arguments, usage
+#   examples, subcommands. Complements the brief listing in your context.
+# arguments: "<tool-name> | --list"
 # ---
 #
 # Usage:
 #   tool-info fetch          Show header + reference docs for 'fetch'
-#   tool-info gateway        Show header + full reference docs (subcommands, examples)
-#   tool-info --list         List all tools with brief descriptions
-#   tool-info --list --full  List all tools with full descriptions
+#   tool-info gateway        Show header + subcommands/examples for 'gateway'
+#   tool-info --list         List all tools (brief descriptions)
 #
 
 set -euo pipefail
@@ -111,8 +109,6 @@ show_tool() {
 }
 
 list_tools() {
-    local full="${1:-false}"
-
     for tool_path in "$TOOLS_DIR"/core/* "$TOOLS_DIR"/library/* "$TOOLS_DIR"/*; do
         [[ -f "$tool_path" ]] || continue
         [[ "$(basename "$tool_path")" == "registry.yml" ]] && continue
@@ -143,32 +139,22 @@ list_tools() {
 
         [[ -z "$tool_name" ]] && continue
 
-        if [[ "$full" == "true" ]]; then
-            local cost_tag=""
-            [[ -n "$cost" ]] && cost_tag=" [\$$cost/call]"
-            local args=""
-            [[ -n "$arguments" ]] && args=" \`$arguments\`"
-            echo "- **${tool_name}**${args} — ${description}${cost_tag}"
-        else
-            local display="${brief:-$description}"
-            local cost_tag=""
-            [[ -n "$cost" ]] && cost_tag=" [\$$cost/call]"
-            echo "- **${tool_name}** — ${display}${cost_tag}"
-        fi
+        local display="${brief:-$description}"
+        local cost_tag=""
+        [[ -n "$cost" ]] && cost_tag=" [\$$cost/call]"
+        echo "- **${tool_name}** — ${display}${cost_tag}"
     done
 }
 
 # --- Main ---
 if [[ $# -eq 0 ]]; then
-    echo "Usage: tool-info <tool-name> [--full] | --list [--full]"
+    echo "Usage: tool-info <tool-name> | --list"
     exit 1
 fi
 
 case "$1" in
     --list)
-        full="false"
-        [[ "${2:-}" == "--full" ]] && full="true"
-        list_tools "$full"
+        list_tools
         ;;
     *)
         show_tool "$1" "true"
