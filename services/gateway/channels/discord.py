@@ -758,7 +758,14 @@ class DiscordChannel(Channel):
             msg = self._security_active_msg
         else:
             # Post a new challenge embed (first attempt or after a strike)
-            mention_content = self._client._permission_ping_content()
+            # Always mention full-trust users for security challenges
+            # (unlike permission pings, which skip when owner is at terminal)
+            mentions = []
+            for uid, entry in self._discord_config.users.items():
+                trust = entry.get("max_trust") or entry.get("trust")
+                if trust == "full":
+                    mentions.append(f"<@{uid}>")
+            mention_content = " ".join(mentions) if mentions else None
             try:
                 log.info("Security challenge: sending embed to #security (channel %s)", security_ch.id)
                 msg = await security_ch.send(content=mention_content, embed=embed)
