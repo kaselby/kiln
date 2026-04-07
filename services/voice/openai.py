@@ -1,6 +1,6 @@
 """OpenAI voice backends — Whisper STT + OpenAI TTS.
 
-Ported from Aleph's voice.py with ElevenLabs stripped.
+Ported from voice.py with ElevenLabs stripped.
 """
 
 import logging

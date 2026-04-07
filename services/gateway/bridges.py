@@ -25,7 +25,7 @@ log = logging.getLogger("gateway.bridges")
 class Bridge:
     """A bidirectional link between a platform surface and a Kiln channel."""
 
-    kiln_channel: str       # Kiln channel name (e.g. "gateway", "beth")
+    kiln_channel: str       # Kiln channel name (e.g. "gateway", "general")
     platform: str           # Platform name (e.g. "discord")
     surface_id: str         # Platform-specific surface ID (e.g. thread ID)
     surface_desc: str = ""  # Human-readable description (e.g. "#channels/gateway")

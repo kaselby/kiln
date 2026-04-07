@@ -1,6 +1,6 @@
 """Message normalization, inbox writing, and Discord message splitting.
 
-Ported from Aleph's discord-relay with agent_home generalized.
+Ported from discord-relay with agent_home generalized.
 """
 
 import logging

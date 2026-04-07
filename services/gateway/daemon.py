@@ -2,7 +2,7 @@
 
 Usage:
     python -m kiln.services.gateway.daemon --config <path>
-    python -m kiln.services.gateway.daemon --agent-home ~/.beth
+    python -m kiln.services.gateway.daemon --agent-home ~/.agent
 """
 
 import argparse

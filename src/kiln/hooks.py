@@ -303,10 +303,10 @@ def create_session_state_hook(
         parts = [f"mode={harness.permission_mode.value}"]
         parts.extend(harness.session_state_labels())
 
-        # Presence — where is Kira?
+        # Presence — where is the user?
         state_dir = harness.config.home / "state"
         presence = read_presence(state_dir)
-        parts.append(f"Kira: {presence['summary']}")
+        parts.append(f"{harness.config.owner_name}: {presence['summary']}")
 
         # Get running agent sessions
         try:
@@ -631,9 +631,9 @@ def format_message_source(msg: dict) -> str:
 
     Returns the inner content of the header bracket (caller wraps with timestamp
     or 'Notification' prefix). Examples:
-        GATEWAY MESSAGE from kira | source: discord/dm | trust: verified ✓ | sent 10:12:03
-        AGENT MESSAGE from beth-frost-owl | source: kiln/#design-review | sent 10:20:01
-        AGENT MESSAGE from beth-frost-owl | source: kiln/dm | sent 10:20:01
+        GATEWAY MESSAGE from owner | source: discord/dm | trust: full (verified ✓) | sent 10:12:03
+        AGENT MESSAGE from agent-frost-owl | source: kiln/#design-review | sent 10:20:01
+        AGENT MESSAGE from agent-frost-owl | source: kiln/dm | sent 10:20:01
     """
     source = msg.get("source", "")
     sender = msg.get("from") or "unknown"

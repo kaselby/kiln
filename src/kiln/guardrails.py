@@ -189,7 +189,7 @@ def _has_rm_rf(command: str) -> bool:
     after_rm = match.group(1)
     # Collect only actual flag tokens — must be preceded by whitespace or at
     # start of string. This excludes hyphens embedded in filenames like
-    # "aleph-first-bay.yml" where "-first" would be a false positive.
+    # "agent-first-run.yml" where "-first" would be a false positive.
     flags = re.findall(r"(?:^|\s)-(\w+)", after_rm)
     all_flags = "".join(flags)
     return "r" in all_flags and "f" in all_flags

@@ -40,7 +40,7 @@ def write_presence(state_dir: Path, surface: str, agent_id: str | None = None) -
 
 
 def read_presence(state_dir: Path, idle_seconds: int = PRESENCE_IDLE_SECONDS) -> dict:
-    """Read presence state and derive Kira's location.
+    """Read presence state and derive the user's location.
 
     Returns a dict with:
         location: "terminal" | "discord" | "away"

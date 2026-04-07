@@ -33,7 +33,7 @@ class SessionConfig:
     """
 
     # Core tunables with kiln-level defaults.
-    # Agent harnesses extend with their own (e.g. Aleph adds show_thinking,
+    # Agent harnesses extend with their own (e.g. a harness might add show_thinking,
     # worklog_interval).
     CORE_DEFAULTS: dict[str, object] = {
         "heartbeat_enabled": False,

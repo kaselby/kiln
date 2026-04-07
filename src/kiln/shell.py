@@ -135,9 +135,10 @@ class PersistentShell:
         for key in list(base):
             if key.startswith("CLAUDE"):
                 del base[key]
-        # Strip ALEPH_IN_TMUX so subprocess-spawned `aleph` commands always
+        # Strip KILN_IN_TMUX so subprocess-spawned agent commands always
         # create their own tmux session instead of running inside our pipe.
-        base.pop("ALEPH_IN_TMUX", None)
+        base.pop("KILN_IN_TMUX", None)
+        base.pop("ALEPH_IN_TMUX", None)  # legacy name — kept for compatibility
         if overrides:
             base.update(overrides)
         return base

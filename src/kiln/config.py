@@ -52,6 +52,7 @@ class AgentConfig:
 
     # Agent identity
     name: str = ""                    # agent name (e.g. "assistant")
+    owner_name: str = "User"          # display name for the agent's owner (used in presence labels etc.)
     home: Path = field(default_factory=lambda: Path.home())
     identity_doc: str = "identity.md"  # relative to home
 
@@ -257,7 +258,7 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
 
     # Simple scalar fields
     for field_name in [
-        "identity_doc", "model", "effort", "session_prefix",
+        "identity_doc", "owner_name", "model", "effort", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
         "orientation", "cleanup",

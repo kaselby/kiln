@@ -14,6 +14,12 @@ import yaml
 
 import discord
 
+# Optional kiln import — available when kiln/src is on sys.path
+try:
+    from kiln.state import trust_label as _trust_label
+except ImportError:
+    _trust_label = None
+
 from ..bridges import BridgeManager, Bridge
 from ..config import DiscordConfig, GatewayConfig
 from ..messages import split_message, write_to_inbox
@@ -211,7 +217,7 @@ def _count_inbox(agent_home: Path, agent_id: str) -> int:
 
 
 def _read_canonical(agent_home: Path) -> str | None:
-    """Read the canonical agent ID from the lock file (~/.beth/state/canonical)."""
+    """Read the canonical agent ID from the lock file (<agent_home>/state/canonical)."""
     path = agent_home / "state" / "canonical"
     try:
         return path.read_text().strip() or None
@@ -592,7 +598,7 @@ class DiscordChannel(Channel):
         future: asyncio.Future[tuple[bool, str]] = asyncio.get_event_loop().create_future()
         view = _PermissionView(future, self._discord_config, detail=detail)
 
-        # Ping full-trust users if Kira isn't at terminal (beth#16)
+        # Ping full-trust users if the owner isn't at terminal
         mention_content = self._client._permission_ping_content()
 
         try:
@@ -859,6 +865,14 @@ class _GatewayClient(discord.Client):
 
         # --- Routing ---
 
+        # Resolve trust label (combines config trust with live verification)
+        resolved_trust = trust
+        if _trust_label is not None:
+            state_dir = self._config.agent_home / "state"
+            resolved_trust = _trust_label(
+                state_dir, config_trust=trust, sender_user_id=sender_id,
+            )
+
         # 1. Bridge: inject into Kiln channel if this surface is bridged
         self._bridge_manager.inject_inbound(surface_id, sender_name, content)
 
@@ -871,7 +885,7 @@ class _GatewayClient(discord.Client):
                 sender_name=sender_name, sender_id=sender_id,
                 content=content, platform="discord",
                 channel_desc=channel_desc, channel_id=str(message.channel.id),
-                trust=trust, attachment_paths=attachment_paths or None,
+                trust=resolved_trust, attachment_paths=attachment_paths or None,
             )
 
         if subscribers:
@@ -890,7 +904,7 @@ class _GatewayClient(discord.Client):
         path.write_text(datetime.now(timezone.utc).isoformat() + "\n")
 
     def _permission_ping_content(self) -> str | None:
-        """Build mention string for permission prompts when Kira isn't at terminal.
+        """Build mention string for permission prompts when the owner isn't at terminal.
 
         Returns None if terminal is active (no ping needed), or a string of
         Discord user mentions for all full-trust users.
@@ -1011,7 +1025,10 @@ class _GatewayClient(discord.Client):
         self, message: discord.Message, instructions: str,
     ) -> None:
         """Handle: spawn [instructions]"""
-        agent_name = self._config.default_agent or "beth"
+        agent_name = self._config.default_agent
+        if not agent_name:
+            await message.reply("❌ No default agent configured (`routing.default_agent` in gateway config).")
+            return
         cli_path = shutil.which(agent_name)
         if not cli_path:
             await message.reply(f"❌ Cannot find `{agent_name}` on PATH.")
