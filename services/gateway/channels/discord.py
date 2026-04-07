@@ -749,10 +749,14 @@ class DiscordChannel(Channel):
         }
 
         try:
+            log.info("Security challenge: sending embed to #security (channel %s)", security_ch.id)
             msg = await security_ch.send(content=mention_content, embed=embed)
             self._security_message_ids.append(msg.id)
+            log.info("Security challenge: embed sent (msg %s), waiting for response (timeout=%ds)",
+                     msg.id, int(timeout))
         except (discord.Forbidden, discord.HTTPException) as e:
             self._security_challenge_state = None
+            log.error("Security challenge: failed to send embed: %s", e)
             return {"response": None, "author_id": "", "timed_out": False,
                     "error": f"failed to send challenge: {e}"}
 

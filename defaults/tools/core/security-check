@@ -213,17 +213,17 @@ def run_challenge(platform: str, reason: str) -> bool:
     print(f"Notified {agent_count} active session(s)")
 
     strikes = 0
-    attempt = 1
     previous_result = None
 
     while strikes < MAX_STRIKES:
-        print(f"Attempt {attempt} (strikes: {strikes}/{MAX_STRIKES}) — waiting up to {TIMEOUT_SECONDS}s for response...")
+        print(f"Challenge (strikes: {strikes}/{MAX_STRIKES}) — waiting up to {TIMEOUT_SECONDS}s for response...")
 
         # Call the gateway's security challenge endpoint
+        # attempt = strikes + 1 (used-password retries don't count)
         result = gateway_api("POST", f"/api/{platform}/security/challenge", {
             "reason": reason_text,
             "timeout": TIMEOUT_SECONDS,
-            "attempt": attempt,
+            "attempt": strikes + 1,
             "max_attempts": MAX_STRIKES,
             "previous_result": previous_result,
         })
@@ -240,7 +240,6 @@ def run_challenge(platform: str, reason: str) -> bool:
             print(f"Timeout — strike {strikes}")
             if strikes >= MAX_STRIKES:
                 break
-            attempt += 1
             continue
 
         response = result.get("response", "")
@@ -261,9 +260,8 @@ def run_challenge(platform: str, reason: str) -> bool:
             return True
 
         elif pw_result == "used":
-            previous_result = "used"
+            previous_result = "used"  # no strike increment — free retry
             print("Used password — not a strike, retrying")
-            attempt += 1
             continue
 
         else:
@@ -272,7 +270,6 @@ def run_challenge(platform: str, reason: str) -> bool:
             print(f"Wrong password — strike {strikes}")
             if strikes >= MAX_STRIKES:
                 break
-            attempt += 1
             continue
 
     # Lockdown
