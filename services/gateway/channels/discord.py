@@ -831,7 +831,7 @@ class _GatewayClient(discord.Client):
         # Determine surface ID for routing
         if is_dm:
             surface_id = f"dm/{sender_id}"
-            channel_desc = f"dm/{sender_name}"
+            channel_desc = "dm"
         else:
             surface_id = str(message.channel.id)
             if hasattr(message.channel, "name"):
