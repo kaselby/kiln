@@ -589,9 +589,9 @@ def format_message_source(msg: dict) -> str:
 
     Returns the inner content of the header bracket (caller wraps with timestamp
     or 'Notification' prefix). Examples:
-        GATEWAY MESSAGE from kira | discord #dm | trust: verified ✓ | sent 10:12:03
-        AGENT MESSAGE from beth-frost-owl | #design-review | sent 10:20:01
-        AGENT MESSAGE from beth-frost-owl | sent 10:20:01
+        GATEWAY MESSAGE from kira | source: discord/dm | trust: verified ✓ | sent 10:12:03
+        AGENT MESSAGE from beth-frost-owl | source: kiln/#design-review | sent 10:20:01
+        AGENT MESSAGE from beth-frost-owl | source: kiln/dm | sent 10:20:01
     """
     source = msg.get("source", "")
     sender = msg.get("from") or "unknown"
@@ -603,27 +603,29 @@ def format_message_source(msg: dict) -> str:
     if source and source not in ("kiln", "agent"):
         # Gateway message (discord, slack, etc.)
         msg_type = "GATEWAY MESSAGE"
-        # Strip platform prefix from sender name (e.g. "discord-kira" -> "kira")
         if sender.startswith(f"{source}-"):
             sender = sender[len(source) + 1:]
         parts = [f"{msg_type} from {sender}"]
-        # Platform + channel (e.g. "discord #dm")
+        # source: platform/channel (e.g. "source: discord/dm", "source: discord/#general")
         if channel:
-            ch = f"#{channel}" if not channel.startswith("#") else channel
-            parts.append(f"{source} {ch}")
+            ch = f"#{channel}" if not channel.startswith(("#", "dm")) else channel
+            parts.append(f"source: {source}/{ch}")
         else:
-            parts.append(source)
-        # Trust level — only "verified" means a security check passed recently
+            parts.append(f"source: {source}")
+        # Trust level
         if trust == "verified":
             parts.append("trust: verified ✓")
         else:
             parts.append("trust: unverified ⚠")
     else:
-        # Agent message
+        # Agent message — source is kiln
         msg_type = "AGENT MESSAGE"
         parts = [f"{msg_type} from {sender}"]
         if channel:
-            parts.append(f"#{channel}" if not channel.startswith("#") else channel)
+            ch = f"#{channel}" if not channel.startswith("#") else channel
+            parts.append(f"source: kiln/{ch}")
+        else:
+            parts.append("source: kiln/dm")
 
     # Original send time (short format)
     if timestamp:
