@@ -41,13 +41,17 @@ class DiscordConfig:
     voice_instructions: str = ""  # default TTS instructions/persona
 
     def resolve_user(self, user_id: str, fallback_name: str = "") -> tuple[str, str]:
-        """Look up a user's display name and trust level.
+        """Look up a user's display name and max trust level.
 
-        Returns (name, trust). Falls back to fallback_name/user_id if unknown.
+        Returns (name, max_trust). Falls back to fallback_name/user_id if unknown.
+        Uses ``max_trust`` field if present, falling back to ``trust`` for
+        backward compatibility.
         """
         entry = self.users.get(user_id, {})
         name = entry.get("name", fallback_name or user_id)
-        trust = entry.get("trust", "unknown")
+        trust = entry.get("max_trust") or entry.get("trust", "unknown")
+        if "max_trust" not in entry and "trust" in entry:
+            log.debug("User %s uses deprecated 'trust' field — rename to 'max_trust'", user_id)
         return name, trust
 
     @classmethod

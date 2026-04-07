@@ -54,7 +54,8 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import StreamEvent
 
-from ..hooks import format_message_source, parse_message
+from ..hooks import _resolve_live_trust, format_message_source, parse_message
+from ..state import write_presence
 from ..permissions import (
     PermissionMode,
     PermissionRequest,
@@ -1174,6 +1175,11 @@ class KilnApp:
         try:
             # Inject timestamp + source header so the agent has time and source awareness
             ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            if source == "user":
+                write_presence(
+                    self._harness.config.home / "state", "terminal",
+                    agent_id=self._harness.agent_id,
+                )
             if self._resume_indicator_pending and source == "user":
                 self._resume_indicator_pending = False
                 stamped = f"[{ts} | TERMINAL MESSAGE | trust: always ✓ | Resumed session]\n{text}"
@@ -1333,6 +1339,7 @@ class KilnApp:
         marker = msg_path.with_suffix(".read")
         marker.touch()  # write early to prevent concurrent re-queue; removed on failure
 
+        _resolve_live_trust(msg, self._harness.config.home / "state")
         header = format_message_source(msg)
         summary = msg.get("summary", "")
         body = msg.get("body", "")

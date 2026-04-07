@@ -285,7 +285,8 @@ class KilnHarness:
         )
 
         # Build infrastructure hooks
-        inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events)
+        state_dir = self.config.home / "state"
+        inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events, state_dir=state_dir)
         read_tracker = create_read_tracking_hook(inbox, file_state=file_state)
         context_warning = create_context_warning_hook(self.session_control)
         session_state = self._create_session_state_hook()

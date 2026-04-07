@@ -15,8 +15,14 @@ from claude_agent_sdk import (
     HookJSONOutput,
 )
 
+from kiln.state import read_presence, read_trust, trust_label
 
-def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = None):
+
+def create_inbox_check_hook(
+    inbox_path: Path,
+    ui_events: list[dict] | None = None,
+    state_dir: Path | None = None,
+):
     """Create a PostToolUse hook that checks for unread messages after every tool call.
 
     Returns summaries of unread messages as additionalContext (agent-facing).
@@ -30,10 +36,8 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
     Messages arriving while the agent is idle bypass the hook entirely and
     are delivered by the watcher as proper user turns.
     """
-    # Track messages already injected this session (in-memory dedup for the
-    # rare case where .read write succeeds but the set check runs before the
-    # filesystem catches up on the next iteration).
     _injected: set[str] = set()
+    _last_trust_verified: bool | None = None  # track for expiry notification
 
     async def inbox_check_hook(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
@@ -59,6 +63,7 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
             # Extract sender and channel from frontmatter
             parsed = parse_message(msg_file)
             if parsed:
+                _resolve_live_trust(parsed, state_dir)
                 header = format_message_source(parsed)
                 ping = f"[Notification | {header}]\n{msg_file}"
                 summaries.append(ping)
@@ -74,6 +79,15 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
                         "channel": parsed.get("channel", ""),
                         "path": path_str,
                     })
+
+        # Trust expiry notification — fire once when trust lapses
+        nonlocal _last_trust_verified
+        if state_dir:
+            trust = read_trust(state_dir)
+            now_verified = trust["verified"]
+            if _last_trust_verified is True and not now_verified:
+                summaries.append("[Discord trust expired — subsequent messages are unverified]")
+            _last_trust_verified = now_verified
 
         if not summaries:
             return {}
@@ -288,6 +302,11 @@ def create_session_state_hook(
 
         parts = [f"mode={harness.permission_mode.value}"]
         parts.extend(harness.session_state_labels())
+
+        # Presence — where is Kira?
+        state_dir = harness.config.home / "state"
+        presence = read_presence(state_dir)
+        parts.append(f"Kira: {presence['summary']}")
 
         # Get running agent sessions
         try:
@@ -532,6 +551,29 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
     return usage_log_hook
 
 
+def _resolve_live_trust(msg: dict, state_dir: Path | None) -> None:
+    """Override a gateway message's trust field with live trust state.
+
+    Modifies ``msg`` in place. Only applies to gateway messages (source is a
+    platform name, not "kiln"/"agent"). Agent and non-gateway messages are
+    left untouched.
+
+    Combines the config-level trust from the message frontmatter with live
+    verification state. The ``discord-user-id`` field enables per-user
+    verification matching.
+    """
+    if not state_dir:
+        return
+    source = msg.get("source", "")
+    if not source or source in ("kiln", "agent"):
+        return
+    msg["trust"] = trust_label(
+        state_dir,
+        config_trust=msg.get("trust", ""),
+        sender_user_id=msg.get("discord-user-id", ""),
+    )
+
+
 def parse_message(msg_file: Path) -> dict | None:
     """Parse a message file into its components.
 
@@ -577,7 +619,7 @@ def parse_message(msg_file: Path) -> dict | None:
             continue
         key = key_val[0].strip()
         val = key_val[1].strip().strip('"').strip("'")
-        if key in ("from", "summary", "priority", "channel", "source", "trust", "timestamp"):
+        if key in ("from", "summary", "priority", "channel", "source", "trust", "timestamp", "discord-user-id"):
             result[key] = val
 
     result["body"] = "\n".join(lines[fm_end + 1:]).strip()
@@ -612,11 +654,10 @@ def format_message_source(msg: dict) -> str:
             parts.append(f"source: {source}/{ch}")
         else:
             parts.append(f"source: {source}")
-        # Trust level
-        if trust == "verified":
-            parts.append("trust: verified ✓")
-        else:
-            parts.append("trust: unverified ⚠")
+        # Trust level — set by _resolve_live_trust() (e.g. "full (verified ✓)",
+        # "full", "known", "unknown"). Display as-is.
+        if trust:
+            parts.append(f"trust: {trust}")
     else:
         # Agent message — source is kiln
         msg_type = "AGENT MESSAGE"
