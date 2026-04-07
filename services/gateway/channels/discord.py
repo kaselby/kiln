@@ -3,11 +3,14 @@
 import asyncio
 import json
 import logging
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import yaml
 
 import discord
 
@@ -790,6 +793,15 @@ class _GatewayClient(discord.Client):
         if not content.strip() and not message.attachments:
             return
 
+        # Control channel: handle as command, skip normal routing
+        control_id = self._discord_config.channels.get("control")
+        if control_id and str(message.channel.id) == control_id:
+            if trust != "full":
+                await message.reply("⛔ Control commands require full trust.")
+                return
+            await self._handle_control_command(message, content.strip())
+            return
+
         # Determine surface ID for routing
         if is_dm:
             surface_id = f"dm/{sender_id}"
@@ -832,6 +844,188 @@ class _GatewayClient(discord.Client):
         if subscribers:
             log.info("Discord -> %d subscriber(s) from %s in %s",
                      len(subscribers), sender_name, channel_desc)
+
+    # -----------------------------------------------------------------------
+    # Control channel
+    # -----------------------------------------------------------------------
+
+    async def _handle_control_command(
+        self, message: discord.Message, text: str,
+    ) -> None:
+        """Parse and execute a control channel command."""
+        parts = text.split()
+        if not parts:
+            return
+
+        cmd = parts[0].lower()
+        try:
+            if cmd == "mode":
+                await self._cmd_mode(message, parts[1:])
+            elif cmd == "spawn":
+                await self._cmd_spawn(message, text[len("spawn"):].strip())
+            elif cmd == "kill":
+                await self._cmd_kill(message, parts[1:])
+            elif cmd == "help":
+                await message.reply(
+                    "**Commands:**\n"
+                    "`mode <agent> <mode>` — change permission mode "
+                    "(safe, supervised, yolo)\n"
+                    "`spawn [instructions]` — launch a new session\n"
+                    "`kill <agent>` — kill a session (immediate)\n"
+                    "`help` — this message"
+                )
+            else:
+                await message.reply(f"Unknown command: `{cmd}`. Try `help`.")
+        except Exception as e:
+            log.exception("Control command error: %s", text)
+            await message.reply(f"❌ Error: {e}")
+
+    async def _cmd_mode(
+        self, message: discord.Message, args: list[str],
+    ) -> None:
+        """Handle: mode <agent-id> <mode>"""
+        if len(args) != 2:
+            await message.reply("Usage: `mode <agent> <mode>`")
+            return
+
+        agent_ref, mode_str = args[0], args[1].lower()
+
+        # Validate mode — trusted is not allowed remotely
+        valid_modes = {"safe", "supervised", "yolo"}
+        if mode_str == "trusted":
+            await message.reply("⛔ Trusted mode is TUI-only.")
+            return
+        if mode_str not in valid_modes:
+            await message.reply(
+                f"Invalid mode: `{mode_str}`. "
+                f"Valid: {', '.join(sorted(valid_modes))}"
+            )
+            return
+
+        # Resolve agent ID — accept short names (e.g. "storm-jay")
+        agent_id = self._resolve_agent_id(agent_ref)
+        if not agent_id:
+            await message.reply(f"No running session matching `{agent_ref}`.")
+            return
+
+        # Write to session config
+        config_path = (
+            self._config.agent_home / "state" / f"session-config-{agent_id}.yml"
+        )
+        if not config_path.exists():
+            await message.reply(f"No session config for `{agent_id}`.")
+            return
+
+        try:
+            data = yaml.safe_load(config_path.read_text()) or {}
+        except (yaml.YAMLError, OSError):
+            data = {}
+
+        old_mode = data.get("mode", "?")
+        data["mode"] = mode_str
+        tmp = config_path.with_suffix(".tmp")
+        tmp.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+        tmp.rename(config_path)
+
+        await message.reply(f"✅ `{agent_id}`: {old_mode} → **{mode_str}**")
+        log.info("Control: mode %s -> %s (by %s)", agent_id, mode_str,
+                 message.author.name)
+
+    async def _cmd_spawn(
+        self, message: discord.Message, instructions: str,
+    ) -> None:
+        """Handle: spawn [instructions]"""
+        agent_name = self._config.default_agent or "beth"
+        cli_path = shutil.which(agent_name)
+        if not cli_path:
+            await message.reply(f"❌ Cannot find `{agent_name}` on PATH.")
+            return
+
+        cmd = [cli_path, "run", "--mode", "yolo", "--detach"]
+        if instructions:
+            cmd.extend(["--prompt", instructions])
+
+        log.info("Control: spawn by %s — %s", message.author.name,
+                 instructions[:100] if instructions else "(no instructions)")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=30,
+            )
+            if proc.returncode == 0:
+                output = stdout.decode().strip()
+                await message.reply(
+                    f"✅ Session launched.\n```\n{output[:500]}\n```"
+                    if output else "✅ Session launched."
+                )
+            else:
+                err = stderr.decode().strip()[:500]
+                await message.reply(
+                    f"❌ Spawn failed (exit {proc.returncode}):\n```\n{err}\n```"
+                )
+        except asyncio.TimeoutError:
+            await message.reply("❌ Spawn timed out (30s).")
+        except Exception as e:
+            await message.reply(f"❌ Spawn error: {e}")
+
+    async def _cmd_kill(
+        self, message: discord.Message, args: list[str],
+    ) -> None:
+        """Handle: kill <agent-id>"""
+        if not args:
+            await message.reply("Usage: `kill <agent>`")
+            return
+
+        agent_ref = args[0]
+        agent_id = self._resolve_agent_id(agent_ref)
+        if not agent_id:
+            await message.reply(f"No running session matching `{agent_ref}`.")
+            return
+
+        log.info("Control: kill %s (by %s)", agent_id, message.author.name)
+
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "kill-session", "-t", agent_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode == 0:
+            await message.reply(f"💀 `{agent_id}` killed.")
+        else:
+            await message.reply(f"❌ Failed to kill `{agent_id}` (tmux session not found?).")
+
+    def _resolve_agent_id(self, ref: str) -> str | None:
+        """Resolve a short agent reference to a full agent ID.
+
+        Accepts full IDs (beth-storm-jay) or short names (storm-jay).
+        Matches against running sessions from the registry.
+        """
+        registry = _read_registry(self._config.agent_home)
+        if not registry:
+            return None
+
+        # Exact match
+        if ref in registry:
+            return ref
+
+        # Short name: try prefixing with session_prefix
+        prefix = self._session_prefix
+        full = f"{prefix}{ref}"
+        if full in registry:
+            return full
+
+        # Partial match: find unique match containing ref
+        matches = [aid for aid in registry if ref in aid]
+        if len(matches) == 1:
+            return matches[0]
+
+        return None
 
     # -----------------------------------------------------------------------
     # Branch threads
