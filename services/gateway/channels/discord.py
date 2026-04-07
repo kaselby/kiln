@@ -930,7 +930,7 @@ class _GatewayClient(discord.Client):
 
         # Security challenge intercept — resolve pending challenge if this
         # message is in the security channel from a non-bot user.
-        sc = self._discord_channel._security_challenge_state
+        sc = self._discord_channel._security_challenge_state if self._discord_channel else None
         if sc and str(message.channel.id) == str(sc["channel_id"]):
             self._discord_channel._security_message_ids.append(message.id)
             if not sc["future"].done():
