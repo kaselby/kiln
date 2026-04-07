@@ -739,26 +739,25 @@ class DiscordChannel(Channel):
         embed = discord.Embed(title=title, description=desc, color=color)
         embed.set_footer(text=f"Attempt {attempt}/{max_attempts} · {int(timeout)}s timeout")
 
-        # Set up the future before sending/editing (avoid race)
+        # Set up the future before sending (avoid race)
         future: asyncio.Future[tuple[str, str]] = asyncio.get_event_loop().create_future()
         self._security_challenge_state = {
             "future": future,
             "channel_id": security_ch.id,
         }
 
-        # Reuse existing embed on retries (e.g. used password), post new on first/strike
-        msg = self._security_active_msg
-        if msg and previous_result == "used":
-            # Edit existing embed in place
+        if previous_result == "used" and self._security_active_msg:
+            # Used password — post a plain status message, keep original embed
             try:
-                await msg.edit(embed=embed)
-                log.info("Security challenge: updated existing embed (msg %s)", msg.id)
-            except discord.HTTPException as e:
-                log.warning("Security challenge: failed to edit embed, posting new: %s", e)
-                msg = None  # fall through to post new
-
-        if not msg or previous_result != "used":
-            # Post a new embed
+                status_msg = await security_ch.send(
+                    "\u26a0\ufe0f That password has already been used — try another."
+                )
+                self._security_message_ids.append(status_msg.id)
+            except discord.HTTPException:
+                pass
+            msg = self._security_active_msg
+        else:
+            # Post a new challenge embed (first attempt or after a strike)
             mention_content = self._client._permission_ping_content()
             try:
                 log.info("Security challenge: sending embed to #security (channel %s)", security_ch.id)
@@ -788,15 +787,20 @@ class DiscordChannel(Channel):
         finally:
             self._security_challenge_state = None
 
-        # Update embed to show response received
-        try:
-            embed.color = 0x3498db  # blue — "processing"
-            embed.title = "\U0001f50d Verifying..."
-            await msg.edit(embed=embed)
-        except discord.HTTPException:
-            pass
+        # Return the response message ID so the tool can request deletion
+        # (e.g. for used passwords — don't leave OTP attempts visible)
+        response_msg_id = None
+        for mid in reversed(self._security_message_ids):
+            if mid != msg.id:
+                response_msg_id = mid
+                break
 
-        return {"response": content, "author_id": author_id, "timed_out": False}
+        return {
+            "response": content,
+            "author_id": author_id,
+            "timed_out": False,
+            "response_msg_id": str(response_msg_id) if response_msg_id else None,
+        }
 
     async def security_challenge_cleanup(self) -> dict:
         if not self._client:

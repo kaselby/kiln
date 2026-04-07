@@ -260,11 +260,13 @@ def run_challenge(platform: str, reason: str) -> bool:
             return True
 
         elif pw_result == "used":
+            _delete_response_msg(platform, result)
             previous_result = "used"  # no strike increment — free retry
             print("Used password — not a strike, retrying")
             continue
 
         else:
+            _delete_response_msg(platform, result)
             strikes += 1
             previous_result = "invalid"
             print(f"Wrong password — strike {strikes}")
@@ -284,6 +286,16 @@ def run_challenge(platform: str, reason: str) -> bool:
     _cleanup(platform)
     call_lockdown(f"OTP verification failed on {platform}: {reason_text}")
     return False
+
+
+def _delete_response_msg(platform: str, result: dict) -> None:
+    """Delete the user's password message to avoid leaving OTP attempts visible."""
+    msg_id = result.get("response_msg_id")
+    if msg_id:
+        gateway_api("POST", f"/api/{platform}/delete", {
+            "target": "#security",
+            "message_id": msg_id,
+        })
 
 
 def _cleanup(platform: str) -> None:
