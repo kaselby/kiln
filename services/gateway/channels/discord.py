@@ -103,6 +103,15 @@ class _PermissionView(discord.ui.View):
             )
 
 
+class _DismissView(discord.ui.View):
+    """View with a single Dismiss button that deletes the message."""
+
+    @discord.ui.button(label="Dismiss", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.delete()
+        self.stop()
+
+
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
@@ -882,6 +891,8 @@ class _GatewayClient(discord.Client):
                 await self._cmd_spawn(message, text[len("spawn"):].strip())
             elif cmd == "kill":
                 await self._cmd_kill(message, parts[1:])
+            elif cmd == "show":
+                await self._cmd_show(message, parts[1:])
             elif cmd == "help":
                 await message.reply(
                     "**Commands:**\n"
@@ -889,6 +900,7 @@ class _GatewayClient(discord.Client):
                     "(safe, supervised, yolo)\n"
                     "`spawn [instructions]` — launch a new session\n"
                     "`kill <agent>` — kill a session (immediate)\n"
+                    "`show <agent>` — capture current terminal pane\n"
                     "`help` — this message"
                 )
             else:
@@ -1016,6 +1028,67 @@ class _GatewayClient(discord.Client):
             await message.reply(f"💀 `{agent_id}` killed.")
         else:
             await message.reply(f"❌ Failed to kill `{agent_id}` (tmux session not found?).")
+
+    async def _cmd_show(
+        self, message: discord.Message, args: list[str],
+    ) -> None:
+        """Handle: show <agent-id>"""
+        if not args:
+            await message.reply("Usage: `show <agent>`")
+            return
+
+        agent_ref = args[0]
+        agent_id = self._resolve_agent_id(agent_ref)
+        if not agent_id:
+            await message.reply(f"No running session matching `{agent_ref}`.")
+            return
+
+        # Read mode from session config
+        config_path = (
+            self._config.agent_home / "state" / f"session-config-{agent_id}.yml"
+        )
+        mode = "unknown"
+        if config_path.exists():
+            try:
+                data = yaml.safe_load(config_path.read_text()) or {}
+                mode = data.get("mode", "unknown")
+            except (yaml.YAMLError, OSError):
+                pass
+
+        # Capture the tmux pane (50 lines of scrollback, plain text)
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "capture-pane", "-t", agent_id, "-p", "-S", "-50",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+
+        if proc.returncode != 0:
+            await message.reply(
+                f"❌ Failed to capture `{agent_id}` (tmux session not found?)."
+            )
+            return
+
+        lines = [line.rstrip() for line in stdout.decode(errors="replace").splitlines()]
+        while lines and not lines[-1]:
+            lines.pop()
+
+        header = f"📟 **{agent_id}** | mode: `{mode}`\n"
+        if not lines:
+            await message.reply(f"{header}*(empty pane)*")
+            return
+
+        # Trim from the top to fit within Discord's 2000-char message limit
+        max_content = 2000 - len(header) - len("```\n\n```")
+        content = "\n".join(lines)
+        if len(content) > max_content:
+            content = content[-max_content:]
+            newline_pos = content.find("\n")
+            if newline_pos != -1:
+                content = content[newline_pos + 1:]
+
+        log.info("Control: show %s (by %s)", agent_id, message.author.name)
+        await message.reply(f"{header}```\n{content}\n```", view=_DismissView())
 
     def _resolve_agent_id(self, ref: str) -> str | None:
         """Resolve a short agent reference to a full agent ID.
