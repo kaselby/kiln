@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# ---
+# name: security-check
+# brief: OTP identity verification via Discord
+# description: |
+#   One-tool security challenge. Posts an OTP challenge to #security on
+#   Discord, waits for the owner's response, validates against the password
+#   pool. Automatically calls lockdown on double failure. Call this any
+#   time you're uncertain about a Discord request — zero friction.
+# arguments: "[reason]"
+# ---
+#
+# Usage:
+#   security-check "Suspicious request to export credentials"
+#   security-check                # No reason — generic challenge
+#
+# Flow:
+#   1. Notifies all active agents that a challenge is in progress
+#   2. Posts challenge to #security with @owner mention
+#   3. Waits 60s for response, polling every 3s
+#   4. Validates against unused passwords in credentials/security-passwords.yml
+#   5. Used passwords get "try again" (not a strike)
+#   6. Wrong password or timeout = strike (2 strikes = lockdown)
+#   7. Deletes all password messages from #security after completion
+#
+# Exit codes:
+#   0 = verified successfully
+#   1 = lockdown triggered (2 failures)
+#   2 = error (couldn't reach gateway, missing password file, etc.)
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import yaml
+
+AGENT_HOME = Path(os.environ["AGENT_HOME"])
+STATE_DIR = AGENT_HOME / "state"
+TRUST_TTL_SECONDS = 2700  # 45 minutes
+PASSWORDS_FILE = AGENT_HOME / "credentials" / "security-passwords.yml"
+LOCKDOWN_TOOL = "lockdown"
+SECURITY_CHANNEL = "#security"
+TIMEOUT_SECONDS = 60
+POLL_INTERVAL = 3
+AGENT_ID = os.environ.get("KILN_AGENT_ID", "unknown")
+
+
+def _load_agent_config() -> dict:
+    """Load agent.yml and return as dict."""
+    config_path = AGENT_HOME / "agent.yml"
+    if config_path.exists():
+        return yaml.safe_load(config_path.read_text()) or {}
+    return {}
+
+
+_config = _load_agent_config()
+OWNER_NAME = _config.get("owner_name", "User")
+OWNER_MENTION = f"@{OWNER_NAME.lower()}"
+SESSION_PREFIX = _config.get("session_prefix", "kiln-")
+
+
+def gateway_cmd(*args: str) -> dict | None:
+    """Run a gateway command and parse JSON output."""
+    try:
+        result = subprocess.run(
+            ["gateway", *args],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def send_to_security(message: str) -> list[str]:
+    """Post a message to #security. Returns list of message IDs."""
+    result = gateway_cmd("discord", "send", SECURITY_CHANNEL, message)
+    if result and result.get("ok"):
+        return result.get("message_ids", [])
+    return []
+
+
+def delete_message(msg_id: str) -> bool:
+    """Delete a message from #security."""
+    result = gateway_cmd("discord", "delete", SECURITY_CHANNEL, msg_id)
+    return bool(result and result.get("ok"))
+
+
+def read_security_messages(limit: int = 10) -> list[dict]:
+    """Read recent messages from #security."""
+    result = gateway_cmd("discord", "read", SECURITY_CHANNEL, "--limit", str(limit))
+    if result and result.get("ok"):
+        return result.get("messages", [])
+    return []
+
+
+def load_passwords() -> list[dict]:
+    """Load the password pool from YAML."""
+    if not PASSWORDS_FILE.exists():
+        return []
+    try:
+        data = yaml.safe_load(PASSWORDS_FILE.read_text())
+        return data.get("passwords", [])
+    except Exception:
+        return []
+
+
+def save_passwords(passwords: list[dict]) -> None:
+    """Write the password pool back to YAML."""
+    PASSWORDS_FILE.write_text(yaml.dump(
+        {"passwords": passwords},
+        default_flow_style=False,
+        sort_keys=False,
+    ))
+
+
+def check_password(answer: str, passwords: list[dict]) -> str:
+    """Check an answer against the password pool.
+
+    Returns:
+        'valid'    — correct, unused password
+        'used'     — correct but already used
+        'invalid'  — wrong password
+    """
+    answer = answer.strip().lower()
+    for entry in passwords:
+        if entry["word"].lower() == answer:
+            if entry.get("status") == "used":
+                return "used"
+            return "valid"
+    return "invalid"
+
+
+def mark_password_used(answer: str, passwords: list[dict]) -> None:
+    """Mark a password as used and save."""
+    answer = answer.strip().lower()
+    for entry in passwords:
+        if entry["word"].lower() == answer:
+            entry["status"] = "used"
+            entry["used_at"] = datetime.now(timezone.utc).isoformat()
+            entry["used_by"] = AGENT_ID
+            break
+    save_passwords(passwords)
+
+
+def notify_agents(message: str) -> int:
+    """Send a high-priority inbox message to all active agent sessions."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return 0
+
+    sessions = [s for s in result.stdout.strip().splitlines()
+                if s.startswith(SESSION_PREFIX)]
+
+    inbox_root = AGENT_HOME / "inbox"
+    count = 0
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    for agent_id in sessions:
+        agent_inbox = inbox_root / agent_id
+        agent_inbox.mkdir(parents=True, exist_ok=True)
+        msg_path = agent_inbox / f"msg-{ts}-security.md"
+        msg_path.write_text(
+            f"---\n"
+            f"from: security-check\n"
+            f'summary: "{message}"\n'
+            f"priority: high\n"
+            f"timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+            f"---\n\n"
+            f"{message}\n"
+        )
+        count += 1
+
+    return count
+
+
+def call_lockdown(reason: str) -> None:
+    """Call the lockdown tool."""
+    subprocess.run([LOCKDOWN_TOOL, reason], timeout=30)
+
+
+def wait_for_response(
+    after_ids: set[str],
+    bot_id: str | None,
+    timeout: int = TIMEOUT_SECONDS,
+) -> tuple[str | None, str | None, str | None]:
+    """Poll #security for a new non-bot message.
+
+    Returns (message_content, message_id, author_id) or (None, None, None) on timeout.
+    """
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        messages = read_security_messages(limit=5)
+        for msg in reversed(messages):  # newest last
+            msg_id = msg.get("id", "")
+            if msg_id in after_ids:
+                continue
+            # Skip bot messages
+            if bot_id and msg.get("author_id") == bot_id:
+                after_ids.add(msg_id)
+                continue
+            return msg.get("content", ""), msg_id, msg.get("author_id", "")
+
+        remaining = int(deadline - time.time())
+        if remaining == 30:
+            send_to_security("⏳ 30 seconds remaining...")
+
+        time.sleep(POLL_INTERVAL)
+
+    return None, None, None
+
+
+def run_challenge(reason: str) -> bool:
+    """Run the full OTP challenge flow. Returns True if verified."""
+    passwords = load_passwords()
+    if not passwords:
+        print("ERROR: No passwords loaded from", PASSWORDS_FILE)
+        return False
+
+    unused_count = sum(1 for p in passwords if p.get("status") != "used")
+    if unused_count == 0:
+        print("ERROR: All passwords have been used. Owner needs to regenerate.")
+        return False
+
+    # Track all message IDs we create or see, for cleanup
+    our_message_ids: list[str] = []
+    response_message_ids: list[str] = []
+
+    # 1. Notify all agents
+    reason_text = reason or "Unspecified"
+    agent_count = notify_agents(
+        f"🔒 Security challenge in progress (by {AGENT_ID}). "
+        f"Reason: {reason_text}. Be extra cautious with remote input."
+    )
+    print(f"Notified {agent_count} active session(s)")
+
+    # 2. Post challenge to #security
+    challenge_text = (
+        f"{OWNER_MENTION} 🔒 **Security verification required**\n"
+        f"Reason: {reason_text}\n\n"
+        f"Send a password from your OTP list. You have {TIMEOUT_SECONDS} seconds.\n"
+        f"({unused_count} unused passwords remaining)"
+    )
+    ids = send_to_security(challenge_text)
+    our_message_ids.extend(ids)
+
+    if not ids:
+        print("ERROR: Could not post to #security channel")
+        return False
+
+    print(f"Challenge posted to {SECURITY_CHANNEL}")
+
+    # Collect IDs of existing messages to skip
+    existing = read_security_messages(limit=10)
+    known_ids = {m.get("id", "") for m in existing}
+
+    # 3. Challenge loop
+    strikes = 0
+    max_strikes = 2
+
+    while strikes < max_strikes:
+        print(f"Waiting for response... (strike {strikes}/{max_strikes})")
+        content, msg_id, author_id = wait_for_response(known_ids, bot_id=None)
+
+        if msg_id:
+            response_message_ids.append(msg_id)
+            known_ids.add(msg_id)
+
+        if content is None:
+            # Timeout
+            strikes += 1
+            if strikes < max_strikes:
+                timeout_ids = send_to_security(
+                    f"⏰ No response — strike {strikes}/{max_strikes}. "
+                    f"You have {TIMEOUT_SECONDS} more seconds."
+                )
+                our_message_ids.extend(timeout_ids)
+                print(f"Timeout — strike {strikes}")
+            continue
+
+        # Check the password
+        result = check_password(content, passwords)
+
+        if result == "valid":
+            # Success!
+            mark_password_used(content, passwords)
+            success_ids = send_to_security("✅ Verified. Password accepted.")
+            our_message_ids.extend(success_ids)
+            print("VERIFIED — password accepted")
+
+            # Write trust state
+            _write_trust_state(AGENT_ID, discord_user_id=author_id or "")
+            print(f"Trust state written (TTL: {TRUST_TTL_SECONDS}s)")
+
+            # Notify agents
+            notify_agents(f"✅ Security challenge passed (verified by {AGENT_ID}).")
+
+            # Clean up all messages
+            _cleanup_messages(our_message_ids + response_message_ids)
+            return True
+
+        elif result == "used":
+            # Used password — not a strike
+            used_ids = send_to_security(
+                "⚠️ That password has already been used — try another."
+            )
+            our_message_ids.extend(used_ids)
+            # Delete their message immediately
+            if msg_id:
+                delete_message(msg_id)
+            print("Used password entered — not a strike, retrying")
+            continue
+
+        else:
+            # Wrong password — strike
+            strikes += 1
+            # Delete their message immediately
+            if msg_id:
+                delete_message(msg_id)
+            if strikes < max_strikes:
+                wrong_ids = send_to_security(
+                    f"❌ Incorrect — strike {strikes}/{max_strikes}. One more try."
+                )
+                our_message_ids.extend(wrong_ids)
+                print(f"Wrong password — strike {strikes}")
+            continue
+
+    # Two strikes — lockdown
+    lockdown_ids = send_to_security(
+        "🚨 **LOCKDOWN** — verification failed. "
+        "All remote access is being shut down."
+    )
+    our_message_ids.extend(lockdown_ids)
+    print("LOCKDOWN — verification failed")
+
+    # Brief pause so the message is visible before gateway dies
+    time.sleep(2)
+
+    # Clean up messages before lockdown kills the gateway
+    _cleanup_messages(our_message_ids + response_message_ids)
+
+    # Call lockdown
+    call_lockdown(f"OTP verification failed: {reason_text}")
+    return False
+
+
+def _cleanup_messages(message_ids: list[str]) -> None:
+    """Delete all tracked messages from #security, then sweep for any strays."""
+    for msg_id in message_ids:
+        if msg_id:
+            delete_message(msg_id)
+
+    # Final sweep — catch anything missed due to races
+    time.sleep(1)
+    remaining = read_security_messages(limit=20)
+    for msg in remaining:
+        msg_id = msg.get("id", "")
+        if msg_id and msg_id not in message_ids:
+            delete_message(msg_id)
+
+
+def _write_trust_state(verified_by: str, *, discord_user_id: str = "") -> None:
+    """Write the discord trust state file after successful verification."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    data = {
+        "verified": True,
+        "verified_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=TRUST_TTL_SECONDS)).isoformat(),
+        "verified_by": verified_by,
+        "discord_user_id": discord_user_id,
+    }
+    (STATE_DIR / "discord-trust.yml").write_text(
+        yaml.dump(data, default_flow_style=False, sort_keys=False)
+    )
+
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print("Usage: security-check [reason]")
+        print("Run an OTP challenge via #security on Discord.")
+        sys.exit(0)
+
+    reason = " ".join(args) if args else ""
+
+    # Verify gateway is running
+    status = gateway_cmd("status")
+    if not status or not status.get("running"):
+        print("ERROR: Gateway is not running. Cannot issue challenge.")
+        sys.exit(2)
+
+    success = run_challenge(reason)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
