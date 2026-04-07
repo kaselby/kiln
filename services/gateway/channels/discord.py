@@ -563,11 +563,11 @@ class DiscordChannel(Channel):
         timeout: float = 300,
     ) -> dict:
         if not self._client:
-            return {"approved": False, "timed_out": False, "responder": ""}
+            return {"error": "not connected"}
 
         thread_id = self._client._branch_threads.get(agent_id)
         if not thread_id:
-            return {"approved": False, "timed_out": False, "responder": ""}
+            return {"error": f"no branch thread for {agent_id}"}
 
         try:
             thread = self._client.get_channel(thread_id)
@@ -575,7 +575,7 @@ class DiscordChannel(Channel):
                 thread = await self._client.fetch_channel(thread_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.error("Failed to get branch thread for %s: %s", agent_id, e)
-            return {"approved": False, "timed_out": False, "responder": ""}
+            return {"error": f"branch thread inaccessible: {e}"}
 
         # Severity-based coloring
         color = 0xe74c3c if severity == "warn" else 0x3498db  # red or blue
