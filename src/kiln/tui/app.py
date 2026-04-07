@@ -1172,13 +1172,20 @@ class KilnApp:
         self._receiving = True
 
         try:
-            # Inject timestamp so the agent has time awareness
+            # Inject timestamp + source header so the agent has time and source awareness
             ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            # Prepend resume indicator to the first user-typed message of a resumed session.
-            # This ensures the agent knows it's resuming without auto-firing a round-trip.
             if self._resume_indicator_pending and source == "user":
                 self._resume_indicator_pending = False
-                stamped = f"[{ts}] [Resumed session]\n{text}"
+                stamped = f"[{ts} | TERMINAL MESSAGE | trust: always ✓ | Resumed session]\n{text}"
+            elif source == "user":
+                stamped = f"[{ts} | TERMINAL MESSAGE | trust: always ✓]\n{text}"
+            elif source == "agent":
+                # Agent/gateway messages build their own [header] in _deliver_agent_message
+                # — just prepend the injection timestamp into the existing bracket
+                if text.startswith("["):
+                    stamped = f"[{ts} | {text[1:]}"
+                else:
+                    stamped = f"[{ts}]\n{text}"
             else:
                 stamped = f"[{ts}]\n{text}"
             await self._harness.send(stamped)
@@ -1326,19 +1333,19 @@ class KilnApp:
         marker = msg_path.with_suffix(".read")
         marker.touch()  # write early to prevent concurrent re-queue; removed on failure
 
-        source = format_message_source(msg)
+        header = format_message_source(msg)
         summary = msg.get("summary", "")
         body = msg.get("body", "")
 
-        _tprint("\n<agent-msg-b>\U0001f4e8 {}:</agent-msg-b>", source)
-        if summary:
+        _tprint("\n<agent-msg-b>\U0001f4e8 {}:</agent-msg-b>", header)
+        if summary and (not body or summary not in body):
             _tprint("<agent-msg>{}</agent-msg>", summary)
-        if body and body != summary:
+        if body:
             display_body = body if len(body) < 2000 else body[:2000] + "\n... (truncated)"
             _tprint("<agent-msg>{}</agent-msg>", display_body)
 
         model_text = body or summary
-        formatted = f"[Message from {source}]\n{model_text}"
+        formatted = f"[{header}]\n{model_text}"
 
         if len(model_text) < 200:
             cooldown = 5.0

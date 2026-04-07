@@ -59,8 +59,8 @@ def create_inbox_check_hook(inbox_path: Path, ui_events: list[dict] | None = Non
             # Extract sender and channel from frontmatter
             parsed = parse_message(msg_file)
             if parsed:
-                source = format_message_source(parsed)
-                ping = f"[Notification] Message from {source} — {msg_file}"
+                header = format_message_source(parsed)
+                ping = f"[Notification | {header}]\n{msg_file}"
                 summaries.append(ping)
                 _injected.add(path_str)
                 read_marker.touch()  # prevent watcher re-delivery
@@ -572,24 +572,70 @@ def parse_message(msg_file: Path) -> dict | None:
         return result
 
     for line in lines[1:fm_end]:
-        if line.startswith("from:"):
-            result["from"] = line[len("from:"):].strip().strip('"').strip("'")
-        elif line.startswith("summary:"):
-            result["summary"] = line[len("summary:"):].strip().strip('"').strip("'")
-        elif line.startswith("priority:"):
-            result["priority"] = line[len("priority:"):].strip().strip('"').strip("'")
-        elif line.startswith("channel:"):
-            result["channel"] = line[len("channel:"):].strip().strip('"').strip("'")
+        key_val = line.split(":", 1)
+        if len(key_val) != 2:
+            continue
+        key = key_val[0].strip()
+        val = key_val[1].strip().strip('"').strip("'")
+        if key in ("from", "summary", "priority", "channel", "source", "trust", "timestamp"):
+            result[key] = val
 
     result["body"] = "\n".join(lines[fm_end + 1:]).strip()
     return result
 
 
 def format_message_source(msg: dict) -> str:
-    """Format a parsed message's source as 'sender in channel' or just 'sender'."""
+    """Build a structured message header from parsed message metadata.
+
+    Returns the inner content of the header bracket (caller wraps with timestamp
+    or 'Notification' prefix). Examples:
+        GATEWAY MESSAGE from kira | discord #dm | trust: verified ✓ | sent 10:12:03
+        AGENT MESSAGE from beth-frost-owl | #design-review | sent 10:20:01
+        AGENT MESSAGE from beth-frost-owl | sent 10:20:01
+    """
+    source = msg.get("source", "")
     sender = msg.get("from") or "unknown"
     channel = msg.get("channel", "")
-    return f"{sender} in {channel}" if channel else sender
+    trust = msg.get("trust", "")
+    timestamp = msg.get("timestamp", "")
+
+    # Determine message type and strip platform prefix from sender
+    if source and source not in ("kiln", "agent"):
+        # Gateway message (discord, slack, etc.)
+        msg_type = "GATEWAY MESSAGE"
+        # Strip platform prefix from sender name (e.g. "discord-kira" -> "kira")
+        if sender.startswith(f"{source}-"):
+            sender = sender[len(source) + 1:]
+        parts = [f"{msg_type} from {sender}"]
+        # Platform + channel (e.g. "discord #dm")
+        if channel:
+            ch = f"#{channel}" if not channel.startswith("#") else channel
+            parts.append(f"{source} {ch}")
+        else:
+            parts.append(source)
+        # Trust level — only "verified" means a security check passed recently
+        if trust == "verified":
+            parts.append("trust: verified ✓")
+        else:
+            parts.append("trust: unverified ⚠")
+    else:
+        # Agent message
+        msg_type = "AGENT MESSAGE"
+        parts = [f"{msg_type} from {sender}"]
+        if channel:
+            parts.append(f"#{channel}" if not channel.startswith("#") else channel)
+
+    # Original send time (short format)
+    if timestamp:
+        try:
+            # Handle ISO format — extract just the time portion
+            time_part = timestamp.split("T")[-1] if "T" in timestamp else timestamp
+            short_time = time_part[:8]  # HH:MM:SS
+            parts.append(f"sent {short_time}")
+        except (ValueError, IndexError):
+            pass
+
+    return " | ".join(parts)
 
 
 def wrap_hook_visibility(hook_fn, name: str, ui_events: list[dict]):
