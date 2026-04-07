@@ -3,10 +3,10 @@
 # name: security-check
 # brief: OTP identity verification via gateway platform
 # description: |
-#   Security challenge via any gateway backend. Posts a challenge through
-#   the platform's security_challenge endpoint, validates responses against
-#   the local OTP password pool. Two strikes trigger lockdown.
-#   Call this any time you're uncertain about a remote request.
+#   Security challenge via any gateway backend. Sends the OTP password pool
+#   to the gateway, which handles the full interactive challenge flow
+#   (posting, waiting, validating, retrying). The tool handles consequences:
+#   marking passwords used, writing trust state, triggering lockdown.
 # arguments: "<platform> [reason]"
 # ---
 #
@@ -16,12 +16,11 @@
 #   security-check slack "Unknown user"
 #
 # Flow:
-#   1. Notifies all active agents that a challenge is in progress
-#   2. Calls the gateway's security_challenge endpoint for the platform
-#   3. Validates response against unused passwords in credentials/security-passwords.yml
-#   4. Used passwords get "try again" (not a strike)
-#   5. Wrong password or timeout = strike (2 strikes = lockdown)
-#   6. Calls the gateway's security_cleanup endpoint on completion
+#   1. Loads password pool and validates unused passwords exist
+#   2. Notifies all active agents that a challenge is in progress
+#   3. Sends one request to gateway — gateway handles the full UX loop
+#   4. On success: marks password used, writes per-platform trust state
+#   5. On failure: notifies agents, triggers lockdown
 #
 # Exit codes:
 #   0 = verified successfully
@@ -59,9 +58,8 @@ _config = _load_agent_config()
 SESSION_PREFIX = _config.get("session_prefix", "kiln-")
 
 
-def gateway_api(method: str, path: str, body: dict | None = None) -> dict | None:
-    """Call the gateway HTTP API directly."""
-    # Read gateway state to find port
+def gateway_api(method: str, path: str, body: dict | None = None,
+                timeout: float = 30) -> dict | None:
     state_file = AGENT_HOME / "state" / "gateway.json"
     if not state_file.exists():
         return None
@@ -79,7 +77,7 @@ def gateway_api(method: str, path: str, body: dict | None = None) -> dict | None
 
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS + 15) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except Exception:
         return None
@@ -101,16 +99,6 @@ def save_passwords(passwords: list[dict]) -> None:
         default_flow_style=False,
         sort_keys=False,
     ))
-
-
-def check_password(answer: str, passwords: list[dict]) -> str:
-    answer = answer.strip().lower()
-    for entry in passwords:
-        if entry["word"].lower() == answer:
-            if entry.get("status") == "used":
-                return "used"
-            return "valid"
-    return "invalid"
 
 
 def mark_password_used(answer: str, passwords: list[dict]) -> None:
@@ -180,7 +168,6 @@ def call_lockdown(reason: str) -> None:
 
 
 def run_challenge(platform: str, reason: str) -> bool:
-    """Run the full OTP challenge flow. Returns True if verified."""
     passwords = load_passwords()
     if not passwords:
         print("ERROR: No passwords loaded from", PASSWORDS_FILE)
@@ -191,20 +178,6 @@ def run_challenge(platform: str, reason: str) -> bool:
         print("ERROR: All passwords have been used. Owner needs to regenerate.")
         return False
 
-    # Check platform supports security challenges
-    status = gateway_api("GET", "/api/status")
-    if not status or not status.get("running"):
-        print("ERROR: Gateway is not running.")
-        return False
-    platform_info = status.get("channels", {}).get(platform)
-    if not platform_info:
-        print(f"ERROR: Platform '{platform}' is not connected.")
-        return False
-    if "security_challenge" not in platform_info.get("capabilities", []):
-        print(f"ERROR: Platform '{platform}' does not support security challenges.")
-        return False
-
-    # Notify agents
     reason_text = reason or "Unspecified"
     agent_count = notify_agents(
         f"\U0001f512 Security challenge in progress on {platform} (by {AGENT_ID}). "
@@ -212,95 +185,54 @@ def run_challenge(platform: str, reason: str) -> bool:
     )
     print(f"Notified {agent_count} active session(s)")
 
-    strikes = 0
-    previous_result = None
+    # Single call — gateway handles the full interactive flow.
+    # Timeout: worst case is max_attempts * per-attempt timeout + overhead.
+    http_timeout = MAX_STRIKES * TIMEOUT_SECONDS + 30
+    print(f"Challenge started on {platform} — waiting for gateway response...")
 
-    while strikes < MAX_STRIKES:
-        print(f"Challenge (strikes: {strikes}/{MAX_STRIKES}) — waiting up to {TIMEOUT_SECONDS}s for response...")
+    result = gateway_api("POST", f"/api/{platform}/security/challenge", {
+        "reason": reason_text,
+        "timeout": TIMEOUT_SECONDS,
+        "max_attempts": MAX_STRIKES,
+        "passwords": passwords,
+    }, timeout=http_timeout)
 
-        # Call the gateway's security challenge endpoint
-        # attempt = strikes + 1 (used-password retries don't count)
-        result = gateway_api("POST", f"/api/{platform}/security/challenge", {
-            "reason": reason_text,
-            "timeout": TIMEOUT_SECONDS,
-            "attempt": strikes + 1,
-            "max_attempts": MAX_STRIKES,
-            "previous_result": previous_result,
-        })
+    if not result or not result.get("ok"):
+        error = (result or {}).get("error", "unknown error")
+        print(f"ERROR: Challenge failed: {error}")
+        return False
 
-        if not result or not result.get("ok"):
-            error = (result or {}).get("error", "unknown error")
-            print(f"ERROR: Challenge endpoint failed: {error}")
-            _cleanup(platform)
-            return False
+    challenge_result = result.get("result")
 
-        if result.get("timed_out"):
-            strikes += 1
-            previous_result = "timeout"
-            print(f"Timeout — strike {strikes}")
-            if strikes >= MAX_STRIKES:
-                break
-            continue
-
-        response = result.get("response", "")
+    if challenge_result == "verified":
+        password_used = result.get("password", "")
         author_id = result.get("author_id", "")
 
-        # Validate OTP
-        pw_result = check_password(response, passwords)
+        mark_password_used(password_used, passwords)
+        print("VERIFIED — password accepted")
 
-        if pw_result == "valid":
-            mark_password_used(response, passwords)
-            print("VERIFIED — password accepted")
+        write_trust_state(platform, platform_user_id=author_id)
+        print(f"Trust state written for {platform} (TTL: {TRUST_TTL_SECONDS}s)")
 
-            write_trust_state(platform, platform_user_id=author_id)
-            print(f"Trust state written for {platform} (TTL: {TRUST_TTL_SECONDS}s)")
+        notify_agents(
+            f"\u2705 Security challenge passed on {platform} (verified by {AGENT_ID})."
+        )
+        return True
 
-            notify_agents(f"\u2705 Security challenge passed on {platform} (verified by {AGENT_ID}).")
-            _cleanup(platform)
-            return True
+    elif challenge_result == "failed":
+        strikes = result.get("strikes", MAX_STRIKES)
+        print(f"LOCKDOWN — {strikes} strikes on {platform}")
+        notify_agents(
+            f"\U0001f6a8 LOCKDOWN — security verification failed on {platform}. "
+            f"Reason: {reason_text}"
+        )
+        call_lockdown(f"OTP verification failed on {platform}: {reason_text}")
+        return False
 
-        elif pw_result == "used":
-            _delete_response_msg(platform, result)
-            previous_result = "used"  # no strike increment — free retry
-            print("Used password — not a strike, retrying")
-            continue
-
-        else:
-            _delete_response_msg(platform, result)
-            strikes += 1
-            previous_result = "invalid"
-            print(f"Wrong password — strike {strikes}")
-            if strikes >= MAX_STRIKES:
-                break
-            continue
-
-    # Lockdown
-    print(f"LOCKDOWN — {strikes} strikes on {platform}")
-    notify_agents(
-        f"\U0001f6a8 LOCKDOWN — security verification failed on {platform}. "
-        f"Reason: {reason_text}"
-    )
-
-    # Brief pause so any platform messages are visible before gateway dies
-    time.sleep(2)
-    _cleanup(platform)
-    call_lockdown(f"OTP verification failed on {platform}: {reason_text}")
-    return False
-
-
-def _delete_response_msg(platform: str, result: dict) -> None:
-    """Delete the user's password message to avoid leaving OTP attempts visible."""
-    msg_id = result.get("response_msg_id")
-    if msg_id:
-        gateway_api("POST", f"/api/{platform}/delete", {
-            "target": "#security",
-            "message_id": msg_id,
-        })
-
-
-def _cleanup(platform: str) -> None:
-    """Call the gateway's cleanup endpoint to remove challenge messages."""
-    gateway_api("POST", f"/api/{platform}/security/cleanup", {})
+    else:
+        error = result.get("error", "unknown")
+        print(f"ERROR: {error}")
+        return False
 
 
 def main():
@@ -322,7 +254,6 @@ def main():
     platform = args[0]
     reason = " ".join(args[1:]) if len(args) > 1 else ""
 
-    # Check gateway is running
     status = gateway_api("GET", "/api/status")
     if not status or not status.get("running"):
         print("ERROR: Gateway is not running. Cannot issue challenge.")

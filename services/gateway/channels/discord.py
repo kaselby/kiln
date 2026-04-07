@@ -387,8 +387,6 @@ class DiscordChannel(Channel):
         self._ready = asyncio.Event()
         self._pending_permissions: dict[str, dict] = {}  # agent_id -> {future, message, embed}
         self._security_challenge_state: dict | None = None  # pending challenge state
-        self._security_message_ids: list[int] = []  # accumulated msg IDs for cleanup
-        self._security_active_msg: discord.Message | None = None  # current challenge embed
 
     async def connect(self) -> None:
         token = self._config.load_credential("DISCORD_BOT_TOKEN")
@@ -696,145 +694,156 @@ class DiscordChannel(Channel):
 
     # --- Security challenge ---
 
+    @staticmethod
+    def _check_password(answer: str, passwords: list[dict]) -> str:
+        answer = answer.strip().lower()
+        for entry in passwords:
+            if entry["word"].lower() == answer:
+                if entry.get("status") == "used":
+                    return "used"
+                return "valid"
+        return "invalid"
+
+    def _build_owner_mentions(self) -> str | None:
+        mentions = []
+        for uid, entry in self._discord_config.users.items():
+            trust = entry.get("max_trust") or entry.get("trust")
+            if trust == "full":
+                mentions.append(f"<@{uid}>")
+        return " ".join(mentions) if mentions else None
+
     async def security_challenge(
         self, reason: str, *,
         timeout: float = 60,
-        attempt: int = 1,
         max_attempts: int = 2,
-        previous_result: str | None = None,
+        passwords: list[dict],
     ) -> dict:
         if not self._client:
-            return {"response": None, "author_id": "", "timed_out": False,
-                    "error": "not connected"}
+            return {"result": "error", "error": "not connected"}
 
-        # Resolve security channel — config key, then fallback to name
         security_ch = await self._resolve_target("#security")
         if not security_ch:
-            return {"response": None, "author_id": "", "timed_out": False,
-                    "error": "no #security channel found"}
+            return {"result": "error", "error": "no #security channel found"}
 
-        # Build the challenge embed
-        if attempt == 1:
-            color = 0xf39c12  # orange
-            title = "\U0001f512 Security Verification Required"
-            desc = f"**Reason:** {reason or 'Unspecified'}\n\nSend a password from your OTP list."
-        else:
-            if previous_result == "timeout":
-                color = 0xe74c3c  # red
-                title = f"\u23f0 No Response — Strike {attempt - 1}/{max_attempts}"
-                desc = f"**Reason:** {reason or 'Unspecified'}\n\nTry again — send a password."
-            elif previous_result == "invalid":
-                color = 0xe74c3c
-                title = f"\u274c Wrong Password — Strike {attempt - 1}/{max_attempts}"
-                desc = f"**Reason:** {reason or 'Unspecified'}\n\nTry again — send a password."
-            elif previous_result == "used":
-                color = 0xf39c12
-                title = "\u26a0\ufe0f Password Already Used"
-                desc = f"**Reason:** {reason or 'Unspecified'}\n\nThat one's been used — send a different password."
-            else:
-                color = 0xf39c12
-                title = "\U0001f512 Security Verification — Retry"
-                desc = f"**Reason:** {reason or 'Unspecified'}\n\nSend a password from your OTP list."
+        reason_text = reason or "Unspecified"
+        unused = sum(1 for p in passwords if p.get("status") != "used")
+        strikes = 0
+        # Track all message IDs (ours + user's) for cleanup
+        message_ids: list[int] = []
 
-        embed = discord.Embed(title=title, description=desc, color=color)
-        embed.set_footer(text=f"Attempt {attempt}/{max_attempts} · {int(timeout)}s timeout")
-
-        # Set up the future before sending (avoid race)
-        future: asyncio.Future[tuple[str, str]] = asyncio.get_event_loop().create_future()
-        self._security_challenge_state = {
-            "future": future,
-            "channel_id": security_ch.id,
-        }
-
-        if previous_result == "used" and self._security_active_msg:
-            # Used password — post a plain status message, keep original embed
+        async def _send(text: str) -> None:
             try:
-                status_msg = await security_ch.send(
-                    "\u26a0\ufe0f That password has already been used — try another."
-                )
-                self._security_message_ids.append(status_msg.id)
+                msg = await security_ch.send(text)
+                message_ids.append(msg.id)
             except discord.HTTPException:
                 pass
-            msg = self._security_active_msg
-        else:
-            # Post a new challenge embed (first attempt or after a strike)
-            # Always mention full-trust users for security challenges
-            # (unlike permission pings, which skip when owner is at terminal)
-            mentions = []
-            for uid, entry in self._discord_config.users.items():
-                trust = entry.get("max_trust") or entry.get("trust")
-                if trust == "full":
-                    mentions.append(f"<@{uid}>")
-            mention_content = " ".join(mentions) if mentions else None
+
+        async def _delete_msg(msg_id: int) -> None:
             try:
-                log.info("Security challenge: sending embed to #security (channel %s)", security_ch.id)
-                msg = await security_ch.send(content=mention_content, embed=embed)
-                self._security_message_ids.append(msg.id)
-                self._security_active_msg = msg
-                log.info("Security challenge: embed sent (msg %s), waiting for response (timeout=%ds)",
-                         msg.id, int(timeout))
-            except (discord.Forbidden, discord.HTTPException) as e:
+                await security_ch.get_partial_message(msg_id).delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        async def _wait_for_response() -> tuple[str, str, int] | None:
+            future: asyncio.Future[tuple[str, str, int]] = (
+                asyncio.get_event_loop().create_future()
+            )
+            self._security_challenge_state = {
+                "future": future,
+                "channel_id": security_ch.id,
+                "message_ids": message_ids,
+            }
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+            finally:
                 self._security_challenge_state = None
-                log.error("Security challenge: failed to send embed: %s", e)
-                return {"response": None, "author_id": "", "timed_out": False,
-                        "error": f"failed to send challenge: {e}"}
 
-        # Wait for response
+        async def _cleanup() -> None:
+            for mid in message_ids:
+                await _delete_msg(mid)
+            log.info("Security challenge cleanup: %d message(s)", len(message_ids))
+
+        # --- Challenge flow (matches original tool logic) ---
+
+        # Post challenge with @mention
+        mention = self._build_owner_mentions()
+        prefix = f"{mention}\n" if mention else ""
         try:
-            content, author_id = await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                embed.color = 0x95a5a6
-                embed.title = "\u23f0 Timed Out"
-                await msg.edit(embed=embed)
-            except discord.HTTPException:
-                pass
-            self._security_active_msg = None
-            return {"response": None, "author_id": "", "timed_out": True}
-        finally:
-            self._security_challenge_state = None
+            challenge_msg = await security_ch.send(
+                f"{prefix}\U0001f512 **Security verification required**\n"
+                f"Reason: {reason_text}\n\n"
+                f"Send a password from your OTP list. "
+                f"You have {int(timeout)} seconds.\n"
+                f"({unused} unused passwords remaining)"
+            )
+            message_ids.append(challenge_msg.id)
+            log.info("Security challenge: posted to #security (msg %s)",
+                     challenge_msg.id)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.error("Security challenge: failed to send: %s", e)
+            return {"result": "error", "error": f"failed to send: {e}"}
 
-        # Return the response message ID so the tool can request deletion
-        # (e.g. for used passwords — don't leave OTP attempts visible)
-        response_msg_id = None
-        for mid in reversed(self._security_message_ids):
-            if mid != msg.id:
-                response_msg_id = mid
-                break
+        while strikes < max_attempts:
+            result = await _wait_for_response()
 
-        return {
-            "response": content,
-            "author_id": author_id,
-            "timed_out": False,
-            "response_msg_id": str(response_msg_id) if response_msg_id else None,
-        }
+            if result is None:
+                # Timeout
+                strikes += 1
+                log.info("Security challenge: timeout — strike %d/%d",
+                         strikes, max_attempts)
+                if strikes < max_attempts:
+                    await _send(
+                        f"\u23f0 No response — strike {strikes}/{max_attempts}. "
+                        f"You have {int(timeout)} more seconds."
+                    )
+                continue
 
-    async def security_challenge_cleanup(self) -> dict:
-        if not self._client:
-            return {"ok": False, "error": "not connected"}
+            content, author_id, response_msg_id = result
+            pw_result = self._check_password(content, passwords)
 
-        security_ch = await self._resolve_target("#security")
-        if not security_ch:
-            self._security_message_ids.clear()
-            return {"ok": False, "error": "no #security channel found"}
+            if pw_result == "valid":
+                log.info("Security challenge: password accepted")
+                await _send("\u2705 Verified. Password accepted.")
+                await _cleanup()
+                return {
+                    "result": "verified",
+                    "password": content.strip().lower(),
+                    "author_id": author_id,
+                }
 
-        deleted = 0
-        log.info("Security cleanup: %d message ID(s) to delete: %s",
-                 len(self._security_message_ids), self._security_message_ids)
-        for msg_id in self._security_message_ids:
-            try:
-                msg = await security_ch.fetch_message(msg_id)
-                await msg.delete()
-                deleted += 1
-                log.info("Security cleanup: deleted message %s", msg_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                log.warning("Security cleanup: failed to delete %s: %s", msg_id, e)
+            elif pw_result == "used":
+                log.info("Security challenge: used password — free retry")
+                await _send(
+                    "\u26a0\ufe0f That password has already been used "
+                    "— try another."
+                )
+                await _delete_msg(response_msg_id)
+                continue
 
-        self._security_message_ids.clear()
-        self._security_challenge_state = None
-        self._security_active_msg = None
-        log.info("Security challenge cleanup: deleted %d message(s)", deleted)
-        return {"ok": True, "deleted": deleted}
+            else:
+                # Wrong password
+                strikes += 1
+                log.info("Security challenge: wrong password — strike %d/%d",
+                         strikes, max_attempts)
+                await _delete_msg(response_msg_id)
+                if strikes < max_attempts:
+                    await _send(
+                        f"\u274c Incorrect — strike {strikes}/{max_attempts}. "
+                        f"One more try."
+                    )
+                continue
+
+        # Lockdown
+        log.info("Security challenge: %d strikes — failed", strikes)
+        await _send(
+            "\U0001f6a8 **LOCKDOWN** — verification failed. "
+            "All remote access is being shut down."
+        )
+        await asyncio.sleep(2)
+        await _cleanup()
+        return {"result": "failed", "strikes": strikes}
 
     # --- Internal helpers ---
 
@@ -964,9 +973,9 @@ class _GatewayClient(discord.Client):
         # message is in the security channel from a non-bot user.
         sc = self._discord_channel._security_challenge_state if self._discord_channel else None
         if sc and str(message.channel.id) == str(sc["channel_id"]):
-            self._discord_channel._security_message_ids.append(message.id)
+            sc["message_ids"].append(message.id)
             if not sc["future"].done():
-                sc["future"].set_result((message.content, sender_id))
+                sc["future"].set_result((message.content, sender_id, message.id))
             return  # consumed — don't route normally
 
         # Access control

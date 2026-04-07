@@ -116,7 +116,6 @@ class GatewayDaemon:
         app.router.add_post("/api/permission/request", self._handle_permission_request)
         app.router.add_post("/api/permission/resolve", self._handle_permission_resolve)
         app.router.add_post("/api/{platform}/security/challenge", self._handle_security_challenge)
-        app.router.add_post("/api/{platform}/security/cleanup", self._handle_security_cleanup)
         return app
 
     def _get_channel(self, platform: str) -> Channel | None:
@@ -509,7 +508,7 @@ class GatewayDaemon:
         return web.json_response(result)
 
     async def _handle_security_challenge(self, request: web.Request) -> web.Response:
-        """Post a security challenge and wait for a response."""
+        """Run a full security challenge flow on a platform."""
         platform = request.match_info["platform"]
         channel = self._get_channel(platform)
         if not channel:
@@ -531,37 +530,22 @@ class GatewayDaemon:
 
         reason = body.get("reason", "")
         timeout = body.get("timeout", 60)
-        attempt = body.get("attempt", 1)
         max_attempts = body.get("max_attempts", 2)
-        previous_result = body.get("previous_result")
+        passwords = body.get("passwords", [])
 
-        log.info("Security challenge on %s: reason=%s attempt=%d", platform, reason, attempt)
+        if not passwords:
+            return web.json_response(
+                {"ok": False, "error": "No passwords provided"}, status=400,
+            )
+
+        log.info("Security challenge on %s: reason=%s max_attempts=%d",
+                 platform, reason, max_attempts)
         result = await channel.security_challenge(
-            reason, timeout=timeout, attempt=attempt,
-            max_attempts=max_attempts, previous_result=previous_result,
+            reason, timeout=timeout, max_attempts=max_attempts,
+            passwords=passwords,
         )
-        log.info("Security challenge result on %s: timed_out=%s has_response=%s",
-                 platform, result.get("timed_out"), result.get("response") is not None)
+        log.info("Security challenge result on %s: %s", platform, result.get("result"))
         return web.json_response({"ok": True, **result})
-
-    async def _handle_security_cleanup(self, request: web.Request) -> web.Response:
-        """Clean up messages from a security challenge flow."""
-        platform = request.match_info["platform"]
-        channel = self._get_channel(platform)
-        if not channel:
-            return web.json_response(
-                {"ok": False, "error": f"Platform '{platform}' not connected"},
-                status=404,
-            )
-
-        if "security_challenge" not in channel.capabilities():
-            return web.json_response(
-                {"ok": False, "error": f"Platform '{platform}' does not support security challenges"},
-                status=501,
-            )
-
-        result = await channel.security_challenge_cleanup()
-        return web.json_response(result)
 
 
 # ---------------------------------------------------------------------------

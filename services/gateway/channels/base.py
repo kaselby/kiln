@@ -115,44 +115,28 @@ class Channel(ABC):
     async def security_challenge(
         self, reason: str, *,
         timeout: float = 60,
-        attempt: int = 1,
         max_attempts: int = 2,
-        previous_result: str | None = None,
+        passwords: list[dict],
     ) -> dict:
-        """Post a security challenge and wait for a human response.
+        """Run a full OTP security challenge flow.
 
-        Platform-specific implementation of the challenge/response UX.
-        The caller (security-check tool) handles OTP validation, strike
-        counting, trust state, and lockdown — this method only handles
-        the messaging flow.
+        Handles the entire interactive loop: post challenge, wait for
+        responses, validate against the password pool, handle retries,
+        and clean up all messages before returning.
 
         Args:
             reason: Why the challenge was triggered.
-            timeout: Seconds to wait for a response.
-            attempt: Current attempt number (1-indexed).
-            max_attempts: Total allowed attempts before lockdown.
-            previous_result: Result of previous attempt if retrying —
-                "timeout", "invalid", or "used". None on first attempt.
+            timeout: Seconds to wait per attempt.
+            max_attempts: Strikes before failure (used passwords don't count).
+            passwords: Password pool — list of {"word": str, "status": str}.
+                Entries with status "used" trigger a free retry, not a strike.
 
         Returns:
-            {
-                "response": str | None,  # user's text, None if timed out
-                "author_id": str,        # platform user ID of responder
-                "timed_out": bool,
-            }
+            On success: {"result": "verified", "password": str, "author_id": str}
+            On failure: {"result": "failed", "strikes": int}
+            On error:   {"result": "error", "error": str}
         """
         raise NotImplementedError(f"{type(self).__name__} does not support security_challenge")
-
-    async def security_challenge_cleanup(self) -> dict:
-        """Clean up any messages left over from security challenge flow.
-
-        Called by the tool after the challenge sequence completes
-        (whether success, failure, or lockdown).
-
-        Returns:
-            {"ok": bool}
-        """
-        raise NotImplementedError(f"{type(self).__name__} does not support security_challenge_cleanup")
 
     def capabilities(self) -> set[str]:
         """Declare supported operations beyond send_message."""
