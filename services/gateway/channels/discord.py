@@ -201,6 +201,15 @@ def _count_inbox(agent_home: Path, agent_id: str) -> int:
     return count
 
 
+def _read_canonical(agent_home: Path) -> str | None:
+    """Read the canonical agent ID from the lock file (~/.beth/state/canonical)."""
+    path = agent_home / "state" / "canonical"
+    try:
+        return path.read_text().strip() or None
+    except OSError:
+        return None
+
+
 def _get_context_usage(registry_entry: dict) -> tuple[int, int] | None:
     """Get (used_tokens, max_tokens) from Claude's conversation JSONL.
 
@@ -277,19 +286,20 @@ def _format_uptime(started_at: str) -> str:
         return "?"
 
 
-def _build_presence_text(agents: list[dict]) -> str:
+def _build_presence_text(agents: list[dict], canonical_id: str | None = None) -> str:
     if not agents:
         return "No agents running"
     count = len(agents)
-    # Show most recent agent's name and context usage
-    latest = agents[-1]  # sorted by id, but good enough
-    name = latest["id"].removeprefix(f"{latest['id'].split('-')[0]}-")
-    ctx = latest.get("context", "?")
+    # Show canonical agent's context if known; fall back to most recent
+    canonical = next((a for a in agents if a["id"] == canonical_id), None) if canonical_id else None
+    target = canonical or agents[-1]
+    name = target["id"].removeprefix(f"{target['id'].split('-')[0]}-")
+    ctx = target.get("context", "?")
     text = f"{count} agent{'s' if count != 1 else ''} | {name} {ctx}"
     return text[:128]
 
 
-def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
+def _build_status_embeds(agents: list[dict], canonical_id: str | None = None) -> list[discord.Embed]:
     if not agents:
         embed = discord.Embed(
             title="No agents running",
@@ -303,9 +313,14 @@ def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
         # Staleness detection — no context data suggests idle/stale
         context_pct = agent.get("context_pct")
         color = COLOR_ACTIVE if context_pct is not None else COLOR_IDLE
+        is_canonical = agent["id"] == canonical_id
+
+        title = f"\U0001f7e2 {agent['id']}"
+        if is_canonical:
+            title += " \u2b50"
 
         embed = discord.Embed(
-            title=f"\U0001f7e2 {agent['id']}",
+            title=title,
             color=color,
         )
 
@@ -313,6 +328,8 @@ def _build_status_embeds(agents: list[dict]) -> list[discord.Embed]:
             f"**Uptime:** {agent['uptime']}",
             f"**Context:** {agent.get('context', '?')}",
         ]
+        if is_canonical:
+            meta.append("\u2b50 **canonical**")
         if agent["inbox"] > 0:
             meta.append(f"**Inbox:** {agent['inbox']}")
         embed.description = " \u00b7 ".join(meta)
@@ -1316,7 +1333,8 @@ class _GatewayClient(discord.Client):
         while not self.is_closed():
             try:
                 agents = self._collect_agent_data()
-                text = _build_presence_text(agents)
+                canonical_id = _read_canonical(self._config.agent_home)
+                text = _build_presence_text(agents, canonical_id)
                 activity = discord.Activity(
                     type=discord.ActivityType.watching,
                     name=text,
@@ -1339,7 +1357,8 @@ class _GatewayClient(discord.Client):
         while not self.is_closed():
             try:
                 agents = self._collect_agent_data()
-                embeds = _build_status_embeds(agents)
+                canonical_id = _read_canonical(self._config.agent_home)
+                embeds = _build_status_embeds(agents, canonical_id)
                 now = datetime.now(ZoneInfo("America/Toronto")).strftime("%I:%M:%S %p EST")
                 content = f"**Agent Status** \u2014 last updated {now}"
 
