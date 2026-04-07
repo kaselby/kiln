@@ -386,6 +386,8 @@ class DiscordChannel(Channel):
         self._client: _GatewayClient | None = None
         self._ready = asyncio.Event()
         self._pending_permissions: dict[str, dict] = {}  # agent_id -> {future, message, embed}
+        self._security_challenge_state: dict | None = None  # pending challenge state
+        self._security_message_ids: list[int] = []  # accumulated msg IDs for cleanup
 
     async def connect(self) -> None:
         token = self._config.load_credential("DISCORD_BOT_TOKEN")
@@ -399,6 +401,7 @@ class DiscordChannel(Channel):
             bridge_manager=self._bridge_manager,
             subscription_manager=self._subscription_manager,
             ready_event=self._ready,
+            discord_channel=self,
         )
         connect_task = asyncio.create_task(self._client.start(token))
         try:
@@ -690,6 +693,117 @@ class DiscordChannel(Channel):
 
         return {"ok": True}
 
+    # --- Security challenge ---
+
+    async def security_challenge(
+        self, reason: str, *,
+        timeout: float = 60,
+        attempt: int = 1,
+        max_attempts: int = 2,
+        previous_result: str | None = None,
+    ) -> dict:
+        if not self._client:
+            return {"response": None, "author_id": "", "timed_out": False,
+                    "error": "not connected"}
+
+        # Resolve security channel — config key, then fallback to name
+        security_ch = await self._resolve_target("#security")
+        if not security_ch:
+            return {"response": None, "author_id": "", "timed_out": False,
+                    "error": "no #security channel found"}
+
+        # Build the challenge embed
+        if attempt == 1:
+            color = 0xf39c12  # orange
+            title = "\U0001f512 Security Verification Required"
+            desc = f"**Reason:** {reason or 'Unspecified'}\n\nSend a password from your OTP list."
+        else:
+            if previous_result == "timeout":
+                color = 0xe74c3c  # red
+                title = f"\u23f0 No Response — Strike {attempt - 1}/{max_attempts}"
+                desc = f"**Reason:** {reason or 'Unspecified'}\n\nTry again — send a password."
+            elif previous_result == "invalid":
+                color = 0xe74c3c
+                title = f"\u274c Wrong Password — Strike {attempt - 1}/{max_attempts}"
+                desc = f"**Reason:** {reason or 'Unspecified'}\n\nTry again — send a password."
+            elif previous_result == "used":
+                color = 0xf39c12
+                title = "\u26a0\ufe0f Password Already Used"
+                desc = f"**Reason:** {reason or 'Unspecified'}\n\nThat one's been used — send a different password."
+            else:
+                color = 0xf39c12
+                title = "\U0001f512 Security Verification — Retry"
+                desc = f"**Reason:** {reason or 'Unspecified'}\n\nSend a password from your OTP list."
+
+        embed = discord.Embed(title=title, description=desc, color=color)
+        embed.set_footer(text=f"Attempt {attempt}/{max_attempts} · {int(timeout)}s timeout")
+
+        # Mention full-trust users
+        mention_content = self._client._permission_ping_content()
+
+        # Set up the future before sending (avoid race)
+        future: asyncio.Future[tuple[str, str]] = asyncio.get_event_loop().create_future()
+        self._security_challenge_state = {
+            "future": future,
+            "channel_id": security_ch.id,
+        }
+
+        try:
+            msg = await security_ch.send(content=mention_content, embed=embed)
+            self._security_message_ids.append(msg.id)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            self._security_challenge_state = None
+            return {"response": None, "author_id": "", "timed_out": False,
+                    "error": f"failed to send challenge: {e}"}
+
+        # Wait for response
+        try:
+            content, author_id = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            # Post timeout indicator and update embed
+            try:
+                embed.color = 0x95a5a6
+                embed.title = "\u23f0 Timed Out"
+                await msg.edit(embed=embed)
+            except discord.HTTPException:
+                pass
+            return {"response": None, "author_id": "", "timed_out": True}
+        finally:
+            self._security_challenge_state = None
+
+        # Update embed to show response received
+        try:
+            embed.color = 0x3498db  # blue — "processing"
+            embed.title = "\U0001f50d Verifying..."
+            await msg.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+
+        return {"response": content, "author_id": author_id, "timed_out": False}
+
+    async def security_challenge_cleanup(self) -> dict:
+        if not self._client:
+            return {"ok": False, "error": "not connected"}
+
+        security_ch = await self._resolve_target("#security")
+        if not security_ch:
+            self._security_message_ids.clear()
+            return {"ok": False, "error": "no #security channel found"}
+
+        deleted = 0
+        for msg_id in self._security_message_ids:
+            try:
+                msg = await security_ch.fetch_message(msg_id)
+                await msg.delete()
+                deleted += 1
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        self._security_message_ids.clear()
+        self._security_challenge_state = None
+        log.info("Security challenge cleanup: deleted %d message(s)", deleted)
+        return {"ok": True, "deleted": deleted}
+
     # --- Internal helpers ---
 
     async def _resolve_target(self, target: str) -> discord.abc.Messageable | None:
@@ -762,7 +876,9 @@ class _GatewayClient(discord.Client):
     def __init__(self, config: GatewayConfig,
                  bridge_manager: BridgeManager,
                  subscription_manager: SubscriptionManager,
-                 ready_event: asyncio.Event, **kwargs):
+                 ready_event: asyncio.Event,
+                 discord_channel: "DiscordChannel | None" = None,
+                 **kwargs):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents, **kwargs)
@@ -772,6 +888,7 @@ class _GatewayClient(discord.Client):
         self._bridge_manager = bridge_manager
         self._subscription_manager = subscription_manager
         self._ready_event = ready_event
+        self._discord_channel = discord_channel
 
         state_dir = config.agent_home / "state"
         session_prefix = config.default_agent + "-" if config.default_agent else ""
@@ -810,6 +927,15 @@ class _GatewayClient(discord.Client):
             return
 
         sender_id = str(message.author.id)
+
+        # Security challenge intercept — resolve pending challenge if this
+        # message is in the security channel from a non-bot user.
+        sc = self._discord_channel._security_challenge_state
+        if sc and str(message.channel.id) == str(sc["channel_id"]):
+            self._discord_channel._security_message_ids.append(message.id)
+            if not sc["future"].done():
+                sc["future"].set_result((message.content, sender_id))
+            return  # consumed — don't route normally
 
         # Access control
         is_dm = isinstance(message.channel, discord.DMChannel)
@@ -870,7 +996,8 @@ class _GatewayClient(discord.Client):
         if _trust_label is not None:
             state_dir = self._config.agent_home / "state"
             resolved_trust = _trust_label(
-                state_dir, config_trust=trust, sender_user_id=sender_id,
+                state_dir, "discord",
+                config_trust=trust, sender_user_id=sender_id,
             )
 
         # 1. Bridge: inject into Kiln channel if this surface is bridged

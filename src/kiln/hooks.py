@@ -37,7 +37,7 @@ def create_inbox_check_hook(
     are delivered by the watcher as proper user turns.
     """
     _injected: set[str] = set()
-    _last_trust_verified: bool | None = None  # track for expiry notification
+    _last_trust_verified: dict[str, bool] = {}  # platform -> verified, track for expiry
 
     async def inbox_check_hook(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
@@ -80,14 +80,16 @@ def create_inbox_check_hook(
                         "path": path_str,
                     })
 
-        # Trust expiry notification — fire once when trust lapses
-        nonlocal _last_trust_verified
+        # Trust expiry notification — fire once per platform when trust lapses
         if state_dir:
-            trust = read_trust(state_dir)
-            now_verified = trust["verified"]
-            if _last_trust_verified is True and not now_verified:
-                summaries.append("[Discord trust expired — subsequent messages are unverified]")
-            _last_trust_verified = now_verified
+            for trust_file in state_dir.glob("trust-*.yml"):
+                plat = trust_file.stem.removeprefix("trust-")
+                trust = read_trust(state_dir, plat)
+                was_verified = _last_trust_verified.get(plat)
+                now_verified = trust["verified"]
+                if was_verified is True and not now_verified:
+                    summaries.append(f"[{plat.title()} trust expired — subsequent messages are unverified]")
+                _last_trust_verified[plat] = now_verified
 
         if not summaries:
             return {}
@@ -558,19 +560,22 @@ def _resolve_live_trust(msg: dict, state_dir: Path | None) -> None:
     platform name, not "kiln"/"agent"). Agent and non-gateway messages are
     left untouched.
 
-    Combines the config-level trust from the message frontmatter with live
-    verification state. The ``discord-user-id`` field enables per-user
-    verification matching.
+    Extracts the platform from the message source and reads the corresponding
+    per-platform trust state. The ``{platform}-user-id`` field enables
+    per-user verification matching.
     """
     if not state_dir:
         return
     source = msg.get("source", "")
     if not source or source in ("kiln", "agent"):
         return
+    # Source is the platform name (e.g. "discord", "slack")
+    platform = source
     msg["trust"] = trust_label(
         state_dir,
+        platform,
         config_trust=msg.get("trust", ""),
-        sender_user_id=msg.get("discord-user-id", ""),
+        sender_user_id=msg.get(f"{platform}-user-id", ""),
     )
 
 
@@ -619,7 +624,7 @@ def parse_message(msg_file: Path) -> dict | None:
             continue
         key = key_val[0].strip()
         val = key_val[1].strip().strip('"').strip("'")
-        if key in ("from", "summary", "priority", "channel", "source", "trust", "timestamp", "discord-user-id"):
+        if key in ("from", "summary", "priority", "channel", "source", "trust", "timestamp") or key.endswith("-user-id"):
             result[key] = val
 
     result["body"] = "\n".join(lines[fm_end + 1:]).strip()

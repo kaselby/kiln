@@ -28,7 +28,7 @@ set -euo pipefail
 
 AGENT_HOME="${AGENT_HOME:?AGENT_HOME must be set}"
 LOCKDOWN_FILE="${AGENT_HOME}/security-lockdown"
-TRUST_FILE="${AGENT_HOME}/state/discord-trust.yml"
+STATE_DIR="${AGENT_HOME}/state"
 INBOX_ROOT="${AGENT_HOME}/inbox"
 
 # Read session prefix from agent.yml (default: kiln-)
@@ -101,10 +101,13 @@ EOF
 
     echo "Lockdown flag written to ${LOCKDOWN_FILE}"
 
-    # Clear trust state
-    if [[ -f "$TRUST_FILE" ]]; then
-        rm "$TRUST_FILE"
-        echo "Trust state cleared"
+    # Clear all trust state files
+    local cleared=0
+    for f in "${STATE_DIR}"/trust-*.yml; do
+        [[ -f "$f" ]] && rm "$f" && cleared=$((cleared + 1))
+    done
+    if [[ $cleared -gt 0 ]]; then
+        echo "Trust state cleared ($cleared platform(s))"
     fi
 
     # Stop gateway

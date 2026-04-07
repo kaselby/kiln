@@ -130,11 +130,17 @@ def _format_ago(seconds: float) -> str:
 # Trust state
 # ---------------------------------------------------------------------------
 
+def _trust_path(state_dir: Path, platform: str) -> Path:
+    """Return the trust state file path for a platform."""
+    return state_dir / f"trust-{platform}.yml"
+
+
 def write_trust(
     state_dir: Path,
+    platform: str,
     *,
     verified_by: str,
-    discord_user_id: str,
+    platform_user_id: str = "",
     ttl_seconds: int = TRUST_TTL_SECONDS,
 ) -> None:
     """Write a verified trust state file after a successful security check."""
@@ -145,32 +151,42 @@ def write_trust(
         "verified_at": now.isoformat(),
         "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat(),
         "verified_by": verified_by,
-        "discord_user_id": discord_user_id,
+        "platform_user_id": platform_user_id,
     }
-    path = state_dir / "discord-trust.yml"
-    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    _trust_path(state_dir, platform).write_text(
+        yaml.dump(data, default_flow_style=False, sort_keys=False)
+    )
 
 
-def clear_trust(state_dir: Path) -> bool:
-    """Remove the trust state file (called by lockdown). Returns True if file existed."""
-    path = state_dir / "discord-trust.yml"
-    if path.exists():
+def clear_trust(state_dir: Path, platform: str | None = None) -> bool:
+    """Remove trust state file(s). If platform is None, clear all platforms."""
+    if platform:
+        path = _trust_path(state_dir, platform)
+        if path.exists():
+            path.unlink()
+            return True
+        return False
+
+    # Clear all trust files
+    cleared = False
+    for path in state_dir.glob("trust-*.yml"):
         path.unlink()
-        return True
-    return False
+        cleared = True
+    return cleared
 
 
-def read_trust(state_dir: Path) -> dict:
-    """Read the current trust state.
+def read_trust(state_dir: Path, platform: str) -> dict:
+    """Read the current trust state for a platform.
 
     Returns a dict with:
         verified: bool (True only if within TTL)
         verified_at: ISO timestamp string or None
         expires_at: ISO timestamp string or None
         verified_by: agent ID or None
+        platform_user_id: platform-specific user ID or ""
         expired: bool (True if file exists but TTL has passed)
     """
-    path = state_dir / "discord-trust.yml"
+    path = _trust_path(state_dir, platform)
     if not path.exists():
         return {"verified": False, "expired": False}
 
@@ -203,12 +219,14 @@ def read_trust(state_dir: Path) -> dict:
         "verified_at": data.get("verified_at"),
         "expires_at": expires_at,
         "verified_by": data.get("verified_by"),
-        "discord_user_id": data.get("discord_user_id", ""),
+        "platform_user_id": data.get("platform_user_id")
+            or data.get("discord_user_id", ""),  # backward compat
     }
 
 
 def trust_label(
     state_dir: Path,
+    platform: str,
     *,
     config_trust: str = "",
     sender_user_id: str = "",
@@ -216,25 +234,18 @@ def trust_label(
     """Return the trust string for message headers.
 
     Combines the config-level trust (full/known/unknown) with live
-    verification state. Verification is a modifier on ``full`` only —
-    other levels pass through as-is.
+    verification state for the given platform. Verification is a
+    modifier on ``full`` only — other levels pass through as-is.
 
     Examples: ``full (verified ✓)``, ``full``, ``known``, ``unknown``.
     """
-    # If no config trust provided, fall back to legacy binary label
-    if not config_trust:
-        trust = read_trust(state_dir)
-        if trust["verified"]:
-            return "verified ✓"
-        return "unverified ⚠"
-
     if config_trust != "full":
-        return config_trust
+        return config_trust or "unknown"
 
     # Full trust — check verification state with sender match
-    trust = read_trust(state_dir)
+    trust = read_trust(state_dir, platform)
     if trust["verified"]:
-        verified_uid = trust.get("discord_user_id", "")
+        verified_uid = trust.get("platform_user_id", "")
         if not sender_user_id or verified_uid == sender_user_id:
             return "full (verified ✓)"
     return "full"

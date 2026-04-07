@@ -112,11 +112,54 @@ class Channel(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support resolve_permission")
 
+    async def security_challenge(
+        self, reason: str, *,
+        timeout: float = 60,
+        attempt: int = 1,
+        max_attempts: int = 2,
+        previous_result: str | None = None,
+    ) -> dict:
+        """Post a security challenge and wait for a human response.
+
+        Platform-specific implementation of the challenge/response UX.
+        The caller (security-check tool) handles OTP validation, strike
+        counting, trust state, and lockdown — this method only handles
+        the messaging flow.
+
+        Args:
+            reason: Why the challenge was triggered.
+            timeout: Seconds to wait for a response.
+            attempt: Current attempt number (1-indexed).
+            max_attempts: Total allowed attempts before lockdown.
+            previous_result: Result of previous attempt if retrying —
+                "timeout", "invalid", or "used". None on first attempt.
+
+        Returns:
+            {
+                "response": str | None,  # user's text, None if timed out
+                "author_id": str,        # platform user ID of responder
+                "timed_out": bool,
+            }
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support security_challenge")
+
+    async def security_challenge_cleanup(self) -> dict:
+        """Clean up any messages left over from security challenge flow.
+
+        Called by the tool after the challenge sequence completes
+        (whether success, failure, or lockdown).
+
+        Returns:
+            {"ok": bool}
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support security_challenge_cleanup")
+
     def capabilities(self) -> set[str]:
         """Declare supported operations beyond send_message."""
         caps = {"send_message"}
         for method_name in ("read_history", "create_thread", "archive_thread",
-                            "send_voice", "list_channels", "request_permission"):
+                            "send_voice", "list_channels", "request_permission",
+                            "security_challenge"):
             method = getattr(type(self), method_name)
             base_method = getattr(Channel, method_name)
             if method is not base_method:
