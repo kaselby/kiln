@@ -906,25 +906,36 @@ class _GatewayClient(discord.Client):
     def _permission_ping_content(self) -> str | None:
         """Build mention string for permission prompts when the owner isn't at terminal.
 
-        Returns None if terminal is active (no ping needed), or a string of
-        Discord user mentions for all full-trust users.
+        Returns None if the owner is at terminal (no ping needed), or a string
+        of Discord user mentions for all full-trust users.
+
+        Uses read_presence() to properly compare terminal vs discord activity
+        rather than just checking terminal freshness alone.
         """
         state_dir = self._config.agent_home / "state"
-        presence_file = state_dir / "presence-terminal"
-        idle_threshold = 300  # 5 minutes
 
-        # Check if terminal is active
-        if presence_file.exists():
-            try:
-                ts_str = presence_file.read_text().strip().splitlines()[0]
-                ts = datetime.fromisoformat(ts_str)
-                ago = (datetime.now(timezone.utc) - ts).total_seconds()
-                if ago < idle_threshold:
-                    return None  # terminal is active, no ping
-            except (ValueError, IndexError, OSError):
-                pass
+        # Use kiln's presence logic if available — compares both surfaces
+        # and picks the most recent one.
+        try:
+            from kiln.state import read_presence
+            presence = read_presence(state_dir)
+            if presence["location"] == "terminal":
+                return None  # at terminal, no ping needed
+        except ImportError:
+            # Fallback: raw terminal presence check
+            presence_file = state_dir / "presence-terminal"
+            idle_threshold = 300  # 5 minutes
+            if presence_file.exists():
+                try:
+                    ts_str = presence_file.read_text().strip().splitlines()[0]
+                    ts = datetime.fromisoformat(ts_str)
+                    ago = (datetime.now(timezone.utc) - ts).total_seconds()
+                    if ago < idle_threshold:
+                        return None
+                except (ValueError, IndexError, OSError):
+                    pass
 
-        # Terminal idle or unknown — mention full-trust users
+        # Not at terminal — mention full-trust users
         mentions = []
         for uid, entry in self._discord_config.users.items():
             trust = entry.get("max_trust") or entry.get("trust")
