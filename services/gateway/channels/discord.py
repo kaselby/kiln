@@ -55,9 +55,9 @@ class _PermissionView(discord.ui.View):
             self.details.style = discord.ButtonStyle.secondary
 
     def _check_trust(self, user_id: str) -> bool:
-        """Only users with 'full' trust can approve permissions."""
+        """Only users with 'full' max_trust can approve permissions."""
         entry = self._discord_config.users.get(str(user_id), {})
-        return entry.get("trust") == "full"
+        return (entry.get("max_trust") or entry.get("trust")) == "full"
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, emoji="\u2705")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -592,11 +592,14 @@ class DiscordChannel(Channel):
         future: asyncio.Future[tuple[bool, str]] = asyncio.get_event_loop().create_future()
         view = _PermissionView(future, self._discord_config, detail=detail)
 
+        # Ping full-trust users if Kira isn't at terminal (beth#16)
+        mention_content = self._client._permission_ping_content()
+
         try:
-            msg = await thread.send(embed=embed, view=view)
+            msg = await thread.send(content=mention_content, embed=embed, view=view)
         except (discord.Forbidden, discord.HTTPException) as e:
             log.error("Failed to send permission prompt: %s", e)
-            return {"approved": False, "timed_out": False, "responder": ""}
+            return {"error": f"failed to send permission prompt: {e}"}
 
         # Register as pending so resolve_permission can find it
         pending = {
@@ -815,6 +818,10 @@ class _GatewayClient(discord.Client):
             sender_id, fallback_name=message.author.name
         )
 
+        # Update presence for full-trust users
+        if trust == "full":
+            self._write_presence_discord()
+
         content = message.content
         if not content.strip() and not message.attachments:
             return
@@ -870,6 +877,46 @@ class _GatewayClient(discord.Client):
         if subscribers:
             log.info("Discord -> %d subscriber(s) from %s in %s",
                      len(subscribers), sender_name, channel_desc)
+
+    # -----------------------------------------------------------------------
+    # Presence
+    # -----------------------------------------------------------------------
+
+    def _write_presence_discord(self) -> None:
+        """Write discord presence timestamp to state file."""
+        state_dir = self._config.agent_home / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path = state_dir / "presence-discord"
+        path.write_text(datetime.now(timezone.utc).isoformat() + "\n")
+
+    def _permission_ping_content(self) -> str | None:
+        """Build mention string for permission prompts when Kira isn't at terminal.
+
+        Returns None if terminal is active (no ping needed), or a string of
+        Discord user mentions for all full-trust users.
+        """
+        state_dir = self._config.agent_home / "state"
+        presence_file = state_dir / "presence-terminal"
+        idle_threshold = 300  # 5 minutes
+
+        # Check if terminal is active
+        if presence_file.exists():
+            try:
+                ts_str = presence_file.read_text().strip().splitlines()[0]
+                ts = datetime.fromisoformat(ts_str)
+                ago = (datetime.now(timezone.utc) - ts).total_seconds()
+                if ago < idle_threshold:
+                    return None  # terminal is active, no ping
+            except (ValueError, IndexError, OSError):
+                pass
+
+        # Terminal idle or unknown — mention full-trust users
+        mentions = []
+        for uid, entry in self._discord_config.users.items():
+            trust = entry.get("max_trust") or entry.get("trust")
+            if trust == "full":
+                mentions.append(f"<@{uid}>")
+        return " ".join(mentions) if mentions else None
 
     # -----------------------------------------------------------------------
     # Control channel
