@@ -791,13 +791,16 @@ class DiscordChannel(Channel):
             return {"ok": False, "error": "no #security channel found"}
 
         deleted = 0
+        log.info("Security cleanup: %d message ID(s) to delete: %s",
+                 len(self._security_message_ids), self._security_message_ids)
         for msg_id in self._security_message_ids:
             try:
                 msg = await security_ch.fetch_message(msg_id)
                 await msg.delete()
                 deleted += 1
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+                log.info("Security cleanup: deleted message %s", msg_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.warning("Security cleanup: failed to delete %s: %s", msg_id, e)
 
         self._security_message_ids.clear()
         self._security_challenge_state = None

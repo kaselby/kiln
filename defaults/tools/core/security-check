@@ -217,7 +217,7 @@ def run_challenge(platform: str, reason: str) -> bool:
     previous_result = None
 
     while strikes < MAX_STRIKES:
-        print(f"Attempt {attempt} (strikes: {strikes}/{MAX_STRIKES})")
+        print(f"Attempt {attempt} (strikes: {strikes}/{MAX_STRIKES}) — waiting up to {TIMEOUT_SECONDS}s for response...")
 
         # Call the gateway's security challenge endpoint
         result = gateway_api("POST", f"/api/{platform}/security/challenge", {
