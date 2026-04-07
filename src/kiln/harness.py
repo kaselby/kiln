@@ -95,7 +95,7 @@ class KilnHarness:
         self._model_verified = False
         self._permission_hook = None
         self._permission_callbacks = None
-        self.permission_mode = PermissionMode(config.initial_mode) if config.initial_mode else PermissionMode.SUPERVISED
+        self._initial_mode = PermissionMode(config.initial_mode) if config.initial_mode else PermissionMode.SUPERVISED
         self._shell_cleanup = None
         self._get_shell_cwd = None
         self._stderr_log: Path | None = None
@@ -114,6 +114,32 @@ class KilnHarness:
         # Spawned subagents default to yolo — no human watching
         if self.config.parent and self.config.initial_mode is None:
             self.config.initial_mode = "yolo"
+
+    @property
+    def permission_mode(self) -> PermissionMode:
+        """Current permission mode. Reads from session config so external
+        changes (gateway control channel, other tools) take effect on next
+        tool use. Falls back to initial mode before session config exists."""
+        if self.session_config is not None:
+            raw = self.session_config.get("mode")
+            if raw:
+                try:
+                    mode = PermissionMode(raw)
+                    # Trusted cannot be set via config file — TUI only
+                    if mode == PermissionMode.TRUSTED:
+                        return self._initial_mode
+                    return mode
+                except ValueError:
+                    pass
+        return self._initial_mode
+
+    @permission_mode.setter
+    def permission_mode(self, value: PermissionMode) -> None:
+        """Set permission mode. Persists to session config so external
+        tools can observe the current mode."""
+        self._initial_mode = value
+        if self.session_config is not None:
+            self.session_config.set("mode", value.value)
 
     @property
     def show_thinking(self) -> bool:
@@ -251,6 +277,7 @@ class KilnHarness:
         self.session_config = SessionConfig(
             path=self.config.home / "state" / f"session-config-{self.agent_id}.yml",
             defaults={
+                "mode": self._initial_mode.value,
                 "heartbeat_enabled": self.config.heartbeat,
                 "heartbeat_max": self.config.heartbeat_max,
                 "heartbeat_override": self.config.heartbeat_override,
@@ -303,11 +330,11 @@ class KilnHarness:
 
         # Permission handler — always active, even in headless mode.
         # TUI provides interactive callbacks; headless passes no terminal
-        # handler (YOLO mode + gateway-only for confirm-tier guardrails).
+        # handler (gateway-only for confirm-tier guardrails).
         if self._permission_callbacks:
             get_mode, terminal_handler = self._permission_callbacks
         else:
-            get_mode = lambda: PermissionMode.YOLO
+            get_mode = lambda: self.permission_mode
             terminal_handler = None
         self._permission_handler = PermissionHandler(
             get_mode=get_mode,

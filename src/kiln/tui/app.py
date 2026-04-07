@@ -485,9 +485,12 @@ class KilnApp:
         self._receiving = False
         self._interrupt_in_flight = False
         self._receive_task: asyncio.Task | None = None
-        # Permission mode lives on the harness; TUI provides a property alias.
+        # Permission mode lives on the harness (session config file); TUI
+        # provides a property alias.  Trusted mode is a volatile overlay —
+        # it only exists in-memory and can only be set from the TUI.
+        self._trusted_override = (harness._initial_mode == PermissionMode.TRUSTED)
+        self._last_displayed_mode = harness._initial_mode
         self._pending_permission: PermissionRequest | None = None
-        self._mode_override_dir = self._harness.config.home / "control"
         self._app: Application | None = None
 
         # Idle message delivery
@@ -849,11 +852,22 @@ class KilnApp:
 
     @property
     def _perm_mode(self) -> PermissionMode:
+        # Trusted is a volatile TUI-only overlay — when set, it takes
+        # precedence over the session config file.  This ensures trusted
+        # mode (which disables ALL guardrails) can only be set by a human
+        # sitting at the terminal, not by external config writes.
+        if self._trusted_override:
+            return PermissionMode.TRUSTED
         return self._harness.permission_mode
 
     @_perm_mode.setter
     def _perm_mode(self, value: PermissionMode) -> None:
-        self._harness.permission_mode = value
+        if value == PermissionMode.TRUSTED:
+            self._trusted_override = True
+        else:
+            self._trusted_override = False
+            self._harness.permission_mode = value
+        self._last_displayed_mode = value
 
     @property
     def _in_channel_view(self) -> bool:
@@ -1251,8 +1265,7 @@ class KilnApp:
         while True:
             await asyncio.sleep(1.0)
             try:
-                # Check for external mode overrides (e.g. from Discord relay)
-                self._check_mode_override()
+                self._check_external_mode_change()
                 if not self._should_deliver(inbox):
                     continue
                 msg = self._next_unread_message(inbox)
@@ -1628,29 +1641,19 @@ class KilnApp:
     # ---- Permissions ----
 
 
-    def _check_mode_override(self) -> None:
-        """Check for external mode override file (e.g. from Discord relay).
+    def _check_external_mode_change(self) -> None:
+        """Detect and announce external permission mode changes.
 
-        Override files are written to <home>/control/<agent-id>.mode and
-        contain a single mode name (yolo, supervised, safe). Consumed on read.
-        TRUSTED mode cannot be set via override — TUI only.
+        Mode is now stored in the session config file, so external tools
+        (gateway control channel, scripts) can change it directly.  This
+        method detects the change and refreshes the TUI display.
         """
-        try:
-            override_file = self._mode_override_dir / f"{self._harness.agent_id}.mode"
-            if override_file.exists():
-                mode_str = override_file.read_text().strip().lower()
-                override_file.unlink()
-                if mode_str == "trusted":
-                    _tprint("<dim>Ignoring mode override: trusted mode is TUI-only</dim>")
-                    return
-                new_mode = PermissionMode(mode_str)
-                if new_mode != self._perm_mode:
-                    self._perm_mode = new_mode
-                    _tprint("<dim>Mode changed to {} (external override)</dim>", mode_str)
-                    if self._app:
-                        self._app.invalidate()
-        except (ValueError, OSError):
-            pass
+        current = self._perm_mode
+        if current != self._last_displayed_mode:
+            self._last_displayed_mode = current
+            _tprint("<dim>Mode changed to {} (external)</dim>", current.value)
+            if self._app:
+                self._app.invalidate()
 
     async def _request_permission(self, req: PermissionRequest) -> bool:
         """Display diff/preview and wait for user y/n decision.
@@ -1676,8 +1679,7 @@ class KilnApp:
                     req.decide(False)
                     _tprint("<dim>Permission request timed out (5 min). Auto-rejected.</dim>")
                     break
-                # Check for external mode override (e.g. from Discord)
-                self._check_mode_override()
+                self._check_external_mode_change()
                 if self._perm_mode == PermissionMode.TRUSTED:
                     req.decide(True)
                     _tprint("<dim>    auto-approved (mode switched to trusted)</dim>")
