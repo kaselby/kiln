@@ -388,6 +388,7 @@ class DiscordChannel(Channel):
         self._pending_permissions: dict[str, dict] = {}  # agent_id -> {future, message, embed}
         self._security_challenge_state: dict | None = None  # pending challenge state
         self._security_message_ids: list[int] = []  # accumulated msg IDs for cleanup
+        self._security_active_msg: discord.Message | None = None  # current challenge embed
 
     async def connect(self) -> None:
         token = self._config.load_credential("DISCORD_BOT_TOKEN")
@@ -738,39 +739,51 @@ class DiscordChannel(Channel):
         embed = discord.Embed(title=title, description=desc, color=color)
         embed.set_footer(text=f"Attempt {attempt}/{max_attempts} · {int(timeout)}s timeout")
 
-        # Mention full-trust users
-        mention_content = self._client._permission_ping_content()
-
-        # Set up the future before sending (avoid race)
+        # Set up the future before sending/editing (avoid race)
         future: asyncio.Future[tuple[str, str]] = asyncio.get_event_loop().create_future()
         self._security_challenge_state = {
             "future": future,
             "channel_id": security_ch.id,
         }
 
-        try:
-            log.info("Security challenge: sending embed to #security (channel %s)", security_ch.id)
-            msg = await security_ch.send(content=mention_content, embed=embed)
-            self._security_message_ids.append(msg.id)
-            log.info("Security challenge: embed sent (msg %s), waiting for response (timeout=%ds)",
-                     msg.id, int(timeout))
-        except (discord.Forbidden, discord.HTTPException) as e:
-            self._security_challenge_state = None
-            log.error("Security challenge: failed to send embed: %s", e)
-            return {"response": None, "author_id": "", "timed_out": False,
-                    "error": f"failed to send challenge: {e}"}
+        # Reuse existing embed on retries (e.g. used password), post new on first/strike
+        msg = self._security_active_msg
+        if msg and previous_result == "used":
+            # Edit existing embed in place
+            try:
+                await msg.edit(embed=embed)
+                log.info("Security challenge: updated existing embed (msg %s)", msg.id)
+            except discord.HTTPException as e:
+                log.warning("Security challenge: failed to edit embed, posting new: %s", e)
+                msg = None  # fall through to post new
+
+        if not msg or previous_result != "used":
+            # Post a new embed
+            mention_content = self._client._permission_ping_content()
+            try:
+                log.info("Security challenge: sending embed to #security (channel %s)", security_ch.id)
+                msg = await security_ch.send(content=mention_content, embed=embed)
+                self._security_message_ids.append(msg.id)
+                self._security_active_msg = msg
+                log.info("Security challenge: embed sent (msg %s), waiting for response (timeout=%ds)",
+                         msg.id, int(timeout))
+            except (discord.Forbidden, discord.HTTPException) as e:
+                self._security_challenge_state = None
+                log.error("Security challenge: failed to send embed: %s", e)
+                return {"response": None, "author_id": "", "timed_out": False,
+                        "error": f"failed to send challenge: {e}"}
 
         # Wait for response
         try:
             content, author_id = await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            # Post timeout indicator and update embed
             try:
                 embed.color = 0x95a5a6
                 embed.title = "\u23f0 Timed Out"
                 await msg.edit(embed=embed)
             except discord.HTTPException:
                 pass
+            self._security_active_msg = None
             return {"response": None, "author_id": "", "timed_out": True}
         finally:
             self._security_challenge_state = None
@@ -808,6 +821,7 @@ class DiscordChannel(Channel):
 
         self._security_message_ids.clear()
         self._security_challenge_state = None
+        self._security_active_msg = None
         log.info("Security challenge cleanup: deleted %d message(s)", deleted)
         return {"ok": True, "deleted": deleted}
 
