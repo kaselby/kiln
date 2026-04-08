@@ -1131,6 +1131,8 @@ class _GatewayClient(discord.Client):
                 await self._cmd_spawn(message, text[len("spawn"):].strip())
             elif cmd == "kill":
                 await self._cmd_kill(message, parts[1:])
+            elif cmd == "interrupt":
+                await self._cmd_interrupt(message, parts[1:])
             elif cmd == "show":
                 await self._cmd_show(message, parts[1:])
             elif cmd == "help":
@@ -1140,6 +1142,7 @@ class _GatewayClient(discord.Client):
                     "(safe, supervised, yolo)\n"
                     "`spawn [instructions]` — launch a new session\n"
                     "`kill <agent>` — kill a session (immediate)\n"
+                    "`interrupt <agent>` — send ESC to unstick a session\n"
                     "`show <agent>` — capture current terminal pane\n"
                     "`help` — this message"
                 )
@@ -1271,6 +1274,33 @@ class _GatewayClient(discord.Client):
             await message.reply(f"💀 `{agent_id}` killed.")
         else:
             await message.reply(f"❌ Failed to kill `{agent_id}` (tmux session not found?).")
+
+    async def _cmd_interrupt(
+        self, message: discord.Message, args: list[str],
+    ) -> None:
+        """Handle: interrupt <agent-id> — send ESC to unstick a frozen session."""
+        if not args:
+            await message.reply("Usage: `interrupt <agent>`")
+            return
+
+        agent_ref = args[0]
+        agent_id = self._resolve_agent_id(agent_ref)
+        if not agent_id:
+            await message.reply(f"No running session matching `{agent_ref}`.")
+            return
+
+        log.info("Control: interrupt %s (by %s)", agent_id, message.author.name)
+
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", agent_id, "Escape",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode == 0:
+            await message.reply(f"⚡ Sent ESC to `{agent_id}`.")
+        else:
+            await message.reply(f"❌ Failed to interrupt `{agent_id}` (tmux session not found?).")
 
     async def _cmd_show(
         self, message: discord.Message, args: list[str],
