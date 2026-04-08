@@ -8,6 +8,7 @@ Complex agents write their own harness that imports kiln's building
 blocks directly.
 """
 
+import asyncio
 import fcntl
 import json
 import logging
@@ -685,11 +686,53 @@ class KilnHarness:
         await self._client.query(message)
 
     async def receive(self):
-        """Yield messages from the agent until the turn ends."""
+        """Yield messages from the agent until the turn ends.
+
+        If stream_timeout is configured and no message arrives within the
+        timeout window, sends an interrupt to the stalled Claude Code
+        subprocess and queues a recovery message so the agent gets another
+        turn automatically.
+        """
         if not self._client:
             raise RuntimeError("Harness not started. Call start() first.")
-        async for msg in self._client.receive_response():
-            yield msg
+        timeout = self.config.stream_timeout
+        if not timeout:
+            async for msg in self._client.receive_response():
+                yield msg
+            return
+
+        ait = self._client.receive_response().__aiter__()
+        while True:
+            try:
+                msg = await asyncio.wait_for(anext(ait), timeout=timeout)
+                yield msg
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Stream stall: no data for %ds. Interrupting.", int(timeout)
+                )
+                # Interrupt the stalled CC subprocess
+                try:
+                    await asyncio.wait_for(self._client.interrupt(), timeout=10)
+                except Exception:
+                    pass
+                # Drain remaining messages (partial response + ResultMessage)
+                try:
+                    while True:
+                        msg = await asyncio.wait_for(anext(ait), timeout=15)
+                        yield msg
+                except (StopAsyncIteration, asyncio.TimeoutError, Exception):
+                    pass
+                # Queue a recovery message so the agent gets another turn
+                self.followup_queue.append(
+                    "[SYSTEM] The previous model generation stalled — no data "
+                    "was received for %d seconds, likely due to an API streaming "
+                    "connection issue. The stalled turn was interrupted. Your "
+                    "partial response (if any) is preserved in context above. "
+                    "Please continue where you left off." % int(timeout)
+                )
+                return
 
     def check_model(self, actual_model: str) -> str | None:
         """Check actual model against expected. Returns warning or None."""

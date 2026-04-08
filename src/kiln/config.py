@@ -93,6 +93,12 @@ class AgentConfig:
     # Idle nudge: send a message after prolonged inactivity (seconds, 0 = disabled)
     idle_nudge_timeout: float = 0.0
 
+    # Stream stall timeout: if no SDK message arrives for this many seconds during
+    # a model turn, interrupt the stalled generation and auto-retry. Mitigates
+    # Claude Code bug where API streaming connections stall silently (CC #25979).
+    # 0 = disabled.
+    stream_timeout: float = 300.0
+
     # Tools — namespaced list: "Base::Read", "Kiln::Bash", "MyAgent::CustomTool"
     tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
     mcp_server: str | None = None     # path to custom MCP server module (relative to home)
@@ -290,6 +296,13 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
         val = raw[idle_key]
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
             config.idle_nudge_timeout = float(val) * 60
+
+    # Stream stall timeout — value in seconds (0 to disable)
+    st_key = "stream_timeout" if "stream_timeout" in raw else "stream-timeout" if "stream-timeout" in raw else None
+    if st_key:
+        val = raw[st_key]
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            config.stream_timeout = max(float(val), 0.0)
 
 
 def load_agent_spec(spec_path: Path) -> AgentConfig:
