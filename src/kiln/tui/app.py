@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -649,6 +650,9 @@ class KilnApp:
             if text.startswith("/heartbeat"):
                 app_ref._toggle_heartbeat(text)
                 return
+            if text == "/usage":
+                app_ref._show_usage()
+                return
 
             # Channel view: send directly to the channel
             if app_ref._in_channel_view:
@@ -986,6 +990,72 @@ class KilnApp:
         tasks = data["tasks"]
         done = sum(1 for t in tasks if t.get("status") == "done")
         _tprint("<dim>Progress: {}/{} done</dim>\n", done, len(tasks))
+
+    def _show_usage(self) -> None:
+        """Show Anthropic subscription usage."""
+        tool_path = self._harness.config.home / "tools" / "core" / "usage"
+        if not tool_path.exists():
+            _tprint("<err>Usage tool not found.</err>")
+            return
+
+        try:
+            result = subprocess.run(
+                [str(tool_path), "--json"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                _tprint("<err>Usage fetch failed.</err>")
+                return
+            data = json.loads(result.stdout)
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+            _tprint("<err>Usage fetch failed.</err>")
+            return
+
+        _tprint("\n<text-heading>Anthropic Max \u2014 Usage</text-heading>")
+
+        for key, label in [
+            ("five_hour", "Session (5h)"),
+            ("seven_day", "Weekly \u2014 all models"),
+            ("seven_day_sonnet", "Weekly \u2014 Sonnet"),
+        ]:
+            limit = data.get(key)
+            if not limit or limit.get("utilization") is None:
+                continue
+
+            util = limit["utilization"]
+            ratio = util / 100.0
+            filled = int(ratio * 30)
+            bar = "\u2588" * filled + "\u2591" * (30 - filled)
+
+            if ratio >= 0.9:
+                style = "err"
+            elif ratio >= 0.7:
+                style = "tool"
+            else:
+                style = "diff-add"
+
+            pct = f"{util:.0f}"
+            _tprint("  <text-heading>{label}</text-heading>", label=label)
+            _tprint("  <{s}>{bar}</{s}>  {pct}% used", s=style, bar=bar, pct=pct)
+
+            resets_at = limit.get("resets_at")
+            if resets_at:
+                try:
+                    reset = datetime.fromisoformat(resets_at)
+                    total_sec = int((reset - datetime.now(timezone.utc)).total_seconds())
+                    if total_sec > 0:
+                        hours, rem = divmod(total_sec, 3600)
+                        minutes = rem // 60
+                        if hours > 24:
+                            rt = f"resets in {hours // 24}d {hours % 24}h"
+                        elif hours > 0:
+                            rt = f"resets in {hours}h {minutes}m"
+                        else:
+                            rt = f"resets in {minutes}m"
+                        _tprint("  <dim>{}</dim>", rt)
+                except (ValueError, TypeError):
+                    pass
+            _tprint("")
 
     def _permission_bar(self) -> HTML:
         """Build the ephemeral permission prompt that appears above the input."""

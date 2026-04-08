@@ -35,6 +35,7 @@ CHANNEL_POLL_INTERVAL = 1.0  # seconds
 # Embed colors
 COLOR_ACTIVE = 0x2ecc71   # green
 COLOR_IDLE = 0x95a5a6     # gray
+COLOR_CONCLAVE = 0x9b59b6 # purple
 
 # Context window size for token usage display
 MAX_CONTEXT_TOKENS = 200_000
@@ -306,8 +307,10 @@ def _format_uptime(started_at: str) -> str:
     try:
         start = datetime.fromisoformat(started_at)
         if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - start
+            # Registry timestamps are local time — compare with local now
+            delta = datetime.now() - start
+        else:
+            delta = datetime.now(timezone.utc) - start
         hours, remainder = divmod(int(delta.total_seconds()), 3600)
         minutes = remainder // 60
         if hours > 0:
@@ -368,7 +371,125 @@ def _build_presence_text(agents: list[dict], canonical_id: str | None = None) ->
     return text[:128]
 
 
-def _build_status_embeds(agents: list[dict], canonical_id: str | None = None) -> list[discord.Embed]:
+def _get_conclave_membership(agent_home: Path) -> dict[str, dict]:
+    """Parse conclave briefings → {agent_id: {conclave, role}}."""
+    conclaves_dir = agent_home / "conclaves"
+    if not conclaves_dir.exists():
+        return {}
+    import re
+    pattern = re.compile(r"\*\*(Facilitator|Collaborator):\*\*\s+(\S+)")
+    membership: dict[str, dict] = {}
+    for briefing in conclaves_dir.glob("*/briefing.md"):
+        name = briefing.parent.name
+        try:
+            text = briefing.read_text()
+        except OSError:
+            continue
+        in_members = False
+        for line in text.splitlines():
+            if line.strip() == "## Members":
+                in_members = True
+                continue
+            if in_members:
+                if line.startswith("## "):
+                    break
+                m = pattern.search(line)
+                if m:
+                    membership[m.group(2)] = {
+                        "conclave": name, "role": m.group(1).lower(),
+                    }
+    return membership
+
+
+def _build_agent_embed(agent: dict, canonical_id: str | None, extra_annotations: list[str] | None = None) -> discord.Embed:
+    """Build a single-agent status embed (used for standalone agents)."""
+    context_pct = agent.get("context_pct")
+    color = COLOR_ACTIVE if context_pct is not None else COLOR_IDLE
+    is_canonical = agent["id"] == canonical_id
+
+    title = f"\U0001f7e2 {agent['id']}"
+    if is_canonical:
+        title += " \u2b50"
+
+    embed = discord.Embed(title=title, color=color)
+
+    meta = [
+        f"**Uptime:** {agent['uptime']}",
+        f"**Context:** {agent.get('context', '?')}",
+    ]
+    if is_canonical:
+        meta.append("\u2b50 **canonical**")
+    if agent["inbox"] > 0:
+        meta.append(f"**Inbox:** {agent['inbox']}")
+    if extra_annotations:
+        meta.extend(extra_annotations)
+    embed.description = " \u00b7 ".join(meta)
+
+    plan = agent.get("plan")
+    if plan:
+        tasks = plan.get("tasks", [])
+        done = sum(1 for t in tasks if t.get("status") == "done")
+        in_progress = sum(1 for t in tasks if t.get("status") == "in_progress")
+        total = len(tasks)
+        goal = plan.get("goal", "?")
+        if len(goal) > 60:
+            goal = goal[:59] + "\u2026"
+        progress = f"{goal} ({done}/{total}"
+        if in_progress:
+            progress += f", {in_progress} active"
+        progress += ")"
+        embed.add_field(name="Plan", value=progress, inline=False)
+
+    return embed
+
+
+def _build_conclave_embed(
+    name: str, members: list[dict], canonical_id: str | None,
+) -> discord.Embed:
+    """Build a single embed for a whole conclave group."""
+    embed = discord.Embed(
+        title=f"\U0001f52e {name}",
+        color=COLOR_CONCLAVE,
+    )
+    lines = []
+    for agent in members:
+        is_fac = agent.get("_role") == "facilitator"
+        is_can = agent["id"] == canonical_id
+        prefix = "\u2605" if is_fac else "\u2003"  # ★ or em-space
+        label = f"{prefix} **{agent['id']}**"
+        if is_fac:
+            label += " (facilitator)"
+        if is_can:
+            label += " \u2b50"
+        meta = f"up {agent['uptime']} \u00b7 ctx {agent.get('context', '?')}"
+        if agent["inbox"] > 0:
+            meta += f" \u00b7 {agent['inbox']} msg"
+        indent = "\u2003" * len(prefix)  # match width without repeating ★
+        lines.append(f"{label}\n{indent} {meta}")
+
+    embed.description = "\n".join(lines)
+
+    # Show facilitator's plan (or first plan found)
+    for agent in members:
+        plan = agent.get("plan")
+        if plan:
+            tasks = plan.get("tasks", [])
+            done = sum(1 for t in tasks if t.get("status") == "done")
+            total = len(tasks)
+            goal = plan.get("goal", "?")
+            if len(goal) > 60:
+                goal = goal[:59] + "\u2026"
+            embed.add_field(name="Plan", value=f"{goal} ({done}/{total})", inline=False)
+            break
+
+    return embed
+
+
+def _build_status_embeds(
+    agents: list[dict],
+    canonical_id: str | None = None,
+    membership: dict[str, dict] | None = None,
+) -> list[discord.Embed]:
     if not agents:
         embed = discord.Embed(
             title="No agents running",
@@ -377,48 +498,29 @@ def _build_status_embeds(agents: list[dict], canonical_id: str | None = None) ->
         )
         return [embed]
 
-    embeds = []
+    membership = membership or {}
+
+    # Partition into standalone and conclave groups
+    standalone = []
+    conclaves: dict[str, list[dict]] = {}
     for agent in agents:
-        # Staleness detection — no context data suggests idle/stale
-        context_pct = agent.get("context_pct")
-        color = COLOR_ACTIVE if context_pct is not None else COLOR_IDLE
-        is_canonical = agent["id"] == canonical_id
+        m = membership.get(agent["id"])
+        if m:
+            agent_with_role = {**agent, "_role": m["role"]}
+            conclaves.setdefault(m["conclave"], []).append(agent_with_role)
+        else:
+            standalone.append(agent)
 
-        title = f"\U0001f7e2 {agent['id']}"
-        if is_canonical:
-            title += " \u2b50"
+    embeds = []
 
-        embed = discord.Embed(
-            title=title,
-            color=color,
-        )
+    # Standalone agents — individual embeds
+    for agent in standalone:
+        embeds.append(_build_agent_embed(agent, canonical_id))
 
-        meta = [
-            f"**Uptime:** {agent['uptime']}",
-            f"**Context:** {agent.get('context', '?')}",
-        ]
-        if is_canonical:
-            meta.append("\u2b50 **canonical**")
-        if agent["inbox"] > 0:
-            meta.append(f"**Inbox:** {agent['inbox']}")
-        embed.description = " \u00b7 ".join(meta)
-
-        plan = agent.get("plan")
-        if plan:
-            tasks = plan.get("tasks", [])
-            done = sum(1 for t in tasks if t.get("status") == "done")
-            in_progress = sum(1 for t in tasks if t.get("status") == "in_progress")
-            total = len(tasks)
-            goal = plan.get("goal", "?")
-            if len(goal) > 60:
-                goal = goal[:59] + "\u2026"
-            progress = f"{goal} ({done}/{total}"
-            if in_progress:
-                progress += f", {in_progress} active"
-            progress += ")"
-            embed.add_field(name="Plan", value=progress, inline=False)
-
-        embeds.append(embed)
+    # Conclave groups — one embed per conclave, facilitator first
+    for name, members in sorted(conclaves.items()):
+        members.sort(key=lambda a: (0 if a.get("_role") == "facilitator" else 1, a["id"]))
+        embeds.append(_build_conclave_embed(name, members, canonical_id))
 
     return embeds
 
@@ -1748,6 +1850,7 @@ class _GatewayClient(discord.Client):
                 await asyncio.wait_for(
                     self.change_presence(activity=activity), timeout=15,
                 )
+                log.debug("Presence updated: %s", text)
             except asyncio.TimeoutError:
                 log.warning("Presence update timed out")
             except Exception:
@@ -1768,7 +1871,8 @@ class _GatewayClient(discord.Client):
             try:
                 agents = self._collect_agent_data()
                 canonical_id = _read_canonical(self._config.agent_home)
-                embeds = _build_status_embeds(agents, canonical_id)
+                membership = _get_conclave_membership(self._config.agent_home)
+                embeds = _build_status_embeds(agents, canonical_id, membership)
                 now = datetime.now(ZoneInfo("America/Toronto")).strftime("%I:%M:%S %p EST")
                 content = f"**Agent Status** \u2014 last updated {now}"
 
