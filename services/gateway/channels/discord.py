@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -110,12 +111,27 @@ class _PermissionView(discord.ui.View):
 
 
 class _DismissView(discord.ui.View):
-    """View with a single Dismiss button that deletes the message."""
+    """View with a Dismiss button that deletes the message, or auto-deletes after 3 min."""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.target_message: discord.Message | None = None
 
     @discord.ui.button(label="Dismiss", style=discord.ButtonStyle.secondary, emoji="✖️")
     async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.message.delete()
+        try:
+            await interaction.response.defer()
+            await interaction.message.delete()
+        except discord.HTTPException:
+            pass  # Discord API flaky — fail silently
         self.stop()
+
+    async def on_timeout(self):
+        if self.target_message:
+            try:
+                await self.target_message.delete()
+            except discord.NotFound:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +315,44 @@ def _format_uptime(started_at: str) -> str:
         return f"{minutes}m"
     except (ValueError, TypeError):
         return "?"
+
+
+USAGE_CACHE_TTL = 900  # 15 min — conservative to avoid drawing attention to automated polling
+
+
+def _format_usage_reset(resets_at: str | None) -> str:
+    if not resets_at:
+        return ""
+    try:
+        reset = datetime.fromisoformat(resets_at)
+        total_seconds = int((reset - datetime.now(timezone.utc)).total_seconds())
+        if total_seconds <= 0:
+            return "resetting"
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        if hours > 24:
+            days = hours // 24
+            return f"resets {days}d {hours % 24}h"
+        elif hours > 0:
+            return f"resets {hours}h {minutes}m"
+        return f"resets {minutes}m"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_usage_line(data: dict) -> str:
+    parts = []
+    for key, label in [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_sonnet", "Sonnet")]:
+        limit = data.get(key)
+        if not limit or limit.get("utilization") is None:
+            continue
+        util = limit["utilization"]
+        reset = _format_usage_reset(limit.get("resets_at"))
+        part = f"**{label}:** {util:.0f}%"
+        if reset:
+            part += f" ({reset})"
+        parts.append(part)
+    return " · ".join(parts)
 
 
 def _build_presence_text(agents: list[dict], canonical_id: str | None = None) -> str:
@@ -951,6 +1005,10 @@ class _GatewayClient(discord.Client):
         self._status_msg_path = state_dir / "discord-status-msg-id"
         self._status_message_id: int | None = _load_int_state(self._status_msg_path)
 
+        # Subscription usage cache
+        self._usage_cache: dict | None = None
+        self._usage_cache_time: float = 0
+
     async def setup_hook(self) -> None:
         """Start background tasks after connection."""
         self.loop.create_task(self._sync_branch_threads_loop())
@@ -1361,7 +1419,9 @@ class _GatewayClient(discord.Client):
                 content = content[newline_pos + 1:]
 
         log.info("Control: show %s (by %s)", agent_id, message.author.name)
-        await message.reply(f"{header}```\n{content}\n```", view=_DismissView())
+        view = _DismissView()
+        reply = await message.reply(f"{header}```\n{content}\n```", view=view)
+        view.target_message = reply
 
     def _resolve_agent_id(self, ref: str) -> str | None:
         """Resolve a short agent reference to a full agent ID.
@@ -1708,6 +1768,12 @@ class _GatewayClient(discord.Client):
                 now = datetime.now(ZoneInfo("America/Toronto")).strftime("%I:%M:%S %p EST")
                 content = f"**Agent Status** \u2014 last updated {now}"
 
+                usage_data = await self._fetch_usage_data()
+                if usage_data:
+                    usage_line = _format_usage_line(usage_data)
+                    if usage_line:
+                        content += f"\n\U0001f4ca {usage_line}"
+
                 # Discord limits to 10 embeds per message
                 await self._update_or_create_status_message(status_ch, content, embeds[:10])
             except Exception:
@@ -1752,6 +1818,32 @@ class _GatewayClient(discord.Client):
             })
         agents.sort(key=lambda a: a["id"])
         return agents
+
+    async def _fetch_usage_data(self) -> dict | None:
+        """Fetch subscription usage via the usage tool, cached."""
+        now = time.time()
+        if self._usage_cache and (now - self._usage_cache_time) < USAGE_CACHE_TTL:
+            return self._usage_cache
+
+        tool_path = self._config.agent_home / "tools" / "core" / "usage"
+        if not tool_path.exists():
+            return self._usage_cache
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(tool_path), "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode == 0:
+                data = json.loads(stdout.decode())
+                self._usage_cache = data
+                self._usage_cache_time = now
+                return data
+        except (asyncio.TimeoutError, json.JSONDecodeError, OSError):
+            log.debug("Usage data fetch failed, using cache")
+        return self._usage_cache
 
     # -----------------------------------------------------------------------
     # Helpers
