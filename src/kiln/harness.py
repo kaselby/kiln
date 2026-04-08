@@ -717,10 +717,20 @@ class KilnHarness:
                     await asyncio.wait_for(self._client.interrupt(), timeout=10)
                 except Exception:
                     pass
-                # Drain remaining messages (partial response + ResultMessage)
+                # Drain remaining messages (partial response + ResultMessage).
+                # The original iterator `ait` is dead — asyncio.wait_for
+                # cancelled the anext() task, which threw CancelledError into
+                # the generator chain and closed it.  We must use a fresh
+                # receive_response() iterator to consume any stale messages
+                # (especially the ResultMessage emitted by the interrupt).
+                # If we don't, the stale ResultMessage stays in the SDK's
+                # message buffer and the *recovery* turn's receive_response()
+                # will consume it, terminating immediately with zero new
+                # content — leaving the agent stuck at Ready.
                 try:
+                    drain = self._client.receive_response().__aiter__()
                     while True:
-                        msg = await asyncio.wait_for(anext(ait), timeout=15)
+                        msg = await asyncio.wait_for(anext(drain), timeout=15)
                         yield msg
                 except (StopAsyncIteration, asyncio.TimeoutError, Exception):
                     pass
