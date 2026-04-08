@@ -536,8 +536,9 @@ class KilnHarness:
     def _template_vars(self) -> dict[str, str]:
         """Build template variable dict for orientation and cleanup messages.
 
-        Provides: {agent_id}, {today}, {now}, {summary_path}.
-        Subclasses can override to add agent-specific variables.
+        Base vars: {agent_id}, {today}, {now}, {summary_path}.
+        Config vars (from --var flags or programmatic assignment) are merged on
+        top. Subclasses can override to add agent-specific variables.
         """
         today = date.today().strftime("%Y-%m-%d")
         now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -550,12 +551,15 @@ class KilnHarness:
                 n += 1
             summary_path = sessions_path / f"{today}-{self.agent_id}_{n}.md"
 
-        return dict(
+        result = dict(
             agent_id=self.agent_id,
             today=today,
             now=now,
             summary_path=str(summary_path),
         )
+        # Merge extra vars from config (CLI --var, programmatic assignment)
+        result.update(self.config.template_vars)
+        return result
 
     def _run_startup_commands(self) -> None:
         """Run startup commands from agent config before session begins.

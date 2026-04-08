@@ -107,6 +107,13 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Session template — partial config override from <home>/templates/<name>.yml",
     )
+    parser.add_argument(
+        "--var",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra template variable for orientation/cleanup (repeatable)",
+    )
 
 
 def _parse_init_args(parser: argparse.ArgumentParser) -> None:
@@ -189,6 +196,8 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--effort", args.effort]
     if getattr(args, "template", None):
         cmd_parts += ["--template", args.template]
+    for var_str in getattr(args, "var", []):
+        cmd_parts += ["--var", var_str]
     return shlex.join(cmd_parts)
 
 
@@ -320,6 +329,14 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     if getattr(args, "effort", None):
         config.effort = args.effort
 
+    # Parse --var KEY=VALUE pairs into config.template_vars
+    for var_str in getattr(args, "var", []):
+        if "=" not in var_str:
+            print(f"Error: --var must be KEY=VALUE, got: {var_str}")
+            sys.exit(1)
+        key, _, value = var_str.partition("=")
+        config.template_vars[key] = value
+
     # Resolve prompt
     if args.prompt and getattr(args, "prompt_file", None):
         print("Error: --prompt and --prompt-file are mutually exclusive")
@@ -386,6 +403,8 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             exec_args.append("--persistent")
         if getattr(args, "template", None):
             exec_args += ["--template", args.template]
+        for var_str in getattr(args, "var", []):
+            exec_args += ["--var", var_str]
         if config.idle_nudge_timeout > 0:
             exec_args += ["--idle-nudge", str(int(config.idle_nudge_timeout / 60))]
         if harness.handoff_text:
