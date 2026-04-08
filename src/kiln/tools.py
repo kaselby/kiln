@@ -21,6 +21,7 @@ from pathlib import Path
 import yaml
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from .edit_normalize import normalize_edit_inputs
 from .shell import PersistentShell, safe_getcwd
 
 
@@ -305,6 +306,9 @@ def edit_file(
         content = Path(normalized).read_text()
     except OSError as e:
         return _error(f"Failed to read file: {e}")
+
+    # Normalize inputs: desanitize API tokens, fix curly quotes, strip trailing whitespace
+    old_string, new_string = normalize_edit_inputs(content, normalized, old_string, new_string)
 
     match_string = old_string.rstrip("\n")
 
