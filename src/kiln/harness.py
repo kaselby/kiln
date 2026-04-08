@@ -8,6 +8,7 @@ Complex agents write their own harness that imports kiln's building
 blocks directly.
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -15,6 +16,8 @@ import shutil
 import subprocess
 from datetime import date, datetime
 from pathlib import Path
+
+import yaml
 
 log = logging.getLogger("kiln.harness")
 
@@ -53,6 +56,21 @@ from .registry import lookup_session, register_session
 from .session_config import SessionConfig
 from .shell import safe_getcwd
 from .tools import FileState, SessionControl, create_mcp_server
+
+
+class _BlockDumper(yaml.SafeDumper):
+    """YAML dumper that uses literal block scalars for multiline strings."""
+    pass
+
+def _block_str_representer(dumper, data):
+    if "\n" in data:
+        # Strip trailing whitespace per line — block scalars can't represent it,
+        # and it's never meaningful in prompt/config content.
+        cleaned = "\n".join(line.rstrip() for line in data.split("\n"))
+        return dumper.represent_scalar("tag:yaml.org,2002:str", cleaned, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+_BlockDumper.add_representer(str, _block_str_representer)
 
 
 def _tools_path_dirs(tools_path: Path) -> str:
@@ -206,46 +224,117 @@ class KilnHarness:
         """Register TUI callbacks for permission handling."""
         self._permission_callbacks = (get_mode, request_permission)
 
+    # -- Session state persistence -----------------------------------------
+
+    @property
+    def _session_state_path(self) -> Path:
+        return self.config.home / "logs" / "session-state" / f"{self.agent_id}.yml"
+
+    def _save_session_state(
+        self,
+        system_prompt: str,
+        session_config: dict | None = None,
+        channel_subscriptions: list[str] | None = None,
+    ) -> None:
+        state: dict = {"system_prompt": system_prompt}
+        if session_config is not None:
+            state["session_config"] = session_config
+        if channel_subscriptions is not None:
+            state["channel_subscriptions"] = channel_subscriptions
+        path = self._session_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(yaml.dump(state, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False, allow_unicode=True))
+        tmp.rename(path)
+
+    def _load_session_state(self) -> dict | None:
+        path = self._session_state_path
+        if not path.exists():
+            return None
+        try:
+            data = yaml.safe_load(path.read_text())
+            return data if isinstance(data, dict) else None
+        except (OSError, yaml.YAMLError):
+            return None
+
+    def _snapshot_channel_subscriptions(self) -> list[str]:
+        channels_path = self.config.home / "channels.json"
+        if not channels_path.exists():
+            return []
+        try:
+            with open(channels_path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                data = json.loads(f.read() or "{}")
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [ch for ch, subs in data.items() if self.agent_id in subs]
+
+    def _restore_channel_subscriptions(self, subscriptions: list[str]) -> None:
+        if not subscriptions:
+            return
+        channels_path = self.config.home / "channels.json"
+        try:
+            channels_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(channels_path, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.seek(0)
+                try:
+                    channels = json.loads(f.read() or "{}")
+                except json.JSONDecodeError:
+                    channels = {}
+                for channel in subscriptions:
+                    subs = channels.get(channel, [])
+                    if self.agent_id not in subs:
+                        subs.append(self.agent_id)
+                    channels[channel] = subs
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(channels, indent=2) + "\n")
+        except OSError:
+            pass
+
+    # -- Options builder ----------------------------------------------------
+
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions from config."""
-        # Load identity document
-        identity = self.config.load_identity()
+        # Restore saved state if resuming
+        saved_state = self._load_session_state() if self.config.resume_session else None
 
-        # Build session context
         cwd = self.config.project or safe_getcwd()
-        custom_tools = discover_tool_layout(self.config.tools_path)
-        skills = discover_skill_layout(self.config.skills_path)
 
-        extra_lines = [f"Inbox: {self.config.agent_inbox(self.agent_id)}"]
-        session_ctx = build_session_context(
-            self.agent_id,
-            self.config.model,
-            tools=custom_tools,
-            skills=skills,
-            parent=self.config.parent,
-            depth=self.config.depth,
-            cwd=cwd,
-            extra_lines=extra_lines,
-        )
+        if saved_state and "system_prompt" in saved_state:
+            full_prompt = saved_state["system_prompt"]
+        else:
+            # Build fresh prompt
+            identity = self.config.load_identity()
+            custom_tools = discover_tool_layout(self.config.tools_path)
+            skills = discover_skill_layout(self.config.skills_path)
 
-        # Load tool documentation for configured tools
-        tool_docs = load_tool_docs(self.config.tools)
+            extra_lines = [f"Inbox: {self.config.agent_inbox(self.agent_id)}"]
+            session_ctx = build_session_context(
+                self.agent_id,
+                self.config.model,
+                tools=custom_tools,
+                skills=skills,
+                parent=self.config.parent,
+                depth=self.config.depth,
+                cwd=cwd,
+                extra_lines=extra_lines,
+            )
 
-        # Load context injection files
-        context_parts = []
-        for label, content in self.config.load_context_files():
-            context_parts.append(f"\n\n---\n## {label}\n\n{content}")
+            tool_docs = load_tool_docs(self.config.tools)
 
-        full_prompt = identity
-        if tool_docs:
-            full_prompt += "\n\n" + tool_docs
-        full_prompt += session_ctx + "".join(context_parts)
+            context_parts = []
+            for label, content in self.config.load_context_files():
+                context_parts.append(f"\n\n---\n## {label}\n\n{content}")
 
-        # Save system prompt for debugging. Do NOT restore on resume — a stale
-        # system prompt can embed outdated role/context that misleads the model.
-        prompt_store = self.config.home / "logs" / "system-prompts"
-        prompt_store.mkdir(parents=True, exist_ok=True)
-        (prompt_store / f"{self.agent_id}.txt").write_text(full_prompt)
+            full_prompt = identity
+            if tool_docs:
+                full_prompt += "\n\n" + tool_docs
+            full_prompt += session_ctx + "".join(context_parts)
+
+        # Save session state (prompt saved now; config + channels updated at shutdown)
+        self._save_session_state(full_prompt)
 
         # Set up inbox
         inbox = self.config.agent_inbox(self.agent_id)
@@ -273,16 +362,23 @@ class KilnHarness:
         self.session_control = SessionControl()
 
         # Per-session runtime config — seeded from harness config, agent-writable.
-        # Agent harnesses extend with their own defaults (e.g. show_thinking).
+        # On resume, saved values override harness defaults so state is restored.
+        config_defaults = {
+            "mode": self._initial_mode.value,
+            "heartbeat_enabled": self.config.heartbeat,
+            "heartbeat_max": self.config.heartbeat_max,
+            "heartbeat_override": self.config.heartbeat_override,
+        }
+        if saved_state and saved_state.get("session_config"):
+            config_defaults.update(saved_state["session_config"])
         self.session_config = SessionConfig(
             path=self.config.home / "state" / f"session-config-{self.agent_id}.yml",
-            defaults={
-                "mode": self._initial_mode.value,
-                "heartbeat_enabled": self.config.heartbeat,
-                "heartbeat_max": self.config.heartbeat_max,
-                "heartbeat_override": self.config.heartbeat_override,
-            },
+            defaults=config_defaults,
         )
+
+        # Restore channel subscriptions from saved state
+        if saved_state and saved_state.get("channel_subscriptions"):
+            self._restore_channel_subscriptions(saved_state["channel_subscriptions"])
 
         # Build infrastructure hooks
         state_dir = self.config.home / "state"
@@ -727,8 +823,54 @@ class KilnHarness:
             return []
         return [self.config.cleanup.format(**self._template_vars())]
 
+    def _cleanup_channel_subscriptions(self) -> None:
+        """Remove this agent from all channel subscriptions on exit."""
+        channels_path = self.config.home / "channels.json"
+        if not channels_path.exists():
+            return
+        try:
+            with open(channels_path, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.seek(0)
+                try:
+                    channels = json.loads(f.read() or "{}")
+                except json.JSONDecodeError:
+                    return
+                changed = False
+                for channel in list(channels):
+                    subs = channels[channel]
+                    if self.agent_id in subs:
+                        subs.remove(self.agent_id)
+                        changed = True
+                    if not subs:
+                        del channels[channel]
+                if changed:
+                    f.seek(0)
+                    f.truncate()
+                    f.write(json.dumps(channels, indent=2) + "\n")
+        except OSError:
+            pass  # Best-effort — don't block shutdown
+
+    def _snapshot_session_state(self) -> None:
+        """Update the session state file with final config and channel subscriptions."""
+        path = self._session_state_path
+        if not path.exists():
+            return
+        state = self._load_session_state() or {}
+        if self.session_config:
+            state["session_config"] = self.session_config.all
+        state["channel_subscriptions"] = self._snapshot_channel_subscriptions()
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(yaml.dump(state, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False, allow_unicode=True))
+            tmp.rename(path)
+        except OSError:
+            pass
+
     async def stop(self):
         """Disconnect the agent session and clean up resources."""
+        self._snapshot_session_state()
+        self._cleanup_channel_subscriptions()
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None
