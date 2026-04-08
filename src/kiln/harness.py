@@ -297,7 +297,9 @@ class KilnHarness:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions from config."""
-        # Restore saved state if resuming
+        # Restore saved state if resuming (--resume reuses the agent-id, so the
+        # state file exists). Self-continuation (--continue) gets a new agent-id
+        # and builds everything fresh.
         saved_state = self._load_session_state() if self.config.resume_session else None
 
         cwd = self.config.project or safe_getcwd()
@@ -333,8 +335,13 @@ class KilnHarness:
                 full_prompt += "\n\n" + tool_docs
             full_prompt += session_ctx + "".join(context_parts)
 
-        # Save session state (prompt saved now; config + channels updated at shutdown)
-        self._save_session_state(full_prompt)
+        # Save session state — on resume, preserve saved config + channels so a crash
+        # between here and shutdown doesn't lose them. Updated again at shutdown.
+        self._save_session_state(
+            full_prompt,
+            session_config=saved_state.get("session_config") if saved_state else None,
+            channel_subscriptions=saved_state.get("channel_subscriptions") if saved_state else None,
+        )
 
         # Set up inbox
         inbox = self.config.agent_inbox(self.agent_id)
@@ -824,7 +831,11 @@ class KilnHarness:
         return [self.config.cleanup.format(**self._template_vars())]
 
     def _cleanup_channel_subscriptions(self) -> None:
-        """Remove this agent from all channel subscriptions on exit."""
+        """Remove this agent from all channel subscriptions on exit.
+
+        Returns early on corrupt JSON — can't safely assume empty when the
+        intent is removal (vs _restore which can safely start from {}).
+        """
         channels_path = self.config.home / "channels.json"
         if not channels_path.exists():
             return
