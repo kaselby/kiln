@@ -69,8 +69,8 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         help="Persistent peer instance: self-continues, coordinates with parent",
     )
     parser.add_argument(
-        "--continue", dest="continue_session", action="store_true",
-        help="Continue the most recent session instead of starting fresh",
+        "--last", dest="last_session", action="store_true",
+        help="Resume the most recent session",
     )
     parser.add_argument(
         "--resume", metavar="AGENT_ID",
@@ -177,8 +177,8 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts.append("--persistent")
     if args.mode:
         cmd_parts += ["--mode", args.mode]
-    if args.continue_session:
-        cmd_parts.append("--continue")
+    if args.last_session:
+        cmd_parts.append("--last")
     if args.resume:
         cmd_parts += ["--resume", args.resume]
     if args.heartbeat is not None:
@@ -308,8 +308,6 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
         config.persistent = True
     if args.continuation:
         config.continuation = True
-    if args.continue_session:
-        config.continue_session = True
     if args.resume:
         config.resume_session = args.resume
     if args.mode:
@@ -336,11 +334,11 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     if prompt:
         config.prompt = prompt
 
-    # Resolve --continue agent ID before launching tmux so the session name is correct
-    if args.continue_session and not args.id:
+    # --last resolves to --resume <most-recent-agent-id>
+    if args.last_session and not config.resume_session:
         resolved_id = _most_recent_agent_id(config)
         if resolved_id:
-            config.agent_id = resolved_id
+            config.resume_session = resolved_id
 
     # If not inside our tmux guard, launch through tmux
     if not os.environ.get(_TMUX_GUARD) or args.detach:

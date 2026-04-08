@@ -68,7 +68,6 @@ class AgentConfig:
     continuation: bool = False
 
     # Session lifecycle
-    continue_session: bool = False
     resume_session: str | None = None
     prompt: str | None = None
 

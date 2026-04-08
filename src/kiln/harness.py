@@ -297,9 +297,8 @@ class KilnHarness:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions from config."""
-        # Restore saved state if resuming or continuing (both reuse the agent-id,
-        # so the state file exists with the original prompt, config, and channels).
-        saved_state = self._load_session_state() if (self.config.resume_session or self.config.continue_session) else None
+        # Restore saved state if resuming (--resume and --last both set resume_session).
+        saved_state = self._load_session_state() if self.config.resume_session else None
 
         cwd = self.config.project or safe_getcwd()
 
@@ -485,8 +484,7 @@ class KilnHarness:
         )
         mcp_servers = {"kiln": mcp_server}
 
-        # Resolve conversation continuity — prefer agent-specific UUID over
-        # cwd-global --continue, which can pick up a different agent's conversation.
+        # Resolve conversation continuity for --resume / --last.
         resume_uuid = None
         if self.config.resume_session:
             entry = lookup_session(self._registry_path, self.config.resume_session)
@@ -502,13 +500,6 @@ class KilnHarness:
                 )
             if entry.get("cwd"):
                 cwd = entry["cwd"]
-        elif self.config.continue_session:
-            entry = lookup_session(self._registry_path, self.agent_id)
-            if entry:
-                resume_uuid = entry.get("session_uuid")
-                if entry.get("cwd"):
-                    cwd = entry["cwd"]
-
         # Expose resume UUID so the TUI can locate the prior conversation.
         self._resume_uuid = resume_uuid
 
@@ -533,7 +524,7 @@ class KilnHarness:
             env=env,
             permission_mode="bypassPermissions",
             include_partial_messages=True,
-            continue_conversation=self.config.continue_session and not resume_uuid,
+            continue_conversation=False,
             resume=resume_uuid,
             stderr=_stderr_callback,
             extra_args={"setting-sources": ""},  # don't inherit user's CLI settings/MCP servers
