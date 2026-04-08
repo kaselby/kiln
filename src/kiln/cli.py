@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .config import AgentConfig, load_agent_spec
+from .config import AgentConfig, apply_template, load_agent_spec
 from .names import generate_agent_name
 from .registry import lookup_session
 
@@ -102,6 +102,11 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Thinking effort level (low, medium, high). Default: high.",
     )
+    parser.add_argument(
+        "--template",
+        default=None,
+        help="Session template — partial config override from <home>/templates/<name>.yml",
+    )
 
 
 def _parse_init_args(parser: argparse.ArgumentParser) -> None:
@@ -182,6 +187,8 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--idle-nudge", args.idle_nudge]
     if getattr(args, "effort", None):
         cmd_parts += ["--effort", args.effort]
+    if getattr(args, "template", None):
+        cmd_parts += ["--template", args.template]
     return shlex.join(cmd_parts)
 
 
@@ -282,6 +289,10 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     spec_path = _find_agent_spec(args.spec)
     config = load_agent_spec(spec_path)
 
+    # Apply session template (before CLI overrides, so flags always win)
+    if getattr(args, "template", None):
+        apply_template(config, args.template)
+
     # Apply CLI overrides
     if args.id:
         config.agent_id = args.id
@@ -375,6 +386,8 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             exec_args += ["--effort", args.effort]
         if args.persistent:
             exec_args.append("--persistent")
+        if getattr(args, "template", None):
+            exec_args += ["--template", args.template]
         if config.idle_nudge_timeout > 0:
             exec_args += ["--idle-nudge", str(int(config.idle_nudge_timeout / 60))]
         if harness.handoff_text:

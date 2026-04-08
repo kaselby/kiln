@@ -235,6 +235,59 @@ class AgentConfig:
         return result
 
 
+def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
+    """Apply raw YAML fields to an AgentConfig.
+
+    Shared by load_agent_spec (base config) and apply_template (overrides).
+    Unknown fields are silently ignored.
+    """
+    # Scalar fields — simple setattr
+    for field_name in [
+        "identity_doc", "owner_name", "model", "effort", "session_prefix",
+        "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
+        "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
+        "orientation", "cleanup", "initial_mode",
+    ]:
+        if field_name in raw:
+            setattr(config, field_name, raw[field_name])
+
+    if "startup" in raw:
+        config.startup = raw["startup"]
+
+    # Tools — flat namespaced list or structured dict
+    tools_raw = raw.get("tools")
+    if isinstance(tools_raw, list):
+        config.tools = tools_raw
+    elif isinstance(tools_raw, dict):
+        if "list" in tools_raw:
+            config.tools = tools_raw["list"]
+        if "scripts_dir" in tools_raw:
+            config.scripts_dir = tools_raw["scripts_dir"]
+
+    if "context_injection" in raw:
+        config.context_injection = raw["context_injection"]
+
+    if "hooks" in raw:
+        config.hooks = raw["hooks"]
+
+    # Heartbeat — bool or dict with enabled/max/override
+    if "heartbeat" in raw:
+        hb = raw["heartbeat"]
+        if isinstance(hb, dict):
+            config.heartbeat = hb.get("enabled", False)
+            config.heartbeat_max = hb.get("max", hb.get("interval", 1800.0))
+            config.heartbeat_override = hb.get("override", 0.0)
+        else:
+            config.heartbeat = bool(hb)
+
+    # Idle nudge — value in minutes
+    idle_key = "idle_nudge" if "idle_nudge" in raw else "idle-nudge" if "idle-nudge" in raw else None
+    if idle_key:
+        val = raw[idle_key]
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            config.idle_nudge_timeout = float(val) * 60
+
+
 def load_agent_spec(spec_path: Path) -> AgentConfig:
     """Load an AgentConfig from an agent.yml spec file.
 
@@ -255,60 +308,25 @@ def load_agent_spec(spec_path: Path) -> AgentConfig:
         name=raw.get("name", spec_path.parent.name),
         home=home,
     )
-
-    # Simple scalar fields
-    for field_name in [
-        "identity_doc", "owner_name", "model", "effort", "session_prefix",
-        "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
-        "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
-        "orientation", "cleanup",
-    ]:
-        if field_name in raw:
-            setattr(config, field_name, raw[field_name])
-
-    # Startup commands
-    if "startup" in raw:
-        config.startup = raw["startup"]
-
-    # Tools — either a flat namespaced list or a structured dict
-    tools_raw = raw.get("tools")
-    if isinstance(tools_raw, list):
-        # Flat namespaced list: ["Base::Read", "Kiln::Bash", ...]
-        config.tools = tools_raw
-    elif isinstance(tools_raw, dict):
-        # Structured with separate mcp_server/scripts_dir alongside tool list
-        if "list" in tools_raw:
-            config.tools = tools_raw["list"]
-        if "scripts_dir" in tools_raw:
-            config.scripts_dir = tools_raw["scripts_dir"]
-
-    if "mcp_server" in raw:
-        config.mcp_server = raw["mcp_server"]
-
-    # Context injection
-    if "context_injection" in raw:
-        config.context_injection = raw["context_injection"]
-
-    # Hooks
-    if "hooks" in raw:
-        config.hooks = raw["hooks"]
-
-    # Heartbeat
-    if "heartbeat" in raw:
-        hb = raw["heartbeat"]
-        if isinstance(hb, dict):
-            config.heartbeat = hb.get("enabled", False)
-            # Accept both "max"/"interval" (interval is legacy alias)
-            config.heartbeat_max = hb.get("max", hb.get("interval", 1800.0))
-            config.heartbeat_override = hb.get("override", 0.0)
-        else:
-            config.heartbeat = bool(hb)
-
-    # Idle nudge — send a message after prolonged inactivity (value in minutes)
-    idle_key = "idle_nudge" if "idle_nudge" in raw else "idle-nudge" if "idle-nudge" in raw else None
-    if idle_key:
-        val = raw[idle_key]
-        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
-            config.idle_nudge_timeout = float(val) * 60
-
+    _apply_raw_fields(config, raw)
     return config
+
+
+def apply_template(config: AgentConfig, name: str) -> None:
+    """Apply a session template to an existing config.
+
+    Templates live at <config.home>/templates/<name>.yml and provide
+    partial config overrides — same fields as agent.yml.
+    """
+    templates_dir = config.home / "templates"
+    path = templates_dir / f"{name}.yml"
+    if not path.exists():
+        path = templates_dir / name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Template not found: {name} "
+                f"(looked in {templates_dir})"
+            )
+
+    raw = yaml.safe_load(path.read_text()) or {}
+    _apply_raw_fields(config, raw)
