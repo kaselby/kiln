@@ -317,7 +317,7 @@ def _format_uptime(started_at: str) -> str:
         return "?"
 
 
-USAGE_CACHE_TTL = 900  # 15 min — conservative to avoid drawing attention to automated polling
+USAGE_CACHE_TTL = 600  # 10 min — conservative to avoid drawing attention to automated polling
 
 
 def _format_usage_reset(resets_at: str | None) -> str:
@@ -1745,7 +1745,11 @@ class _GatewayClient(discord.Client):
                     type=discord.ActivityType.watching,
                     name=text,
                 )
-                await self.change_presence(activity=activity)
+                await asyncio.wait_for(
+                    self.change_presence(activity=activity), timeout=15,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Presence update timed out")
             except Exception:
                 log.exception("Presence update error")
             await asyncio.sleep(STATUS_UPDATE_INTERVAL)
@@ -1775,7 +1779,12 @@ class _GatewayClient(discord.Client):
                         content += f"\n\U0001f4ca {usage_line}"
 
                 # Discord limits to 10 embeds per message
-                await self._update_or_create_status_message(status_ch, content, embeds[:10])
+                await asyncio.wait_for(
+                    self._update_or_create_status_message(status_ch, content, embeds[:10]),
+                    timeout=15,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Status update timed out")
             except Exception:
                 log.exception("Status update error")
             await asyncio.sleep(STATUS_UPDATE_INTERVAL)
