@@ -97,7 +97,7 @@ class AgentConfig:
     # a model turn, interrupt the stalled generation and auto-retry. Mitigates
     # Claude Code bug where API streaming connections stall silently (CC #25979).
     # 0 = disabled.
-    stream_timeout: float = 300.0
+    stream_timeout: float = 120.0
 
     # Tools — namespaced list: "Base::Read", "Kiln::Bash", "MyAgent::CustomTool"
     tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
