@@ -1081,13 +1081,18 @@ class KilnApp:
 
             # Archive and commit even when skipping summary (but not for ephemeral)
             if not getattr(self._harness.config, "ephemeral", False):
-                archive_path = self._harness.archive_conversation()
-                if archive_path:
-                    _tprint("<dim>Archived conversation to {}</dim>", archive_path)
-
-                commit_result = self._harness.commit_memory()
-                if commit_result:
-                    _tprint("<dim>Git: {}</dim>", commit_result)
+                try:
+                    archive_path = self._harness.archive_conversation()
+                    if archive_path:
+                        _tprint("<dim>Archived conversation to {}</dim>", archive_path)
+                except Exception:
+                    pass
+                try:
+                    commit_result = self._harness.commit_memory()
+                    if commit_result:
+                        _tprint("<dim>Git: {}</dim>", commit_result)
+                except Exception:
+                    pass
 
             _tprint("<dim>Disconnecting...</dim>")
             await self._harness.stop()
