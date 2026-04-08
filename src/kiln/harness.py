@@ -297,10 +297,9 @@ class KilnHarness:
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions from config."""
-        # Restore saved state if resuming (--resume reuses the agent-id, so the
-        # state file exists). Self-continuation (--continue) gets a new agent-id
-        # and builds everything fresh.
-        saved_state = self._load_session_state() if self.config.resume_session else None
+        # Restore saved state if resuming or continuing (both reuse the agent-id,
+        # so the state file exists with the original prompt, config, and channels).
+        saved_state = self._load_session_state() if (self.config.resume_session or self.config.continue_session) else None
 
         cwd = self.config.project or safe_getcwd()
 
