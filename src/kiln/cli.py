@@ -322,7 +322,11 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     if args.continuation:
         config.continuation = True
     if args.resume:
-        config.resume_session = args.resume
+        resume_id = args.resume
+        prefix = config.session_prefix
+        if prefix and not resume_id.startswith(prefix):
+            resume_id = prefix + resume_id
+        config.resume_session = resume_id
     if args.mode:
         config.initial_mode = args.mode
     if args.heartbeat is not None:

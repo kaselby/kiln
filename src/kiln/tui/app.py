@@ -635,7 +635,7 @@ class KilnApp:
                 app_ref._harness.restart_requested = True
                 event.app.exit()
                 return
-            if text == "/fquit":
+            if text in ("/fquit", "/fq"):
                 sc = app_ref._harness.session_control
                 if sc:
                     sc.skip_summary = True
