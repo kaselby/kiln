@@ -985,8 +985,7 @@ class KilnApp:
             desc = t.get("description", "")
             style = status_style.get(status, "dim")
             icon = {"done": "\u2713", "in_progress": "\u25b6", "pending": "\u25cb"}.get(status, " ")
-            _tprint("  <{style}>{icon} [{status}]</{style}> {desc}",
-                    style=style, icon=icon, status=status, desc=desc)
+            _tprint(f"  <{style}>{{}} [{{}}]</{style}> {{}}", icon, status, desc)
         tasks = data["tasks"]
         done = sum(1 for t in tasks if t.get("status") == "done")
         _tprint("<dim>Progress: {}/{} done</dim>\n", done, len(tasks))
@@ -1036,7 +1035,7 @@ class KilnApp:
 
             pct = f"{util:.0f}"
             _tprint("  <text-heading>{label}</text-heading>", label=label)
-            _tprint("  <{s}>{bar}</{s}>  {pct}% used", s=style, bar=bar, pct=pct)
+            _tprint(f"  <{style}>{{}}</{style}>  {{}}% used", bar, pct)
 
             resets_at = limit.get("resets_at")
             if resets_at:
