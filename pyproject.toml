@@ -18,6 +18,9 @@ dependencies = [
 kiln = "kiln.cli:main"
 
 [project.optional-dependencies]
+openai = [
+    "openai>=1.60",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
