@@ -763,6 +763,7 @@ class KilnHarness:
             resume_conversation_id=resume_uuid,
             stream_timeout=self.config.stream_timeout,
             stderr_callback=_stderr_callback,
+            supplemental=self._supplemental,
             base_tools=base_tools,
             extra_args={"setting-sources": ""},
         )

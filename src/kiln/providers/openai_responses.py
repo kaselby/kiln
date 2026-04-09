@@ -502,6 +502,34 @@ class OpenAIResponsesProvider:
             "file_data": b64,
         }
 
+    def build_rich_tool_result(
+        self, content_blocks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Convert MCP content blocks to Responses API rich output format.
+
+        The Responses API accepts function_call_output.output as either a
+        string or a list of input_text / input_image / input_file items.
+
+        Fail-closed: if any block can't be converted, returns None so the
+        caller falls back to the plain text output. This prevents silent
+        data loss for unsupported content types.
+        """
+        import base64 as _b64
+
+        parts: list[dict[str, Any]] = []
+        for block in content_blocks:
+            btype = block.get("type", "")
+            if btype == "text" and block.get("text"):
+                parts.append({"type": "input_text", "text": block["text"]})
+            elif btype == "image":
+                data = _b64.b64decode(block.get("data", ""))
+                mime = block.get("mimeType", "image/png")
+                parts.append(self.build_image_content(data, mime))
+            elif btype:
+                # Unknown non-text block — can't convert, fail closed
+                return None
+        return parts if parts else None
+
     @property
     def context_injection_role(self) -> str:
         return "developer"

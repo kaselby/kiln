@@ -342,13 +342,10 @@ class ClaudeBackend:
     def _build_rich_message(blocks: list[ContentBlock]):
         """Convert Kiln ContentBlocks to an async iter for client.query()."""
         content_parts = []
-        labels = []
-
         for block in blocks:
             if isinstance(block, TextContent):
                 content_parts.append({"type": "text", "text": block.text})
             elif isinstance(block, DocumentContent):
-                labels.append(block.label)
                 content_parts.append({
                     "type": "document",
                     "source": {
@@ -357,12 +354,6 @@ class ClaudeBackend:
                         "data": _b64.b64encode(block.data).decode("ascii"),
                     },
                 })
-
-        if labels:
-            content_parts.append({
-                "type": "text",
-                "text": f"Document content loaded for: {', '.join(labels)}. Continue with your task.",
-            })
 
         async def _iter():
             yield {

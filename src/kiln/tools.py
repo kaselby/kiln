@@ -108,37 +108,9 @@ class SessionControl:
         self.context_tokens: int = 0
 
 
-class SupplementalContent:
-    """Collects content that needs injection as user messages.
-
-    Some content types (e.g. PDF document blocks) can't be expressed in MCP
-    tool results — they need to go in user-level messages. MCP tools stash
-    raw file data here; the harness drains it and injects it between turns,
-    formatted for whatever backend is in use.
-
-    The data is stored backend-agnostic: raw bytes + MIME type. The harness's
-    _format_supplemental_message() converts to the right wire format.
-    """
-
-    def __init__(self):
-        self._pending: list[dict] = []
-
-    def add_file(self, data: bytes, mime_type: str, label: str = "") -> None:
-        """Stash a file for user-message injection."""
-        self._pending.append({
-            "data": data,
-            "mime_type": mime_type,
-            "label": label,
-        })
-
-    def drain(self) -> list[dict]:
-        """Return and clear all pending items."""
-        items, self._pending = self._pending, []
-        return items
-
-    @property
-    def has_pending(self) -> bool:
-        return bool(self._pending)
+# Re-export from types (moved there so BackendConfig can reference it
+# without circular imports).
+from .types import SupplementalContent  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +519,12 @@ def _read_pdf(
         data = Path(normalized).read_bytes()
     except OSError as e:
         return _error(f"Failed to read PDF: {e}")
+
+    if not data or not data[:5].startswith(b"%PDF"):
+        return _error(
+            f"Not a valid PDF file: {file_path}. "
+            "The file is missing the PDF header (%PDF magic bytes)."
+        )
 
     size_mb = len(data) / (1024 * 1024)
     if size_mb > 32:

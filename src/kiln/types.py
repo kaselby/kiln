@@ -165,6 +165,14 @@ class HookResult:
 
 
 @dataclass
+class PostToolResult:
+    """Result of post-tool hook processing."""
+    additional_context: str | None = None
+    updated_tool_output: str | None = None  # Replace tool output text in history
+    continue_: bool = True  # False = stop the agentic loop, return to harness
+
+
+@dataclass
 class HookRule:
     """A pattern-matched hook binding."""
     pattern: str | None              # None = match all, "Read" = exact match
@@ -219,8 +227,10 @@ class HookDispatcher:
 
     async def post_tool(
         self, tool_name: str, tool_input: dict, tool_response: str,
-    ) -> str | None:
+    ) -> PostToolResult:
         additional_context = []
+        updated_output: str | None = None
+        should_continue = True
         for rule in self._post:
             if rule.matches(tool_name):
                 result = await rule.hook(
@@ -229,10 +239,21 @@ class HookDispatcher:
                     None,
                     {"signal": None},
                 )
-                ctx = self._unwrap(result).get("additionalContext")
+                unwrapped = self._unwrap(result)
+                ctx = unwrapped.get("additionalContext")
                 if ctx:
                     additional_context.append(ctx)
-        return "\n".join(additional_context) if additional_context else None
+                updated = unwrapped.get("updatedMCPToolOutput")
+                if updated is not None:
+                    updated_output = updated
+                # continue_ is top-level (not inside hookSpecificOutput)
+                if result.get("continue_") is False:
+                    should_continue = False
+        return PostToolResult(
+            additional_context="\n".join(additional_context) if additional_context else None,
+            updated_tool_output=updated_output,
+            continue_=should_continue,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +275,36 @@ class DocumentContent:
 
 
 ContentBlock = TextContent | DocumentContent
+
+
+class SupplementalContent:
+    """Collects content that needs injection as user messages.
+
+    Some content types (e.g. PDF document blocks, images on providers without
+    native rich tool results) can't be expressed in tool results — they need
+    to go in user-level messages. MCP tools and the CustomBackend stash raw
+    file data here; the harness drains it and injects it between turns.
+    """
+
+    def __init__(self):
+        self._pending: list[dict] = []
+
+    def add_file(self, data: bytes, mime_type: str, label: str = "") -> None:
+        """Stash a file for user-message injection."""
+        self._pending.append({
+            "data": data,
+            "mime_type": mime_type,
+            "label": label,
+        })
+
+    def drain(self) -> list[dict]:
+        """Return and clear all pending items."""
+        items, self._pending = self._pending, []
+        return items
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +353,18 @@ class Provider(Protocol):
         Handles PDFs, docx, txt, spreadsheets, etc. Each provider has its
         own format for file uploads (OpenAI uses input_file, Anthropic uses
         document blocks, etc).
+        """
+        ...
+
+    def build_rich_tool_result(
+        self, content_blocks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Convert MCP tool result content blocks to provider-specific format.
+
+        Called when a tool returns rich content (images, files) that the
+        provider might be able to include natively in function_call_output.
+        Returns a list suitable for the output field, or None if the
+        provider doesn't support rich tool results (caller falls back to text).
         """
         ...
 
@@ -361,6 +424,11 @@ class BackendConfig:
 
     # Stderr
     stderr_callback: Callable[[str], None] | None = None
+
+    # Supplemental content — shared with CustomBackend so it can stash
+    # rich content (images, files) that the provider can't deliver natively
+    # in tool results. The harness drains and injects as a user turn.
+    supplemental: SupplementalContent | None = None
 
     # Permission mode (ClaudeBackend-specific, but harmless to carry generically)
     permission_mode: str = "bypassPermissions"

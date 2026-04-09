@@ -14,6 +14,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import base64 as _b64
+
 from ..types import (
     BackendConfig,
     ContentBlock,
@@ -56,6 +58,7 @@ class ToolResultTurn:
     call_id: str
     output: str
     is_error: bool = False
+    rich_content: list[dict] | None = None  # Raw MCP content blocks (images, etc.)
 
 @dataclass
 class ContextInjection:
@@ -92,6 +95,7 @@ class CustomBackend:
         self._config = config
         self._tool_registry = {t.name: t for t in config.tool_defs}
         self._hook_dispatcher = config.hook_dispatcher
+        self._supplemental = config.supplemental
 
     async def send(self, message: str | list[ContentBlock]) -> None:
         if isinstance(message, str):
@@ -186,6 +190,7 @@ class CustomBackend:
                 break
 
             # Process tool calls
+            hook_stopped = False
             for tc in tool_calls:
                 if self._interrupted:
                     break
@@ -206,29 +211,52 @@ class CustomBackend:
                         continue
 
                 # Execute tool
-                result_output, result_error = await self._execute_tool(tc)
+                result_text, result_error, rich_content = await self._execute_tool(tc)
+
+                # If the provider can't deliver rich content natively,
+                # stash it for supplemental injection by the harness.
+                stashed_for_injection = False
+                if rich_content and self._supplemental:
+                    if self._provider.build_rich_tool_result(rich_content) is None:
+                        self._stash_rich_content(rich_content)
+                        rich_content = None
+                        stashed_for_injection = True
+
                 yield ToolResultEvent(
                     tool_call_id=tc.id,
-                    output=result_output,
+                    output=result_text,
                     is_error=result_error,
                 )
 
                 # Append tool result BEFORE context injection — APIs expect
                 # function_call_output immediately after the function_call.
-                self._history.append(ToolResultTurn(
-                    call_id=tc.id, output=result_output, is_error=result_error,
-                ))
+                tool_result_turn = ToolResultTurn(
+                    call_id=tc.id, output=result_text, is_error=result_error,
+                    rich_content=rich_content,
+                )
+                self._history.append(tool_result_turn)
 
-                # Post-tool hook (context injection)
+                # Post-tool hook (context injection + flow control)
                 if self._hook_dispatcher:
-                    injection = await self._hook_dispatcher.post_tool(
-                        tc.name, tc.input, result_output,
+                    post_result = await self._hook_dispatcher.post_tool(
+                        tc.name, tc.input, result_text,
                     )
-                    if injection:
-                        self._history.append(ContextInjection(text=injection))
+                    if post_result.updated_tool_output is not None:
+                        tool_result_turn.output = post_result.updated_tool_output
+                    if post_result.additional_context:
+                        self._history.append(
+                            ContextInjection(text=post_result.additional_context),
+                        )
+                    if not post_result.continue_:
+                        hook_stopped = True
+                        break
+                if stashed_for_injection:
+                    hook_stopped = True
+                    break
 
-            # Tool calls processed — loop continues
-            if not self._interrupted:
+            # Tool calls processed — continue the agentic loop unless
+            # a hook or stash requested a stop.
+            if not self._interrupted and not hook_stopped:
                 self._has_pending_turn = True
 
         # Emit a single TurnCompleteEvent with accumulated usage
@@ -302,10 +330,15 @@ class CustomBackend:
                         })
 
             elif isinstance(turn, ToolResultTurn):
+                output: str | list[dict] = turn.output
+                if turn.rich_content:
+                    rich = self._provider.build_rich_tool_result(turn.rich_content)
+                    if rich is not None:
+                        output = rich
                 items.append({
                     "type": "function_call_output",
                     "call_id": turn.call_id,
-                    "output": turn.output,
+                    "output": output,
                 })
 
             elif isinstance(turn, ContextInjection):
@@ -421,16 +454,34 @@ class CustomBackend:
     # Tool execution
     # -------------------------------------------------------------------
 
-    async def _execute_tool(self, tc: ToolCallEvent) -> tuple[str, bool]:
-        """Execute a tool call. Returns (output, is_error).
+    def _stash_rich_content(self, content_blocks: list[dict]) -> None:
+        """Stash rich content blocks in supplemental for harness injection.
 
-        MCP results can contain text, images, and other block types.
-        Only text is extracted — images get a placeholder to avoid dumping
-        raw base64 into the conversation history.
+        Called when the provider can't deliver rich content natively in
+        tool results. Converts MCP content blocks to raw bytes for the
+        harness's backend-agnostic supplemental injection pipeline.
+        """
+        for block in content_blocks:
+            btype = block.get("type", "")
+            if btype == "image":
+                data = _b64.b64decode(block.get("data", ""))
+                mime = block.get("mimeType", "image/png")
+                self._supplemental.add_file(data, mime, "tool-image")
+
+    async def _execute_tool(
+        self, tc: ToolCallEvent,
+    ) -> tuple[str, bool, list[dict] | None]:
+        """Execute a tool call. Returns (text_output, is_error, rich_content).
+
+        MCP results can contain text, images, and other block types. The text
+        representation is always produced (for ToolResultEvent / TUI display).
+        When non-text content is present, the raw MCP content blocks are
+        preserved in rich_content so providers can include them natively in
+        tool results.
         """
         tool = self._tool_registry.get(tc.name)
         if not tool:
-            return f"Unknown tool: {tc.name}", True
+            return f"Unknown tool: {tc.name}", True, None
 
         try:
             result = await tool.handler(tc.input)
@@ -438,23 +489,29 @@ class CustomBackend:
             content = result.get("content", [])
 
             if not content or not isinstance(content, list):
-                return str(result), is_error
+                return str(result), is_error, None
 
-            parts = []
+            text_parts = []
+            has_rich = False
             for block in content:
                 if not isinstance(block, dict):
                     continue
                 btype = block.get("type", "")
                 if btype == "text" and block.get("text"):
-                    parts.append(block["text"])
+                    text_parts.append(block["text"])
                 elif btype == "image":
                     mime = block.get("mimeType", "image/png")
-                    parts.append(f"[Image: {mime}]")
+                    text_parts.append(f"[Image: {mime}]")
+                    has_rich = True
+                else:
+                    # Any non-text block type — preserve for provider
+                    has_rich = True
 
-            return "\n".join(parts) if parts else "(no output)", is_error
+            text = "\n".join(text_parts) if text_parts else "(no output)"
+            return text, is_error, content if has_rich else None
         except Exception as e:
             log.error("Tool %s raised: %s", tc.name, e)
-            return f"Tool execution error: {e}", True
+            return f"Tool execution error: {e}", True, None
 
     # -------------------------------------------------------------------
     # Generation params
