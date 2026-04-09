@@ -991,7 +991,7 @@ class KilnApp:
         _tprint("<dim>Progress: {}/{} done</dim>\n", done, len(tasks))
 
     def _show_usage(self) -> None:
-        """Show Anthropic subscription usage."""
+        """Show subscription usage for all providers."""
         tool_path = self._harness.config.home / "tools" / "core" / "usage"
         if not tool_path.exists():
             _tprint("<err>Usage tool not found.</err>")
@@ -1010,13 +1010,54 @@ class KilnApp:
             _tprint("<err>Usage fetch failed.</err>")
             return
 
-        _tprint("\n<text-heading>Anthropic Max \u2014 Usage</text-heading>")
+        # Anthropic — nested under "anthropic" or flat at top level (legacy)
+        anthropic = data.get("anthropic", data if "five_hour" in data else {})
+        if anthropic:
+            _tprint("\n<text-heading>Anthropic Max \u2014 Usage</text-heading>")
+            self._show_usage_limits(anthropic, [
+                ("five_hour", "Session (5h)"),
+                ("seven_day", "Weekly \u2014 all models"),
+                ("seven_day_sonnet", "Weekly \u2014 Sonnet"),
+            ])
 
-        for key, label in [
-            ("five_hour", "Session (5h)"),
-            ("seven_day", "Weekly \u2014 all models"),
-            ("seven_day_sonnet", "Weekly \u2014 Sonnet"),
-        ]:
+        # OpenAI/Codex — nested under "openai"
+        openai_data = data.get("openai", {})
+        rate_limit = openai_data.get("rate_limit", {})
+        if rate_limit:
+            plan = openai_data.get("plan_type", "unknown").capitalize()
+            _tprint(f"\n<text-heading>OpenAI {plan} \u2014 Usage</text-heading>")
+            for window_key, label in [("primary_window", "Primary (5h)"), ("secondary_window", "Secondary (7d)")]:
+                window = rate_limit.get(window_key)
+                if not window:
+                    continue
+                used = window.get("used_percent", 0)
+                ratio = used / 100.0
+                filled = int(ratio * 30)
+                bar = "\u2588" * filled + "\u2591" * (30 - filled)
+                style = "err" if ratio >= 0.9 else "tool" if ratio >= 0.7 else "diff-add"
+                _tprint("  <text-heading>{label}</text-heading>", label=label)
+                _tprint(f"  <{style}>{{}}</{style}>  {{}}% used", bar, used)
+                reset_at = window.get("reset_at")
+                if reset_at:
+                    try:
+                        total_sec = int(reset_at - datetime.now(timezone.utc).timestamp())
+                        if total_sec > 0:
+                            hours, rem = divmod(total_sec, 3600)
+                            minutes = rem // 60
+                            if hours > 24:
+                                rt = f"resets in {hours // 24}d {hours % 24}h"
+                            elif hours > 0:
+                                rt = f"resets in {hours}h {minutes}m"
+                            else:
+                                rt = f"resets in {minutes}m"
+                            _tprint("  <dim>{}</dim>", rt)
+                    except (ValueError, TypeError):
+                        pass
+                _tprint("")
+
+    def _show_usage_limits(self, data: dict, limits: list[tuple[str, str]]) -> None:
+        """Render Anthropic-style usage limits with progress bars."""
+        for key, label in limits:
             limit = data.get(key)
             if not limit or limit.get("utilization") is None:
                 continue

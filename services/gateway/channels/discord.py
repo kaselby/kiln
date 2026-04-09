@@ -343,10 +343,20 @@ def _format_usage_reset(resets_at: str | None) -> str:
         return ""
 
 
-def _format_usage_line(data: dict) -> str:
+def _format_usage_lines(data: dict) -> list[str]:
+    """Format subscription usage as Discord-friendly lines (one per provider).
+
+    Handles both the old flat format (five_hour/seven_day at top level)
+    and the new nested format (anthropic/openai sub-dicts).
+    Returns a list of lines (may be empty).
+    """
+    lines = []
+
+    # Anthropic — nested under "anthropic" key, or flat at top level (legacy)
+    anthropic = data.get("anthropic", data if "five_hour" in data else {})
     parts = []
     for key, label in [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_sonnet", "Sonnet")]:
-        limit = data.get(key)
+        limit = anthropic.get(key)
         if not limit or limit.get("utilization") is None:
             continue
         util = limit["utilization"]
@@ -355,7 +365,48 @@ def _format_usage_line(data: dict) -> str:
         if reset:
             part += f" ({reset})"
         parts.append(part)
-    return " · ".join(parts)
+    if parts:
+        lines.append("\U0001f4ca Anthropic: " + " \u00b7 ".join(parts))
+
+    # OpenAI/Codex — nested under "openai" key
+    openai_data = data.get("openai", {})
+    rate_limit = openai_data.get("rate_limit", {})
+    parts = []
+    for window_key, label in [("primary_window", "5h"), ("secondary_window", "7d")]:
+        window = rate_limit.get(window_key)
+        if not window:
+            continue
+        used = window.get("used_percent", 0)
+        reset_at = window.get("reset_at")
+        reset = _format_codex_reset(reset_at)
+        part = f"**{label}:** {used}%"
+        if reset:
+            part += f" ({reset})"
+        parts.append(part)
+    if parts:
+        lines.append("\U0001f4ca OpenAI: " + " \u00b7 ".join(parts))
+
+    return lines
+
+
+def _format_codex_reset(reset_at: int | None) -> str:
+    """Format a unix timestamp as relative time string."""
+    if not reset_at:
+        return ""
+    try:
+        total_seconds = int(reset_at - datetime.now(timezone.utc).timestamp())
+        if total_seconds <= 0:
+            return "resetting"
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        if hours > 24:
+            days = hours // 24
+            return f"resets {days}d {hours % 24}h"
+        elif hours > 0:
+            return f"resets {hours}h {minutes}m"
+        return f"resets {minutes}m"
+    except (ValueError, TypeError):
+        return ""
 
 
 def _build_presence_text(agents: list[dict], canonical_id: str | None = None) -> str:
@@ -1957,9 +2008,8 @@ class _GatewayClient(discord.Client):
 
                 usage_data = await self._fetch_usage_data()
                 if usage_data:
-                    usage_line = _format_usage_line(usage_data)
-                    if usage_line:
-                        content += f"\n\U0001f4ca {usage_line}"
+                    for line in _format_usage_lines(usage_data):
+                        content += f"\n{line}"
 
                 # Discord limits to 10 embeds per message
                 await asyncio.wait_for(
