@@ -1659,11 +1659,18 @@ class KilnApp:
                 elif updated:
                     _tprint("\n<hook>  \u26a1 hook:{} \u2192 (output replaced)</hook>", hook_name)
 
+    def _capture_session_id(self, session_id: str | None) -> None:
+        """Register session UUID on first sight — called from any message type."""
+        if session_id and not self._harness.session_id:
+            self._harness.session_id = session_id
+            self._harness.register_session()
+
     def _handle_sdk_message(self, msg: object) -> None:
         """Route an incoming SDK message to the appropriate handler."""
         self._drain_ui_events()
 
         if isinstance(msg, StreamEvent):
+            self._capture_session_id(msg.session_id)
             event = msg.event
             etype = event.get("type", "")
             if etype == "content_block_delta":
@@ -1717,9 +1724,7 @@ class KilnApp:
                         )
 
         elif isinstance(msg, ResultMessage):
-            if msg.session_id and not self._harness.session_id:
-                self._harness.session_id = msg.session_id
-                self._harness.register_session()
+            self._capture_session_id(msg.session_id)
             self._on_turn_complete(msg)
 
         elif isinstance(msg, SystemMessage):
