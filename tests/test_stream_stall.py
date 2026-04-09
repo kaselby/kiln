@@ -331,3 +331,122 @@ class TestStreamStallRecovery:
         assert msgs[0].content[0].text == "Partial output before stall"
         # Recovery queued
         assert len(followup) == 1
+
+
+class TestTimeoutIsPerMessage:
+    """Verify stream_timeout is per-message, not total turn time.
+
+    The timeout should reset every time a message arrives. A stream that
+    runs for much longer than the timeout but has frequent messages should
+    complete normally. Only a gap between consecutive messages exceeding
+    the timeout should trigger the stall handler.
+    """
+
+    @pytest.mark.asyncio
+    async def test_long_stream_with_frequent_messages_does_not_timeout(self):
+        """Total stream time >> timeout, but no individual gap exceeds it.
+
+        5 messages, each 0.3s apart = 1.5s total. Timeout is 0.5s.
+        Total time (1.5s) is 3x the timeout, but it should NOT fire
+        because no single gap exceeds 0.5s.
+        """
+        client = MockClient()
+        followup = []
+        timeout = 0.5
+
+        async def feed_slowly():
+            for i in range(5):
+                await asyncio.sleep(0.3)  # 0.3s gap — under 0.5s timeout
+                client.inject(AssistantMessage(
+                    content=[TextBlock(text=f"chunk {i}")],
+                    model="claude-opus-4-20250514",
+                ))
+            # End the turn
+            await asyncio.sleep(0.1)
+            client.inject(ResultMessage(
+                subtype="result", duration_ms=1500, duration_api_ms=1000,
+                is_error=False, num_turns=1, session_id="test",
+            ))
+
+        feeder = asyncio.create_task(feed_slowly())
+
+        msgs = []
+        async for msg in receive_with_timeout(client, timeout=timeout, followup_queue=followup):
+            msgs.append(msg)
+
+        await feeder
+
+        # All 5 chunks + ResultMessage should arrive — no timeout
+        assert len(msgs) == 6
+        assert all(isinstance(m, AssistantMessage) for m in msgs[:5])
+        assert isinstance(msgs[5], ResultMessage)
+        assert followup == []  # No recovery — timeout never fired
+
+    @pytest.mark.asyncio
+    async def test_single_gap_exceeding_timeout_triggers_stall(self):
+        """One message arrives, then a gap > timeout. Should fire.
+
+        First message at t=0, then silence for > timeout.
+        """
+        client = MockClient()
+        followup = []
+        timeout = 0.3
+
+        async def interrupt_with_response():
+            client.interrupt_called = True
+            client.inject_interrupt_response()
+
+        client.interrupt = interrupt_with_response
+
+        # Inject one message, then nothing (stall)
+        client.inject(AssistantMessage(
+            content=[TextBlock(text="first chunk")],
+            model="claude-opus-4-20250514",
+        ))
+
+        msgs = []
+        async for msg in receive_with_timeout(client, timeout=timeout, followup_queue=followup):
+            msgs.append(msg)
+
+        # Got the first chunk, then timeout → interrupt → drain
+        assert msgs[0].content[0].text == "first chunk"
+        assert client.interrupt_called
+        assert len(followup) == 1  # Recovery message queued
+
+    @pytest.mark.asyncio
+    async def test_timeout_resets_after_each_message(self):
+        """Verify the timeout window resets on each received message.
+
+        Messages arrive at: t=0.4, t=0.8, t=1.2, t=1.6 (0.4s apart).
+        Timeout is 0.5s. Each gap (0.4s) is under the timeout.
+        If the timeout were cumulative (total turn), it would fire at 0.5s.
+        Per-message means it resets each time, so all messages arrive.
+        """
+        client = MockClient()
+        followup = []
+        timeout = 0.5
+
+        async def feed_with_consistent_gaps():
+            for i in range(4):
+                await asyncio.sleep(0.4)  # 0.4s < 0.5s timeout
+                client.inject(AssistantMessage(
+                    content=[TextBlock(text=f"msg {i}")],
+                    model="claude-opus-4-20250514",
+                ))
+            await asyncio.sleep(0.1)
+            client.inject(ResultMessage(
+                subtype="result", duration_ms=1700, duration_api_ms=1600,
+                is_error=False, num_turns=1, session_id="test",
+            ))
+
+        feeder = asyncio.create_task(feed_with_consistent_gaps())
+
+        msgs = []
+        async for msg in receive_with_timeout(client, timeout=timeout, followup_queue=followup):
+            msgs.append(msg)
+
+        await feeder
+
+        # Total time ~1.7s >> 0.5s timeout, but all messages should arrive
+        assert len(msgs) == 5  # 4 chunks + ResultMessage
+        assert followup == []  # No stall detected

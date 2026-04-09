@@ -58,7 +58,6 @@ class AgentConfig:
     # Session
     agent_id: str | None = None       # unique session ID (generated if None)
     model: str | None = None          # model name or alias
-    project: str | None = None        # project path (sets cwd)
 
     # Spawning hierarchy
     parent: str | None = None
@@ -137,6 +136,10 @@ class AgentConfig:
 
     # Plans
     plans_dir: str = "plans"          # relative to home
+
+    # Session template — set automatically by apply_template().
+    # Persisted in session state so resume and continuation can re-apply.
+    template: str | None = None
 
     # Extra template variables for orientation/cleanup formatting.
     # Merged into _template_vars() at format time. CLI --var and
@@ -346,3 +349,4 @@ def apply_template(config: AgentConfig, name: str) -> None:
 
     raw = yaml.safe_load(path.read_text()) or {}
     _apply_raw_fields(config, raw)
+    config.template = name

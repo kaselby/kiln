@@ -1420,14 +1420,18 @@ class _GatewayClient(discord.Client):
             return
 
         agent_ref = args[0]
-        agent_id = self._resolve_agent_id(agent_ref)
+        # Use raw registry (not filtered to running sessions) since we're
+        # resuming dead sessions.
+        raw_registry = _load_json_state(
+            self._config.agent_home / "logs" / "session-registry.json"
+        )
+        agent_id = self._resolve_agent_ref(agent_ref, raw_registry)
         if not agent_id:
             await message.reply(f"No session matching `{agent_ref}` in registry.")
             return
 
         # Check the session has a UUID (needed for resume)
-        registry = _read_registry(self._config.agent_home)
-        entry = registry.get(agent_id, {})
+        entry = raw_registry.get(agent_id, {})
         if not entry.get("session_uuid"):
             await message.reply(
                 f"❌ `{agent_id}` has no session UUID — it may have exited "
@@ -1601,32 +1605,31 @@ class _GatewayClient(discord.Client):
         reply = await message.reply(f"{header}```\n{content}\n```", view=view)
         view.target_message = reply
 
-    def _resolve_agent_id(self, ref: str) -> str | None:
-        """Resolve a short agent reference to a full agent ID.
+    def _resolve_agent_ref(self, ref: str, registry: dict) -> str | None:
+        """Resolve an agent reference against a given registry dict.
 
         Accepts full IDs (beth-storm-jay) or short names (storm-jay).
-        Matches against running sessions from the registry.
         """
-        registry = _read_registry(self._config.agent_home)
         if not registry:
             return None
-
-        # Exact match
         if ref in registry:
             return ref
-
-        # Short name: try prefixing with session_prefix
         prefix = self._session_prefix
         full = f"{prefix}{ref}"
         if full in registry:
             return full
-
-        # Partial match: find unique match containing ref
         matches = [aid for aid in registry if ref in aid]
         if len(matches) == 1:
             return matches[0]
-
         return None
+
+    def _resolve_agent_id(self, ref: str) -> str | None:
+        """Resolve a short agent reference to a running agent ID.
+
+        Accepts full IDs (beth-storm-jay) or short names (storm-jay).
+        Matches against running sessions only.
+        """
+        return self._resolve_agent_ref(ref, _read_registry(self._config.agent_home))
 
     # -----------------------------------------------------------------------
     # Branch threads

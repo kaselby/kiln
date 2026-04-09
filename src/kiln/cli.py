@@ -56,7 +56,6 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         help="Path to agent.yml or directory containing one (default: ./agent.yml)",
     )
     parser.add_argument("--id", help="Agent identifier (auto-generated if not provided)")
-    parser.add_argument("--project", help="Project directory (sets working directory)")
     parser.add_argument("--model", help="Model override")
     parser.add_argument("--parent", help="Parent agent ID (for spawned subagents)")
     parser.add_argument("--prompt", help="Initial prompt sent on session start")
@@ -169,8 +168,6 @@ def _cli_bin() -> str:
 def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Path) -> str:
     """Build the shell command that runs inside the tmux session."""
     cmd_parts = [_cli_bin(), "run", str(spec_path), "--id", agent_id]
-    if args.project:
-        cmd_parts += ["--project", args.project]
     if args.model:
         cmd_parts += ["--model", args.model]
     if args.parent:
@@ -311,8 +308,6 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
         config.agent_id = args.id
     if args.model:
         config.model = args.model
-    if args.project:
-        config.project = args.project
     if args.parent:
         config.parent = args.parent
     if args.depth:
@@ -419,10 +414,15 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             exec_args += ["--effort", args.effort]
         if args.persistent:
             exec_args.append("--persistent")
-        if getattr(args, "template", None):
-            exec_args += ["--template", args.template]
+        # Prefer config.template (set by apply_template, survives resume) over args
+        template = harness.config.template or getattr(args, "template", None)
+        if template:
+            exec_args += ["--template", template]
         for var_str in getattr(args, "var", []):
             exec_args += ["--var", var_str]
+        for key, val in harness.config.template_vars.items():
+            if f"{key}=" not in " ".join(getattr(args, "var", [])):
+                exec_args += ["--var", f"{key}={val}"]
         if config.idle_nudge_timeout > 0:
             exec_args += ["--idle-nudge", str(int(config.idle_nudge_timeout / 60))]
         if harness.handoff_text:

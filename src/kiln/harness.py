@@ -56,7 +56,7 @@ from .prompt import (
 )
 from .registry import lookup_session, register_session
 from .session_config import SessionConfig
-from .shell import safe_getcwd
+from .shell import safe_getcwd  # noqa: F401 — used by subclasses
 from .tools import FileState, SessionControl, SupplementalContent, create_mcp_server
 
 
@@ -217,7 +217,7 @@ class KilnHarness:
         register_session(
             self._registry_path,
             self.agent_id,
-            cwd=self.config.project or safe_getcwd(),
+            cwd=str(self.config.home),
             model=self.config.model,
             session_uuid=self.session_id,
         )
@@ -243,6 +243,10 @@ class KilnHarness:
             state["session_config"] = session_config
         if channel_subscriptions is not None:
             state["channel_subscriptions"] = channel_subscriptions
+        if self.config.template:
+            state["template"] = self.config.template
+        if self.config.template_vars:
+            state["template_vars"] = dict(self.config.template_vars)
         path = self._session_state_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -330,7 +334,21 @@ class KilnHarness:
         # Restore saved state if resuming (--resume and --last both set resume_session).
         saved_state = self._load_session_state() if self.config.resume_session else None
 
-        cwd = self.config.project or safe_getcwd()
+        # Re-apply template from saved state so cleanup, hooks, and other
+        # runtime config fields are restored.  CLI --template wins if set.
+        if saved_state and not self.config.template:
+            saved_template = saved_state.get("template")
+            if saved_template:
+                try:
+                    from .config import apply_template
+                    apply_template(self.config, saved_template)
+                except FileNotFoundError:
+                    log.warning("Saved template '%s' not found — skipping", saved_template)
+            saved_vars = saved_state.get("template_vars")
+            if saved_vars and not self.config.template_vars:
+                self.config.template_vars.update(saved_vars)
+
+        cwd = str(self.config.home)
 
         if saved_state and "system_prompt" in saved_state:
             full_prompt = saved_state["system_prompt"]
@@ -475,7 +493,7 @@ class KilnHarness:
         self._permission_handler = PermissionHandler(
             get_mode=get_mode,
             terminal_handler=terminal_handler,
-            get_cwd=lambda: self._get_shell_cwd() if self._get_shell_cwd else safe_getcwd(),
+            get_cwd=lambda: self._get_shell_cwd() if self._get_shell_cwd else str(self.config.home),
             agent_id=self.agent_id,
             agent_home=str(self.config.home),
         )
@@ -939,8 +957,7 @@ class KilnHarness:
         if not self.session_id:
             return None
 
-        cwd = self.config.project or safe_getcwd()
-        cwd = str(Path(cwd).resolve())
+        cwd = str(self.config.home.resolve())
         project_dir_name = cwd.replace("/", "-").replace(".", "-")
         source = Path.home() / ".claude" / "projects" / project_dir_name / f"{self.session_id}.jsonl"
 
@@ -964,8 +981,7 @@ class KilnHarness:
         """
         if not self._resume_uuid:
             return None
-        cwd = self.config.project or safe_getcwd()
-        cwd = str(Path(cwd).resolve())
+        cwd = str(self.config.home.resolve())
         project_dir_name = cwd.replace("/", "-").replace(".", "-")
         path = Path.home() / ".claude" / "projects" / project_dir_name / f"{self._resume_uuid}.jsonl"
         return path if path.exists() else None
