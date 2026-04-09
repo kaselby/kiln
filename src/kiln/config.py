@@ -142,6 +142,10 @@ class AgentConfig:
     # Plans
     plans_dir: str = "plans"          # relative to home
 
+    # Session template — set automatically by apply_template().
+    # Persisted in session state so resume and continuation can re-apply.
+    template: str | None = None
+
     # Extra template variables for orientation/cleanup formatting.
     # Merged into _template_vars() at format time. CLI --var and
     # programmatic config.template_vars["key"] = "value" both land here.
@@ -379,3 +383,4 @@ def apply_template(config: AgentConfig, name: str) -> None:
 
     raw = yaml.safe_load(path.read_text()) or {}
     _apply_raw_fields(config, raw)
+    config.template = name

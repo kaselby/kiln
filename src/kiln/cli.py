@@ -431,10 +431,15 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             exec_args += ["--backend", args.backend]
         if args.persistent:
             exec_args.append("--persistent")
-        if getattr(args, "template", None):
-            exec_args += ["--template", args.template]
+        # Prefer config.template (set by apply_template, survives resume) over args
+        template = harness.config.template or getattr(args, "template", None)
+        if template:
+            exec_args += ["--template", template]
         for var_str in getattr(args, "var", []):
             exec_args += ["--var", var_str]
+        for key, val in harness.config.template_vars.items():
+            if f"{key}=" not in " ".join(getattr(args, "var", [])):
+                exec_args += ["--var", f"{key}={val}"]
         if config.idle_nudge_timeout > 0:
             exec_args += ["--idle-nudge", str(int(config.idle_nudge_timeout / 60))]
         if harness.handoff_text:
