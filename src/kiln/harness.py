@@ -435,23 +435,27 @@ class KilnHarness:
         elif backend_name == "openai":
             from .backends.custom import CustomBackend
             from .providers.openai_responses import OpenAIResponsesProvider
-            api_key = self._resolve_openai_key()
+            api_key, base_url = self._resolve_openai_auth()
             provider = OpenAIResponsesProvider(
-                api_key=api_key, session_id=self.agent_id,
+                api_key=api_key, base_url=base_url, session_id=self.agent_id,
             )
             return CustomBackend(provider)
         raise ValueError(f"Unknown backend: {backend_name}")
 
-    def _resolve_openai_key(self) -> str:
-        """Resolve OpenAI API key from available sources.
+    # Codex OAuth tokens use the ChatGPT backend, not the standard API.
+    _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+    def _resolve_openai_auth(self) -> tuple[str, str | None]:
+        """Resolve OpenAI credentials. Returns (api_key, base_url).
 
         Priority order:
-        1. Codex CLI OAuth token (~/.codex/auth.json) — zero-config default
-           Automatically refreshes expired tokens via OpenAI's OAuth endpoint.
-        2. OPENAI_API_KEY env var
-        3. credentials/OPENAI_API_KEY file
+        1. Codex CLI OAuth token (~/.codex/auth.json) — zero-config default.
+           Uses the ChatGPT backend endpoint (not api.openai.com) since Codex
+           OAuth tokens lack the api.responses.write scope.
+        2. OPENAI_API_KEY env var — standard API endpoint.
+        3. credentials/OPENAI_API_KEY file — standard API endpoint.
         """
-        # 1. Codex CLI OAuth — zero-config default
+        # 1. Codex CLI OAuth — routes to ChatGPT backend
         codex_auth = Path.home() / ".codex" / "auth.json"
         if codex_auth.exists():
             try:
@@ -464,21 +468,21 @@ class KilnHarness:
                             data, codex_auth,
                         )
                         if access_token:
-                            return access_token
+                            return access_token, self._CODEX_BASE_URL
             except (json.JSONDecodeError, OSError) as e:
                 log.warning("Failed to read Codex auth: %s", e)
 
-        # 2. Environment variable
+        # 2. Environment variable — standard API
         api_key = os.environ.get("OPENAI_API_KEY", "")
         if api_key:
-            return api_key
+            return api_key, None
 
-        # 3. Credentials file
+        # 3. Credentials file — standard API
         creds = self.config.home / "credentials" / "OPENAI_API_KEY"
         if creds.exists():
             api_key = creds.read_text().strip()
             if api_key:
-                return api_key
+                return api_key, None
 
         raise RuntimeError(
             "OpenAI backend requires authentication. Options:\n"
