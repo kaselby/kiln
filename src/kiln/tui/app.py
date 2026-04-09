@@ -350,14 +350,15 @@ def _display_name(name: str) -> str:
 
     mcp__kiln__Bash    -> Kiln::Bash
     mcp__myagent__Bash -> Myagent::Bash
-    Read              -> Base::Read
+    Bash               -> Kiln::Bash   (CustomBackend short names)
     """
     if name.startswith("mcp__"):
         parts = name.split("__", 2)
         if len(parts) == 3:
             server = parts[1].capitalize()
             return f"{server}::{parts[2]}"
-    return f"Base::{name}"
+    # CustomBackend uses short names (no MCP prefix)
+    return f"Kiln::{name}"
 
 
 def _format_tool_input(name: str, input: dict) -> str:
@@ -486,6 +487,7 @@ class KilnApp:
         self._stream_chunks: list[str] = []
         self._thinking_buffer = ""
         self._tool_name_queue: list[str] = []
+        self._current_block_type: str = ""  # tracks ContentBlock type for delta routing
         self._context_tokens = 0  # latest API call's total input ~ current context size
         self._last_call_usage = {}  # per-API-call usage from message_delta events
         self._receiving = False
@@ -1708,8 +1710,18 @@ class KilnApp:
         """Route an incoming Kiln Event to the appropriate handler."""
         self._drain_ui_events()
 
-        if isinstance(event, ContentBlockDeltaEvent):
-            if event.text is not None:
+        if isinstance(event, ContentBlockStartEvent):
+            self._current_block_type = event.content_type
+
+        elif isinstance(event, ContentBlockEndEvent):
+            self._current_block_type = ""
+
+        elif isinstance(event, ContentBlockDeltaEvent):
+            # Suppress text deltas during tool_call blocks — those are argument
+            # JSON, not assistant text. The ToolCallEvent has the parsed args.
+            if self._current_block_type == "tool_call":
+                pass
+            elif event.text is not None:
                 if not self._stream_chunks:
                     self._commit_thinking()
                 self._stream_chunks.append(event.text)
