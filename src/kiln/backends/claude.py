@@ -60,6 +60,7 @@ class ClaudeBackend:
         self._block_index: int = 0
         self._pending_usage: dict | None = None
         self._last_model: str | None = None
+        self._current_block_type: str = ""
 
     async def start(self, config: BackendConfig) -> None:
         options = self._build_sdk_options(config)
@@ -185,6 +186,7 @@ class ClaudeBackend:
                 "thinking": "thinking",
                 "tool_use": "tool_call",
             }.get(cb_type, "text")
+            self._current_block_type = kiln_type
             events.append(ContentBlockStartEvent(
                 content_index=self._block_index,
                 content_type=kiln_type,
@@ -213,14 +215,12 @@ class ClaudeBackend:
                 pass
 
         elif etype == "content_block_stop":
-            # Infer content type from the block index tracking.
-            # We don't have it from the event, but the TUI doesn't need
-            # it for the end event — it uses content_type from the start.
             events.append(ContentBlockEndEvent(
                 content_index=self._block_index,
-                content_type="",  # consumer tracks from start event
+                content_type=self._current_block_type,
             ))
             self._block_index += 1
+            self._current_block_type = ""
 
         elif etype == "message_delta":
             usage = event.get("usage")
@@ -305,17 +305,16 @@ class ClaudeBackend:
     def _extract_usage(self, raw: dict | None) -> Usage | None:
         if not raw:
             return None
+        cache_read = raw.get("cache_read_input_tokens")
+        cache_write = raw.get("cache_creation_input_tokens")
+        input_t = raw.get("input_tokens", 0) or 0
+        output_t = raw.get("output_tokens", 0) or 0
         return Usage(
-            input_tokens=raw.get("input_tokens", 0),
-            output_tokens=raw.get("output_tokens", 0),
-            cache_read_tokens=raw.get("cache_read_input_tokens"),
-            cache_write_tokens=raw.get("cache_creation_input_tokens"),
-            total_tokens=(
-                raw.get("input_tokens", 0)
-                + raw.get("output_tokens", 0)
-                + raw.get("cache_read_input_tokens", 0)
-                + raw.get("cache_creation_input_tokens", 0)
-            ),
+            input_tokens=input_t,
+            output_tokens=output_t,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            total_tokens=input_t + output_t + (cache_read or 0) + (cache_write or 0),
         )
 
     @staticmethod
