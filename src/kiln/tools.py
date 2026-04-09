@@ -12,7 +12,9 @@ Agent extensions can:
 - Build their own MCP server using create_sdk_mcp_server()
 """
 
+import base64
 import json
+import mimetypes
 import os
 import uuid as _uuid
 from datetime import datetime, timezone
@@ -58,6 +60,11 @@ class FileState:
             mtime = 0.0
         self._state[normalized] = {"timestamp": mtime, "partial": False}
 
+    def get(self, file_path: str) -> dict | None:
+        """Return the state entry for a file, or None if not recorded."""
+        normalized = str(Path(file_path).resolve())
+        return self._state.get(normalized)
+
     def check(self, file_path: str) -> tuple[bool, str | None]:
         """Validate that a file can be written/edited.
 
@@ -97,6 +104,39 @@ class SessionControl:
         self.context_tokens: int = 0
 
 
+class SupplementalContent:
+    """Collects content that needs injection as user messages.
+
+    Some content types (e.g. PDF document blocks) can't be expressed in MCP
+    tool results — they need to go in user-level messages. MCP tools stash
+    raw file data here; the harness drains it and injects it between turns,
+    formatted for whatever backend is in use.
+
+    The data is stored backend-agnostic: raw bytes + MIME type. The harness's
+    _format_supplemental_message() converts to the right wire format.
+    """
+
+    def __init__(self):
+        self._pending: list[dict] = []
+
+    def add_file(self, data: bytes, mime_type: str, label: str = "") -> None:
+        """Stash a file for user-message injection."""
+        self._pending.append({
+            "data": data,
+            "mime_type": mime_type,
+            "label": label,
+        })
+
+    def drain(self) -> list[dict]:
+        """Return and clear all pending items."""
+        items, self._pending = self._pending, []
+        return items
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+
 # ---------------------------------------------------------------------------
 # Result helpers
 # ---------------------------------------------------------------------------
@@ -127,11 +167,19 @@ BINARY_EXTENSIONS = frozenset([
     "mp4", "avi", "mov", "wmv", "flv", "mkv", "webm", "m4v", "mpeg", "mpg",
 ])
 
-MEDIA_EXTENSIONS = frozenset([
-    "png", "jpg", "jpeg", "gif", "webp",
-    "pdf",
-    "ipynb",
-])
+IMAGE_EXTENSIONS = frozenset(["png", "jpg", "jpeg", "gif", "webp"])
+
+IMAGE_MIME_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
+
+# Max image file size before we bail (10 MB). CC handles resize/compression
+# for MCP ImageContent automatically, but we still want to catch absurd files.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 MAX_LINES = 2000
 MAX_LINE_LEN = 2000
@@ -207,8 +255,13 @@ def read_file(
     file_state: FileState,
     offset: int | None = None,
     limit: int | None = None,
+    supplemental: "SupplementalContent | None" = None,
 ) -> dict:
-    """Read a text file and return formatted MCP result (cat -n format)."""
+    """Read a file and return formatted MCP result.
+
+    Handles text (cat -n), images (ImageContent), notebooks (parsed cells),
+    and PDFs (via supplemental content injection).
+    """
     if not file_path:
         return _error("No file_path provided.")
 
@@ -224,6 +277,7 @@ def read_file(
         )
 
     ext = Path(normalized).suffix.lower().lstrip(".")
+
     if ext in BINARY_EXTENSIONS:
         return _error(
             f"This tool cannot read binary files. The file appears to be "
@@ -231,11 +285,194 @@ def read_file(
             f"binary file analysis."
         )
 
-    if ext in MEDIA_EXTENSIONS:
+    # --- Images: return as MCP ImageContent ---
+    if ext in IMAGE_EXTENSIONS:
+        return _read_image(normalized, file_path, ext, file_state)
+
+    # --- Notebooks: parse and format cells ---
+    if ext == "ipynb":
+        return _read_notebook(normalized, file_path, file_state)
+
+    # --- PDFs: stash for supplemental content injection ---
+    if ext == "pdf":
+        return _read_pdf(normalized, file_path, file_state, supplemental)
+
+    # --- Text files ---
+    return _read_text(normalized, file_path, file_state, offset, limit)
+
+
+def _read_image(normalized: str, file_path: str, ext: str, file_state: FileState) -> dict:
+    """Read an image file and return as MCP ImageContent."""
+    try:
+        size = os.path.getsize(normalized)
+        if size > MAX_IMAGE_BYTES:
+            return _error(
+                f"Image too large ({size / 1024 / 1024:.1f} MB). "
+                f"Maximum supported size is {MAX_IMAGE_BYTES // 1024 // 1024} MB."
+            )
+        data = Path(normalized).read_bytes()
+    except OSError as e:
+        return _error(f"Failed to read image: {e}")
+
+    mime = IMAGE_MIME_TYPES.get(ext, "image/png")
+    b64 = base64.b64encode(data).decode("ascii")
+
+    file_state.record_read(normalized, partial=False)
+    return {
+        "content": [{"type": "image", "data": b64, "mimeType": mime}],
+    }
+
+
+def _read_notebook(normalized: str, file_path: str, file_state: FileState) -> dict:
+    """Read a Jupyter notebook and return formatted cell contents."""
+    try:
+        raw = Path(normalized).read_text(errors="replace")
+    except OSError as e:
+        return _error(f"Failed to read notebook: {e}")
+
+    try:
+        nb = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return _error(f"Invalid notebook JSON: {e}")
+
+    cells = nb.get("cells", [])
+    if not cells:
+        file_state.record_read(normalized, partial=False)
+        return _ok("Notebook is empty (no cells).")
+
+    language = nb.get("metadata", {}).get("language_info", {}).get("name", "python")
+    content_blocks: list[dict] = []
+    text_parts: list[str] = []
+
+    for i, cell in enumerate(cells):
+        cell_type = cell.get("cell_type", "raw")
+        source = cell.get("source", "")
+        if isinstance(source, list):
+            source = "".join(source)
+        cell_id = cell.get("id", f"cell-{i}")
+
+        # Format cell header and source
+        if cell_type == "code":
+            lang_tag = f" [{language}]" if language != "python" else ""
+            text_parts.append(f'<cell id="{cell_id}" type="code"{lang_tag}>\n{source}\n</cell>')
+        elif cell_type == "markdown":
+            text_parts.append(f'<cell id="{cell_id}" type="markdown">\n{source}\n</cell>')
+        else:
+            text_parts.append(f'<cell id="{cell_id}" type="{cell_type}">\n{source}\n</cell>')
+
+        # Process outputs for code cells
+        if cell_type == "code" and cell.get("outputs"):
+            for output in cell["outputs"]:
+                output_type = output.get("output_type", "")
+
+                if output_type == "stream":
+                    text = output.get("text", "")
+                    if isinstance(text, list):
+                        text = "".join(text)
+                    if text.strip():
+                        text_parts.append(f"<output>{text.rstrip()}</output>")
+
+                elif output_type in ("execute_result", "display_data"):
+                    data = output.get("data", {})
+                    # Check for embedded images
+                    for img_mime in ("image/png", "image/jpeg"):
+                        if img_mime in data:
+                            img_b64 = data[img_mime]
+                            if isinstance(img_b64, str):
+                                img_b64 = img_b64.replace("\n", "").replace(" ", "")
+                                # Flush accumulated text before image
+                                if text_parts:
+                                    content_blocks.append({"type": "text", "text": "\n\n".join(text_parts)})
+                                    text_parts = []
+                                content_blocks.append({"type": "image", "data": img_b64, "mimeType": img_mime})
+                            break
+                    # Text output
+                    plain = data.get("text/plain", "")
+                    if isinstance(plain, list):
+                        plain = "".join(plain)
+                    if plain.strip():
+                        text_parts.append(f"<output>{plain.rstrip()}</output>")
+
+                elif output_type == "error":
+                    ename = output.get("ename", "")
+                    evalue = output.get("evalue", "")
+                    tb = output.get("traceback", [])
+                    err_text = f"{ename}: {evalue}"
+                    if tb:
+                        err_text += "\n" + "\n".join(tb)
+                    text_parts.append(f"<output type=\"error\">{err_text.rstrip()}</output>")
+
+    # Flush remaining text
+    if text_parts:
+        content_blocks.append({"type": "text", "text": "\n\n".join(text_parts)})
+
+    file_state.record_read(normalized, partial=False)
+    return {"content": content_blocks}
+
+
+def _read_pdf(
+    normalized: str,
+    file_path: str,
+    file_state: FileState,
+    supplemental: "SupplementalContent | None",
+) -> dict:
+    """Read a PDF — stash content for supplemental injection, return summary."""
+    if supplemental is None:
         return _error(
-            f"This tool handles text files only. For .{ext} files, use "
-            f"the built-in Read tool instead."
+            "PDF reading requires supplemental content support, which is not "
+            "available in this session. Use an external tool to extract text."
         )
+
+    try:
+        data = Path(normalized).read_bytes()
+    except OSError as e:
+        return _error(f"Failed to read PDF: {e}")
+
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > 32:
+        return _error(
+            f"PDF too large ({size_mb:.1f} MB). Maximum supported size is 32 MB."
+        )
+
+    # Estimate page count from the PDF cross-reference table.
+    # This is a rough heuristic — count /Type /Page occurrences.
+    page_count = data.count(b"/Type /Page") - data.count(b"/Type /Pages")
+    page_count = max(page_count, 0) or None  # None if heuristic fails
+
+    supplemental.add_file(
+        data=data,
+        mime_type="application/pdf",
+        label=os.path.basename(file_path),
+    )
+
+    file_state.record_read(normalized, partial=False)
+
+    size_str = f"{size_mb:.1f} MB" if size_mb >= 1 else f"{len(data) / 1024:.0f} KB"
+    page_str = f", ~{page_count} pages" if page_count else ""
+    return _ok(
+        f"PDF detected: {file_path} ({size_str}{page_str}). "
+        f"Document content will be provided in the next turn for native reading."
+    )
+
+
+def _read_text(
+    normalized: str,
+    file_path: str,
+    file_state: FileState,
+    offset: int | None = None,
+    limit: int | None = None,
+) -> dict:
+    """Read a text file in cat -n format."""
+    # Dedup: if the file hasn't changed since last read, return a stub
+    entry = file_state.get(normalized)
+    if entry is not None:
+        try:
+            current_mtime = os.path.getmtime(normalized)
+        except OSError:
+            current_mtime = -1
+        if current_mtime == entry["timestamp"]:
+            file_state.record_read(normalized, partial=False)
+            return _ok(f"File {file_path} has not changed since last read.")
 
     try:
         raw = Path(normalized).read_text(errors="replace")
@@ -689,8 +926,14 @@ READ_DESC = (
     "providing these parameters\n"
     "- Any lines longer than 2000 characters will be truncated\n"
     "- Results are returned using cat -n format, with line numbers starting at 1\n"
-    "- For reading images (PNG, JPG, etc.), PDFs, or Jupyter notebooks, use "
-    "the built-in Read tool instead."
+    "- This tool can read images (PNG, JPG, GIF, WebP). Image content is "
+    "presented visually.\n"
+    "- This tool can read Jupyter notebooks (.ipynb) and returns all cells "
+    "with their outputs, combining code, text, and visualizations.\n"
+    "- This tool can read PDF files (.pdf). PDF content is injected as a "
+    "native document for full reading.\n"
+    "- Re-reading an unchanged file returns a short stub instead of the "
+    "full contents."
 )
 READ_SCHEMA = {
     "type": "object",
@@ -953,6 +1196,7 @@ def create_mcp_server(
     file_state: FileState | None = None,
     session_control: SessionControl | None = None,
     plans_path: Path | None = None,
+    supplemental: SupplementalContent | None = None,
 ):
     """Create the Kiln MCP server with standard agent runtime tools.
 
@@ -1017,6 +1261,7 @@ def create_mcp_server(
             file_state,
             offset=args.get("offset"),
             limit=args.get("limit"),
+            supplemental=supplemental,
         )
 
     @tool("Edit", EDIT_DESC, EDIT_SCHEMA)

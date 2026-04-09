@@ -270,6 +270,37 @@ def create_context_warning_hook(session_control, max_tokens: int = 200_000):
     return context_warning_hook
 
 
+def create_supplemental_content_hook(supplemental):
+    """PostToolUse hook that stops continuation when supplemental content is pending.
+
+    When an MCP tool (e.g. Read on a PDF) stashes content that needs to be
+    injected as a user message, this hook fires continue_=False so the harness
+    can inject it between turns.
+    """
+
+    async def supplemental_content_hook(
+        input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        if not supplemental.has_pending:
+            return {}
+
+        return {
+            "continue_": False,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": (
+                    "[Supplemental content pending — document will be "
+                    "injected in the next turn for native reading.]"
+                ),
+            },
+        }
+
+    return supplemental_content_hook
+
+
+
+
+
 
 
 
@@ -303,6 +334,15 @@ def create_session_state_hook(
             return {}
 
         parts = [f"mode={harness.permission_mode.value}"]
+
+        # Context usage
+        sc = getattr(harness, "session_control", None)
+        if sc and sc.context_tokens > 0:
+            max_tokens = getattr(harness.config, "max_context_tokens", 200_000)
+            used_k = sc.context_tokens // 1000
+            max_k = max_tokens // 1000
+            parts.append(f"context: {used_k}k/{max_k}k")
+
         parts.extend(harness.session_state_labels())
 
         # Presence — where is the user?

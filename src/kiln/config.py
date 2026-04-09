@@ -30,7 +30,6 @@ KNOWN_BUILTINS = {
 
 # Default tool set when agent spec doesn't specify.
 DEFAULT_TOOLS = [
-    "Base::Read",
     "Base::WebSearch",
     "Kiln::Bash",
     "Kiln::Read",

@@ -31,13 +31,14 @@ from claude_agent_sdk import (
 from .config import AgentConfig
 from .hooks import (
     create_session_state_hook,
-    create_context_warning_hook,
+
     create_inbox_check_hook,
     create_message_sent_hook,
     create_plan_nudge_hook,
     create_queued_message_hook,
     create_read_tracking_hook,
     create_skill_context_hook,
+    create_supplemental_content_hook,
     create_usage_log_hook,
     wrap_hook_visibility,
 )
@@ -56,7 +57,7 @@ from .prompt import (
 from .registry import lookup_session, register_session
 from .session_config import SessionConfig
 from .shell import safe_getcwd
-from .tools import FileState, SessionControl, create_mcp_server
+from .tools import FileState, SessionControl, SupplementalContent, create_mcp_server
 
 
 class _BlockDumper(yaml.SafeDumper):
@@ -294,6 +295,34 @@ class KilnHarness:
         except OSError:
             pass
 
+    def _cleanup_stale_session_configs(self) -> None:
+        """Remove session config files for sessions that are no longer running.
+
+        Catches orphans left behind by crashes or hard kills where stop()
+        never ran.  Uses tmux session list as the source of truth for
+        what's alive.
+        """
+        import subprocess
+
+        config_dir = self.config.home / "state"
+        prefix = "session-config-"
+        try:
+            result = subprocess.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            live = set(result.stdout.strip().splitlines()) if result.returncode == 0 else set()
+        except Exception:
+            return  # Can't determine live sessions — skip cleanup
+
+        for path in config_dir.glob(f"{prefix}*.yml"):
+            agent_id = path.stem.removeprefix(prefix)
+            if agent_id != self.agent_id and agent_id not in live:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     # -- Options builder ----------------------------------------------------
 
     def _build_options(self) -> ClaudeAgentOptions:
@@ -366,6 +395,7 @@ class KilnHarness:
         # Shared state
         file_state = FileState()
         self.session_control = SessionControl()
+        self._supplemental = SupplementalContent()
 
         # Per-session runtime config — seeded from harness config, agent-writable.
         # On resume, saved values override harness defaults so state is restored.
@@ -374,6 +404,7 @@ class KilnHarness:
             "heartbeat_enabled": self.config.heartbeat,
             "heartbeat_max": self.config.heartbeat_max,
             "heartbeat_override": self.config.heartbeat_override,
+            "stream_timeout": self.config.stream_timeout,
         }
         if saved_state and saved_state.get("session_config"):
             config_defaults.update(saved_state["session_config"])
@@ -381,6 +412,9 @@ class KilnHarness:
             path=self.config.home / "state" / f"session-config-{self.agent_id}.yml",
             defaults=config_defaults,
         )
+
+        # Clean up stale session config files from dead sessions
+        self._cleanup_stale_session_configs()
 
         # Restore channel subscriptions from saved state
         if saved_state and saved_state.get("channel_subscriptions"):
@@ -390,7 +424,6 @@ class KilnHarness:
         state_dir = self.config.home / "state"
         inbox_check = create_inbox_check_hook(inbox, ui_events=self.ui_events, state_dir=state_dir)
         read_tracker = create_read_tracking_hook(inbox, file_state=file_state)
-        context_warning = create_context_warning_hook(self.session_control)
         session_state = self._create_session_state_hook()
         skill_context = create_skill_context_hook(self.config.skills_path)
         usage_log = create_usage_log_hook(
@@ -401,6 +434,7 @@ class KilnHarness:
             self.steering_queue, self.ui_events,
         )
         message_sent = create_message_sent_hook(self.ui_events)
+        supplemental_hook = create_supplemental_content_hook(self._supplemental)
 
         plans_path = self.config.plans_path
         plan_nudge = create_plan_nudge_hook(plans_path / f"{self.agent_id}.yml")
@@ -412,19 +446,18 @@ class KilnHarness:
             ui = self.ui_events
             inbox_check = wrap_hook_visibility(inbox_check, "inbox_check", ui)
             queued_messages = wrap_hook_visibility(queued_messages, "queued_messages", ui)
-            context_warning = wrap_hook_visibility(context_warning, "context_warning", ui)
             session_state = wrap_hook_visibility(session_state, "session_state", ui)
             plan_nudge = wrap_hook_visibility(plan_nudge, "plan_nudge", ui)
             skill_context = wrap_hook_visibility(skill_context, "skill_context", ui)
+            supplemental_hook = wrap_hook_visibility(supplemental_hook, "supplemental_content", ui)
 
         hooks = {
             "PostToolUse": [
                 HookMatcher(matcher=None, hooks=[
-                    inbox_check, queued_messages, context_warning,
+                    inbox_check, queued_messages,
                     session_state, usage_log, plan_nudge,
                 ]),
-                HookMatcher(matcher="Read", hooks=[read_tracker]),
-                HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker]),
+                HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker, supplemental_hook]),
                 HookMatcher(matcher="mcp__kiln__activate_skill", hooks=[skill_context]),
                 HookMatcher(matcher="mcp__kiln__message", hooks=[message_sent]),
             ],
@@ -448,9 +481,16 @@ class KilnHarness:
         )
         hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[self._permission_handler.hook])]
 
+        # Agent-specific hooks — subclasses override _agent_hooks() to inject.
+        for event, matchers in self._agent_hooks().items():
+            if event in hooks:
+                hooks[event].extend(matchers)
+            else:
+                hooks[event] = list(matchers)
+
         # Resolve tools from agent spec
         resolved = self.config.resolve_tools()
-        base_tools = resolved.get("Base", ["Read", "WebSearch"])
+        base_tools = resolved.get("Base", ["WebSearch"])
 
         # Environment
         venv_path = self.config.home / "venv"
@@ -482,6 +522,7 @@ class KilnHarness:
             cwd=cwd, env=env, file_state=file_state,
             session_control=self.session_control,
             plans_path=plans_path,
+            supplemental=self._supplemental,
         )
         mcp_servers = {"kiln": mcp_server}
 
@@ -533,6 +574,18 @@ class KilnHarness:
         if self.config.effort:
             opts["effort"] = self.config.effort
         return ClaudeAgentOptions(**opts)
+
+    def _agent_hooks(self) -> dict[str, list[HookMatcher]]:
+        """Return agent-specific hooks to merge into the infrastructure hooks.
+
+        Subclasses override this to inject custom PostToolUse/PreToolUse hooks
+        without reimplementing _build_options. Called after all infra hooks are
+        assembled. Returned matchers are appended to the corresponding event lists.
+
+        Returns:
+            Dict mapping hook event names to lists of HookMatchers.
+        """
+        return {}
 
     def _template_vars(self) -> dict[str, str]:
         """Build template variable dict for orientation and cleanup messages.
@@ -688,6 +741,11 @@ class KilnHarness:
     async def receive(self):
         """Yield messages from the agent until the turn ends.
 
+        After each inner receive cycle, checks for pending supplemental
+        content (e.g. PDF document blocks). If found, transparently injects
+        it as a new user turn and continues yielding — the caller never
+        needs to know about the two-turn handshake.
+
         If stream_timeout is configured and no message arrives within the
         timeout window, sends an interrupt to the stalled Claude Code
         subprocess and queues a recovery message so the agent gets another
@@ -695,7 +753,23 @@ class KilnHarness:
         """
         if not self._client:
             raise RuntimeError("Harness not started. Call start() first.")
-        timeout = self.config.stream_timeout
+
+        async for msg in self._receive_inner():
+            yield msg
+
+        # Transparent supplemental content injection.
+        # The loop handles the (unlikely) case where a supplemental response
+        # itself triggers more supplemental content.
+        while self._supplemental and self._supplemental.has_pending:
+            items = self._supplemental.drain()
+            rich_msg = self._build_supplemental_message(items)
+            await self._client.query(rich_msg)
+            async for msg in self._receive_inner():
+                yield msg
+
+    async def _receive_inner(self):
+        """Single receive cycle with optional stream timeout."""
+        timeout = self.session_config.get("stream_timeout", self.config.stream_timeout) if self.session_config else self.config.stream_timeout
         if not timeout:
             async for msg in self._client.receive_response():
                 yield msg
@@ -712,21 +786,12 @@ class KilnHarness:
                 log.warning(
                     "Stream stall: no data for %ds. Interrupting.", int(timeout)
                 )
-                # Interrupt the stalled CC subprocess
                 try:
                     await asyncio.wait_for(self._client.interrupt(), timeout=10)
                 except Exception:
                     pass
-                # Drain remaining messages (partial response + ResultMessage).
-                # The original iterator `ait` is dead — asyncio.wait_for
-                # cancelled the anext() task, which threw CancelledError into
-                # the generator chain and closed it.  We must use a fresh
-                # receive_response() iterator to consume any stale messages
-                # (especially the ResultMessage emitted by the interrupt).
-                # If we don't, the stale ResultMessage stays in the SDK's
-                # message buffer and the *recovery* turn's receive_response()
-                # will consume it, terminating immediately with zero new
-                # content — leaving the agent stuck at Ready.
+                # Drain remaining messages. The original iterator is dead —
+                # asyncio.wait_for cancelled it. Use a fresh one.
                 try:
                     drain = self._client.receive_response().__aiter__()
                     while True:
@@ -734,7 +799,6 @@ class KilnHarness:
                         yield msg
                 except (StopAsyncIteration, asyncio.TimeoutError, Exception):
                     pass
-                # Queue a recovery message so the agent gets another turn
                 self.followup_queue.append(
                     "[SYSTEM] The previous model generation stalled — no data "
                     "was received for %d seconds, likely due to an API streaming "
@@ -743,6 +807,56 @@ class KilnHarness:
                     "Please continue where you left off." % int(timeout)
                 )
                 return
+
+    def _build_supplemental_message(self, items: list[dict]):
+        """Build a rich user message from pending supplemental content items.
+
+        Returns an async iterable of message dicts for client.query().
+        Override in subclasses for backend-specific formatting.
+        """
+        import base64 as _b64
+
+        content_blocks = []
+        labels = []
+        for item in items:
+            mime = item["mime_type"]
+            label = item.get("label", "file")
+            labels.append(label)
+
+            if mime == "application/pdf":
+                content_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": _b64.b64encode(item["data"]).decode("ascii"),
+                    },
+                })
+            else:
+                # Generic fallback — encode as base64 document
+                content_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime,
+                        "data": _b64.b64encode(item["data"]).decode("ascii"),
+                    },
+                })
+
+        files_str = ", ".join(labels)
+        content_blocks.append({
+            "type": "text",
+            "text": f"Document content loaded for: {files_str}. Continue with your task.",
+        })
+
+        async def _message_iter():
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": content_blocks},
+                "parent_tool_use_id": None,
+            }
+
+        return _message_iter()
 
     def check_model(self, actual_model: str) -> str | None:
         """Check actual model against expected. Returns warning or None."""
@@ -776,6 +890,8 @@ class KilnHarness:
         if self._client:
             await self._client.disconnect()
             self._client = None
+        if self.session_config:
+            self.session_config.cleanup()
 
     def commit_memory(self) -> str | None:
         """Commit changed files to git. Returns summary or None."""
