@@ -334,10 +334,27 @@ class KilnHarness:
 
     def _select_backend(self) -> Backend:
         """Choose backend based on config."""
-        backend_name = getattr(self.config, "backend", None) or "claude"
+        from .config import infer_backend
+        backend_name = self.config.backend or infer_backend(self.config.model)
         if backend_name == "claude":
             return ClaudeBackend()
-        # Future: openai, openai-compat, litellm
+        elif backend_name == "openai":
+            from .backends.custom import CustomBackend
+            from .providers.openai_responses import OpenAIResponsesProvider
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            if not api_key:
+                creds = self.config.home / "credentials" / "OPENAI_API_KEY"
+                if creds.exists():
+                    api_key = creds.read_text().strip()
+            if not api_key:
+                raise RuntimeError(
+                    "OpenAI backend requires OPENAI_API_KEY env var "
+                    "or credentials/OPENAI_API_KEY file."
+                )
+            provider = OpenAIResponsesProvider(
+                api_key=api_key, session_id=self.agent_id,
+            )
+            return CustomBackend(provider)
         raise ValueError(f"Unknown backend: {backend_name}")
 
     def _build_backend_config(self) -> BackendConfig:
