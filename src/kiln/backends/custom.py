@@ -27,6 +27,8 @@ from ..types import (
     ToolCallEvent,
     ToolDef,
     ToolResultEvent,
+    TurnCompleteEvent,
+    Usage,
     Provider,
 )
 
@@ -107,6 +109,11 @@ class CustomBackend:
         if not self._config or not self._provider:
             raise RuntimeError("Backend not started.")
 
+        # Accumulate usage across agentic sub-turns so the final
+        # TurnCompleteEvent reports total usage for the whole turn.
+        cumulative_usage = Usage()
+        last_turn_complete: TurnCompleteEvent | None = None
+
         while self._has_pending_turn and not self._interrupted:
             self._has_pending_turn = False
             self._turn_count += 1
@@ -147,6 +154,16 @@ class CustomBackend:
                         assistant_turn.text += event.text
                     elif isinstance(event, ThinkingEvent):
                         assistant_turn.thinking_text += event.text
+                    elif isinstance(event, TurnCompleteEvent):
+                        # Don't yield intermediate TurnCompleteEvents — the
+                        # TUI expects exactly one per user turn. Accumulate
+                        # usage and hold the event for emission at loop exit.
+                        if event.usage:
+                            cumulative_usage = _accumulate_usage(
+                                cumulative_usage, event.usage,
+                            )
+                        last_turn_complete = event
+                        continue
 
                     yield event
 
@@ -196,6 +213,12 @@ class CustomBackend:
                     is_error=result_error,
                 )
 
+                # Append tool result BEFORE context injection — APIs expect
+                # function_call_output immediately after the function_call.
+                self._history.append(ToolResultTurn(
+                    call_id=tc.id, output=result_output, is_error=result_error,
+                ))
+
                 # Post-tool hook (context injection)
                 if self._hook_dispatcher:
                     injection = await self._hook_dispatcher.post_tool(
@@ -204,19 +227,29 @@ class CustomBackend:
                     if injection:
                         self._history.append(ContextInjection(text=injection))
 
-                self._history.append(ToolResultTurn(
-                    call_id=tc.id, output=result_output, is_error=result_error,
-                ))
-
             # Tool calls processed — loop continues
             if not self._interrupted:
                 self._has_pending_turn = True
+
+        # Emit a single TurnCompleteEvent with accumulated usage
+        if last_turn_complete is not None:
+            yield TurnCompleteEvent(
+                stop_reason=last_turn_complete.stop_reason,
+                usage=cumulative_usage,
+                session_id=last_turn_complete.session_id,
+                model=last_turn_complete.model,
+            )
 
     async def interrupt(self) -> None:
         self._interrupted = True
         self._has_pending_turn = False
 
     async def stop(self) -> None:
+        if self._provider:
+            try:
+                await self._provider.close()
+            except Exception:
+                log.debug("Provider close failed", exc_info=True)
         self._history.clear()
         self._tool_registry.clear()
         self._hook_dispatcher = None
@@ -246,8 +279,10 @@ class CustomBackend:
 
             elif isinstance(turn, AssistantTurn):
                 if turn.raw_output_items:
-                    # Round-trip raw provider items for multi-turn continuity
-                    items.extend(turn.raw_output_items)
+                    # Round-trip raw provider items for multi-turn continuity.
+                    # Strip output-only fields that APIs reject as input.
+                    for raw in turn.raw_output_items:
+                        items.append(_strip_output_only_fields(raw))
                 else:
                     # Fallback: reconstruct from our parsed data
                     parts = []
@@ -282,26 +317,33 @@ class CustomBackend:
         return items
 
     def _build_rich_user_message(self, turn: UserTurn) -> dict[str, Any]:
-        """Convert ContentBlock list to a user message."""
-        import base64
+        """Convert ContentBlock list to a user message.
 
+        Delegates format-specific encoding to the provider — each provider
+        knows its own API format for images and documents.
+        """
         parts = []
         for block in turn.content_blocks or []:
             if isinstance(block, TextContent):
                 parts.append({"type": "input_text", "text": block.text})
             elif isinstance(block, DocumentContent):
                 if block.mime_type.startswith("image/"):
-                    b64 = base64.b64encode(block.data).decode("ascii")
-                    parts.append({
-                        "type": "input_image",
-                        "image_url": f"data:{block.mime_type};base64,{b64}",
-                    })
+                    parts.append(
+                        self._provider.build_image_content(
+                            block.data, block.mime_type,
+                        )
+                    )
                 else:
-                    # Generic document — text description fallback
-                    parts.append({
-                        "type": "input_text",
-                        "text": f"[Document: {block.label} ({block.mime_type})]",
-                    })
+                    # Ensure filename has extension for type detection
+                    filename = block.label
+                    if "." not in filename:
+                        ext = block.mime_type.rsplit("/", 1)[-1]
+                        filename = f"{filename}.{ext}"
+                    parts.append(
+                        self._provider.build_document_content(
+                            block.data, block.mime_type, filename,
+                        )
+                    )
         if not parts:
             parts.append({"type": "input_text", "text": ""})
         return {"role": "user", "content": parts}
@@ -390,7 +432,12 @@ class CustomBackend:
             # SdkMcpTool handler returns {"content": [{"type": "text", "text": "..."}]}
             content = result.get("content", [])
             if content and isinstance(content, list):
-                output = content[0].get("text", "")
+                output = "\n".join(
+                    c.get("text", "") for c in content
+                    if isinstance(c, dict) and c.get("text")
+                )
+                if not output:
+                    output = str(result)
             else:
                 output = str(result)
             is_error = result.get("isError", False)
@@ -418,6 +465,37 @@ class CustomBackend:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Fields that appear in API responses but are rejected as input parameters.
+_OUTPUT_ONLY_FIELDS = {"status", "namespace"}
+
+
+def _strip_output_only_fields(item: dict) -> dict:
+    """Remove output-only fields from a raw API item for input replay.
+
+    The Responses API includes metadata fields (e.g. status, namespace) on
+    output items that it rejects when sent back as input.
+    """
+    if not any(k in item for k in _OUTPUT_ONLY_FIELDS):
+        return item
+    return {k: v for k, v in item.items() if k not in _OUTPUT_ONLY_FIELDS}
+
+
+def _accumulate_usage(total: Usage, turn: Usage) -> Usage:
+    """Merge usage across agentic sub-turns.
+
+    Output tokens and total are summed (cumulative generation).
+    Input and cache tokens take the latest sub-turn's values — they
+    reflect the current context window size, not billable volume.
+    """
+    return Usage(
+        input_tokens=turn.input_tokens,
+        output_tokens=total.output_tokens + turn.output_tokens,
+        cache_read_tokens=turn.cache_read_tokens,
+        cache_write_tokens=turn.cache_write_tokens,
+        total_tokens=total.total_tokens + turn.total_tokens,
+    )
+
 
 def _map_thinking_level(effort: str) -> dict[str, Any] | None:
     """Map Kiln effort level to OpenAI reasoning config."""

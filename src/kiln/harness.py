@@ -30,6 +30,8 @@ from .types import (
     ContentBlock,
     DocumentContent,
     ErrorEvent,
+    HookDispatcher,
+    HookRule,
     TextContent,
     ToolDef,
     TurnCompleteEvent,
@@ -96,6 +98,94 @@ def _tools_path_dirs(tools_path: Path) -> str:
         if p.is_dir():
             dirs.append(str(p))
     return ":".join(dirs)
+
+
+# ---------------------------------------------------------------------------
+# Codex OAuth token refresh
+# ---------------------------------------------------------------------------
+
+_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_CODEX_REFRESH_MARGIN = 300  # refresh if expiring within 5 minutes
+
+
+def _decode_jwt_exp(token: str) -> float | None:
+    """Extract expiry timestamp from a JWT without validating signature."""
+    import base64
+    try:
+        payload = token.split(".")[1]
+        # Pad to multiple of 4
+        payload += "=" * (4 - len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("exp")
+    except Exception:
+        return None
+
+
+def _refresh_codex_token_if_needed(data: dict, auth_path: Path) -> str | None:
+    """Check Codex OAuth token expiry and refresh if needed.
+
+    Returns a valid access_token, or None if refresh fails.
+    """
+    import time
+    import urllib.request
+    import urllib.parse
+
+    tokens = data.get("tokens", {})
+    access_token = tokens.get("access_token", "")
+    refresh_token = tokens.get("refresh_token", "")
+
+    if not access_token:
+        return None
+
+    # Check if token is still valid
+    exp = _decode_jwt_exp(access_token)
+    if exp and exp > time.time() + _CODEX_REFRESH_MARGIN:
+        log.debug("Codex token valid until %s", datetime.fromtimestamp(exp))
+        return access_token
+
+    # Token expired or expiring soon — refresh
+    if not refresh_token:
+        log.warning("Codex token expired but no refresh_token available")
+        return None
+
+    log.info("Codex OAuth token expired — refreshing")
+    try:
+        body = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": _CODEX_CLIENT_ID,
+        }).encode()
+        req = urllib.request.Request(
+            _CODEX_TOKEN_URL, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+
+        new_access = result.get("access_token")
+        if not new_access:
+            log.warning("Codex refresh returned no access_token")
+            return None
+
+        # Update tokens in auth.json
+        tokens["access_token"] = new_access
+        if result.get("refresh_token"):
+            tokens["refresh_token"] = result["refresh_token"]
+        if result.get("id_token"):
+            tokens["id_token"] = result["id_token"]
+        data["last_refresh"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        tmp = auth_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.rename(auth_path)
+        log.info("Codex OAuth token refreshed successfully")
+        return new_access
+
+    except Exception as e:
+        log.warning("Codex token refresh failed: %s", e)
+        # Return the old token — it might still work for a few seconds
+        return access_token if exp and exp > time.time() else None
 
 
 class KilnHarness:
@@ -250,6 +340,10 @@ class KilnHarness:
             state["session_config"] = session_config
         if channel_subscriptions is not None:
             state["channel_subscriptions"] = channel_subscriptions
+        if self.config.template:
+            state["template"] = self.config.template
+        if self.config.template_vars:
+            state["template_vars"] = dict(self.config.template_vars)
         path = self._session_state_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -341,26 +435,76 @@ class KilnHarness:
         elif backend_name == "openai":
             from .backends.custom import CustomBackend
             from .providers.openai_responses import OpenAIResponsesProvider
-            api_key = os.environ.get("OPENAI_API_KEY", "")
-            if not api_key:
-                creds = self.config.home / "credentials" / "OPENAI_API_KEY"
-                if creds.exists():
-                    api_key = creds.read_text().strip()
-            if not api_key:
-                raise RuntimeError(
-                    "OpenAI backend requires OPENAI_API_KEY env var "
-                    "or credentials/OPENAI_API_KEY file."
-                )
+            api_key = self._resolve_openai_key()
             provider = OpenAIResponsesProvider(
                 api_key=api_key, session_id=self.agent_id,
             )
             return CustomBackend(provider)
         raise ValueError(f"Unknown backend: {backend_name}")
 
+    def _resolve_openai_key(self) -> str:
+        """Resolve OpenAI API key from available sources.
+
+        Priority order:
+        1. Codex CLI OAuth token (~/.codex/auth.json) — zero-config default
+           Automatically refreshes expired tokens via OpenAI's OAuth endpoint.
+        2. OPENAI_API_KEY env var
+        3. credentials/OPENAI_API_KEY file
+        """
+        # 1. Codex CLI OAuth — zero-config default
+        codex_auth = Path.home() / ".codex" / "auth.json"
+        if codex_auth.exists():
+            try:
+                data = json.loads(codex_auth.read_text())
+                tokens = data.get("tokens", {})
+                if isinstance(tokens, dict):
+                    access_token = tokens.get("access_token", "")
+                    if access_token:
+                        access_token = _refresh_codex_token_if_needed(
+                            data, codex_auth,
+                        )
+                        if access_token:
+                            return access_token
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Failed to read Codex auth: %s", e)
+
+        # 2. Environment variable
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if api_key:
+            return api_key
+
+        # 3. Credentials file
+        creds = self.config.home / "credentials" / "OPENAI_API_KEY"
+        if creds.exists():
+            api_key = creds.read_text().strip()
+            if api_key:
+                return api_key
+
+        raise RuntimeError(
+            "OpenAI backend requires authentication. Options:\n"
+            "  1. Run 'codex login' to set up Codex OAuth (recommended)\n"
+            "  2. Set OPENAI_API_KEY env var\n"
+            "  3. Write key to credentials/OPENAI_API_KEY"
+        )
+
     def _build_backend_config(self) -> BackendConfig:
         """Build backend-agnostic config from agent spec."""
         # Restore saved state if resuming (--resume and --last both set resume_session).
         saved_state = self._load_session_state() if self.config.resume_session else None
+
+        # Re-apply template from saved state so cleanup, hooks, and other
+        # runtime config fields are restored.  CLI --template wins if set.
+        if saved_state and not self.config.template:
+            saved_template = saved_state.get("template")
+            if saved_template:
+                try:
+                    from .config import apply_template
+                    apply_template(self.config, saved_template)
+                except FileNotFoundError:
+                    log.warning("Saved template '%s' not found — skipping", saved_template)
+            saved_vars = saved_state.get("template_vars")
+            if saved_vars and not self.config.template_vars:
+                self.config.template_vars.update(saved_vars)
 
         cwd = self.config.project or safe_getcwd()
 
@@ -605,6 +749,7 @@ class KilnHarness:
             mcp_servers=mcp_servers,
             tool_defs=tool_defs,
             hooks=hooks,
+            hook_dispatcher=self._build_hook_dispatcher(hooks),
             cwd=cwd,
             env=env,
             effort=self.config.effort,
@@ -629,6 +774,35 @@ class KilnHarness:
             Dict mapping hook event names to lists of HookMatchers.
         """
         return {}
+
+    @staticmethod
+    def _strip_mcp_prefix(name: str) -> str:
+        """Strip MCP server namespace prefix: mcp__server__Tool → Tool."""
+        if "__" in name:
+            return name.rsplit("__", 1)[-1]
+        return name
+
+    def _build_hook_dispatcher(self, hooks: dict[str, list]) -> HookDispatcher:
+        """Translate CC SDK HookMatcher hooks into a HookDispatcher for CustomBackend.
+
+        HookMatchers use MCP-namespaced patterns (mcp__kiln__Read) but
+        CustomBackend tools have short names (Read). Patterns are stripped
+        during translation so HookRule.matches() works correctly.
+        """
+        pre_rules: list[HookRule] = []
+        post_rules: list[HookRule] = []
+
+        for matcher in hooks.get("PreToolUse", []):
+            pattern = self._strip_mcp_prefix(matcher.matcher) if matcher.matcher else None
+            for hook in matcher.hooks:
+                pre_rules.append(HookRule(pattern=pattern, hook=hook))
+
+        for matcher in hooks.get("PostToolUse", []):
+            pattern = self._strip_mcp_prefix(matcher.matcher) if matcher.matcher else None
+            for hook in matcher.hooks:
+                post_rules.append(HookRule(pattern=pattern, hook=hook))
+
+        return HookDispatcher(pre_tool_hooks=pre_rules, post_tool_hooks=post_rules)
 
     def _template_vars(self) -> dict[str, str]:
         """Build template variable dict for orientation and cleanup messages.

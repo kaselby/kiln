@@ -179,9 +179,23 @@ class OpenAIResponsesProvider:
         if extra_params:
             params.update(extra_params)
 
+        # Track whether any events have been yielded to the consumer.
+        # Once events are yielded, mid-stream retry would produce duplicates,
+        # so we fall through to an ErrorEvent instead.
+        has_yielded = [False]
+
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
             if attempt > 0:
+                # Don't retry if events have already been yielded — the
+                # consumer has seen partial content and retry would duplicate.
+                if has_yielded[0]:
+                    yield ErrorEvent(
+                        message=f"Stream failed after partial delivery: {last_error}",
+                        is_retryable=True,
+                    )
+                    return
+
                 delay = min(_BASE_DELAY * (2 ** (attempt - 1)), _MAX_DELAY)
                 if isinstance(last_error, APIStatusError):
                     retry_after = last_error.response.headers.get("retry-after")
@@ -200,6 +214,7 @@ class OpenAIResponsesProvider:
                 stream = await self._client.responses.create(**params)
                 state = _StreamState()
                 async for event in self._process_stream(stream, state, raw_output_collector):
+                    has_yielded[0] = True
                     yield event
                 return  # Success — done
             except RateLimitError as e:
@@ -461,6 +476,31 @@ class OpenAIResponsesProvider:
             }
             for tool in tools
         ]
+
+    def build_image_content(self, data: bytes, mime_type: str) -> dict[str, Any]:
+        """Encode image as data URI for the Responses API."""
+        import base64
+        b64 = base64.b64encode(data).decode("ascii")
+        return {
+            "type": "input_image",
+            "image_url": f"data:{mime_type};base64,{b64}",
+        }
+
+    def build_document_content(
+        self, data: bytes, mime_type: str, filename: str,
+    ) -> dict[str, Any]:
+        """Encode document as input_file for the Responses API.
+
+        The API extracts text and images from PDFs, text from docx/txt/etc,
+        and runs spreadsheet-specific augmentation for xlsx/csv.
+        """
+        import base64
+        b64 = base64.b64encode(data).decode("ascii")
+        return {
+            "type": "input_file",
+            "filename": filename,
+            "file_data": b64,
+        }
 
     @property
     def context_injection_role(self) -> str:

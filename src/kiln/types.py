@@ -82,6 +82,16 @@ class ContentBlockEndEvent:
 
 
 @dataclass
+class UsageUpdateEvent:
+    """Mid-turn usage snapshot for live context tracking.
+
+    Emitted from streaming deltas so the TUI can update context size
+    during a turn, not just at turn end.
+    """
+    usage: Usage
+
+
+@dataclass
 class ErrorEvent:
     """An error occurred during generation."""
     message: str
@@ -98,8 +108,9 @@ class SystemMessageEvent:
 # Union of all event types for type hints.
 Event = (
     TextEvent | ThinkingEvent | ToolCallEvent | ToolResultEvent
-    | TurnCompleteEvent | ContentBlockStartEvent | ContentBlockDeltaEvent
-    | ContentBlockEndEvent | ErrorEvent | SystemMessageEvent
+    | TurnCompleteEvent | UsageUpdateEvent | ContentBlockStartEvent
+    | ContentBlockDeltaEvent | ContentBlockEndEvent | ErrorEvent
+    | SystemMessageEvent
 )
 
 
@@ -180,6 +191,16 @@ class HookDispatcher:
         self._pre = pre_tool_hooks or []
         self._post = post_tool_hooks or []
 
+    @staticmethod
+    def _unwrap(result: dict) -> dict:
+        """Unwrap CC SDK hook output envelope if present.
+
+        CC SDK hooks return {"hookSpecificOutput": {actual output}}.
+        Non-SDK hooks may return flat dicts. Handle both.
+        """
+        inner = result.get("hookSpecificOutput")
+        return inner if inner and isinstance(inner, dict) else result
+
     async def pre_tool(self, tool_name: str, tool_input: dict) -> HookResult:
         for rule in self._pre:
             if rule.matches(tool_name):
@@ -188,8 +209,12 @@ class HookDispatcher:
                     None,
                     {"signal": None},
                 )
-                if result.get("decision") == "deny":
-                    return HookResult(denied=True, reason=result.get("reason"))
+                output = self._unwrap(result)
+                # CC SDK uses "permissionDecision"; flat format uses "decision"
+                decision = output.get("permissionDecision") or output.get("decision")
+                if decision == "deny":
+                    reason = output.get("permissionDecisionReason") or output.get("reason")
+                    return HookResult(denied=True, reason=reason)
         return HookResult(denied=False)
 
     async def post_tool(
@@ -204,7 +229,7 @@ class HookDispatcher:
                     None,
                     {"signal": None},
                 )
-                ctx = result.get("additionalContext")
+                ctx = self._unwrap(result).get("additionalContext")
                 if ctx:
                     additional_context.append(ctx)
         return "\n".join(additional_context) if additional_context else None
@@ -265,6 +290,21 @@ class Provider(Protocol):
         """Convert ToolDefs to provider-specific tool format."""
         ...
 
+    def build_image_content(self, data: bytes, mime_type: str) -> dict[str, Any]:
+        """Convert raw image bytes to provider-specific image input format."""
+        ...
+
+    def build_document_content(
+        self, data: bytes, mime_type: str, filename: str,
+    ) -> dict[str, Any]:
+        """Convert raw document bytes to provider-specific file input format.
+
+        Handles PDFs, docx, txt, spreadsheets, etc. Each provider has its
+        own format for file uploads (OpenAI uses input_file, Anthropic uses
+        document blocks, etc).
+        """
+        ...
+
     @property
     def context_injection_role(self) -> str:
         """Role for hook context injection messages.
@@ -272,6 +312,10 @@ class Provider(Protocol):
         "developer" for OpenAI (reasoning models ignore "system"),
         "system" for Anthropic, "user" with [SYSTEM] prefix as fallback.
         """
+        ...
+
+    async def close(self) -> None:
+        """Clean up resources (HTTP clients, connections, etc)."""
         ...
 
 

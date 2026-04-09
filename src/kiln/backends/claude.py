@@ -40,6 +40,7 @@ from ..types import (
     ToolResultEvent,
     TurnCompleteEvent,
     Usage,
+    UsageUpdateEvent,
 )
 
 log = logging.getLogger("kiln.backends.claude")
@@ -226,6 +227,9 @@ class ClaudeBackend:
             usage = event.get("usage")
             if usage:
                 self._pending_usage = usage
+                parsed = self._extract_usage(usage)
+                if parsed:
+                    events.append(UsageUpdateEvent(usage=parsed))
 
         return events
 
@@ -276,10 +280,12 @@ class ClaudeBackend:
         return events
 
     def _map_result_message(self, msg: ResultMessage) -> list[Event]:
-        # Use the most detailed usage available: ResultMessage > AssistantMessage > streaming.
-        usage = self._extract_usage(msg.usage) if msg.usage else None
-        if not usage and self._pending_usage:
-            usage = self._extract_usage(self._pending_usage)
+        # Prefer streaming/AssistantMessage usage (per-call, reflects actual
+        # context window size) over ResultMessage usage (cumulative across
+        # the SDK's agentic loop — inflates context display).
+        usage = self._extract_usage(self._pending_usage) if self._pending_usage else None
+        if not usage and msg.usage:
+            usage = self._extract_usage(msg.usage)
 
         model = self._last_model
         self._last_model = None
