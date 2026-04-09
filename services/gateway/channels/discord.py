@@ -1289,6 +1289,8 @@ class _GatewayClient(discord.Client):
                 await self._cmd_mode(message, parts[1:])
             elif cmd == "spawn":
                 await self._cmd_spawn(message, text[len("spawn"):].strip())
+            elif cmd == "resume":
+                await self._cmd_resume(message, parts[1:])
             elif cmd == "kill":
                 await self._cmd_kill(message, parts[1:])
             elif cmd == "interrupt":
@@ -1301,6 +1303,7 @@ class _GatewayClient(discord.Client):
                     "`mode <agent> <mode>` — change permission mode "
                     "(safe, supervised, yolo)\n"
                     "`spawn [instructions]` — launch a new session\n"
+                    "`resume <agent>` — resume a previous session\n"
                     "`kill <agent>` — kill a session (immediate)\n"
                     "`interrupt <agent>` — send ESC to unstick a session\n"
                     "`show <agent>` — capture current terminal pane\n"
@@ -1407,6 +1410,79 @@ class _GatewayClient(discord.Client):
             await message.reply("❌ Spawn timed out (30s).")
         except Exception as e:
             await message.reply(f"❌ Spawn error: {e}")
+
+    async def _cmd_resume(
+        self, message: discord.Message, args: list[str],
+    ) -> None:
+        """Handle: resume <agent-id>"""
+        if not args:
+            await message.reply("Usage: `resume <agent>`")
+            return
+
+        agent_ref = args[0]
+        agent_id = self._resolve_agent_id(agent_ref)
+        if not agent_id:
+            await message.reply(f"No session matching `{agent_ref}` in registry.")
+            return
+
+        # Check the session has a UUID (needed for resume)
+        registry = _read_registry(self._config.agent_home)
+        entry = registry.get(agent_id, {})
+        if not entry.get("session_uuid"):
+            await message.reply(
+                f"❌ `{agent_id}` has no session UUID — it may have exited "
+                "before completing its first turn."
+            )
+            return
+
+        # Check if still running
+        proc = await asyncio.create_subprocess_exec(
+            "tmux", "has-session", "-t", agent_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode == 0:
+            await message.reply(f"⚠️ `{agent_id}` is still running. Kill it first or use a different session.")
+            return
+
+        agent_name = self._config.default_agent
+        if not agent_name:
+            await message.reply("❌ No default agent configured.")
+            return
+        cli_path = shutil.which(agent_name)
+        if not cli_path:
+            await message.reply(f"❌ Cannot find `{agent_name}` on PATH.")
+            return
+
+        cmd = [cli_path, "run", "--mode", "yolo", "--detach", "--resume", agent_id]
+
+        log.info("Control: resume %s (by %s)", agent_id, message.author.name)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=30,
+            )
+            if proc.returncode == 0:
+                output = stdout.decode().strip()
+                await message.reply(
+                    f"✅ Resumed `{agent_id}`.\n```\n{output[:500]}\n```"
+                    if output else f"✅ Resumed `{agent_id}`."
+                )
+            else:
+                err = stderr.decode().strip()[:500]
+                await message.reply(
+                    f"❌ Resume failed (exit {proc.returncode}):\n```\n{err}\n```"
+                )
+        except asyncio.TimeoutError:
+            await message.reply("❌ Resume timed out (30s).")
+        except Exception as e:
+            await message.reply(f"❌ Resume error: {e}")
 
     async def _cmd_kill(
         self, message: discord.Message, args: list[str],
