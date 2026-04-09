@@ -1373,10 +1373,12 @@ def create_mcp_server(
             args.get("tasks", []),
         )
 
+    mcp_tools = [bash_tool, read_tool, edit_tool, write_tool, activate_skill_tool,
+                  message_tool, exit_session_tool, plan_tool]
+
     server = create_sdk_mcp_server(
         name="kiln",
         version="0.2.0",
-        tools=[bash_tool, read_tool, edit_tool, write_tool, activate_skill_tool,
-               message_tool, exit_session_tool, plan_tool],
+        tools=mcp_tools,
     )
-    return server, cleanup, get_shell_cwd
+    return server, cleanup, get_shell_cwd, mcp_tools

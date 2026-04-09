@@ -1,1 +1,1 @@
-"""Backend implementations — ClaudeBackend (CC SDK) and CustomBackend (direct API)."""
+"""Backend implementations for Kiln agent sessions."""
