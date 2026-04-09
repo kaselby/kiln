@@ -114,6 +114,12 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         help="Thinking effort level (low, medium, high). Default: high.",
     )
     parser.add_argument(
+        "--backend",
+        choices=["claude", "openai"],
+        default=None,
+        help="Backend override (default: infer from model name)",
+    )
+    parser.add_argument(
         "--template",
         default=None,
         help="Session template — partial config override from <home>/templates/<name>.yml",
@@ -203,6 +209,8 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--idle-nudge", args.idle_nudge]
     if getattr(args, "effort", None):
         cmd_parts += ["--effort", args.effort]
+    if getattr(args, "backend", None):
+        cmd_parts += ["--backend", args.backend]
     if getattr(args, "template", None):
         cmd_parts += ["--template", args.template]
     for var_str in getattr(args, "var", []):
@@ -342,6 +350,8 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
         config.idle_nudge_timeout = float(args.idle_nudge) * 60
     if getattr(args, "effort", None):
         config.effort = args.effort
+    if getattr(args, "backend", None):
+        config.backend = args.backend
 
     # Parse --var KEY=VALUE pairs into config.template_vars
     for var_str in getattr(args, "var", []):
@@ -423,6 +433,8 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             exec_args += ["--model", args.model]
         if getattr(args, "effort", None):
             exec_args += ["--effort", args.effort]
+        if getattr(args, "backend", None):
+            exec_args += ["--backend", args.backend]
         if args.persistent:
             exec_args.append("--persistent")
         # Prefer config.template (set by apply_template, survives resume) over args

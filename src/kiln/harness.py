@@ -8,7 +8,6 @@ Complex agents write their own harness that imports kiln's building
 blocks directly.
 """
 
-import asyncio
 import fcntl
 import json
 import logging
@@ -22,10 +21,20 @@ import yaml
 
 log = logging.getLogger("kiln.harness")
 
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    HookMatcher,
+from claude_agent_sdk import HookMatcher
+
+from .backends.claude import ClaudeBackend
+from .types import (
+    Backend,
+    BackendConfig,
+    ContentBlock,
+    DocumentContent,
+    ErrorEvent,
+    HookDispatcher,
+    HookRule,
+    TextContent,
+    ToolDef,
+    TurnCompleteEvent,
 )
 
 from .config import AgentConfig
@@ -91,6 +100,94 @@ def _tools_path_dirs(tools_path: Path) -> str:
     return ":".join(dirs)
 
 
+# ---------------------------------------------------------------------------
+# Codex OAuth token refresh
+# ---------------------------------------------------------------------------
+
+_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_CODEX_REFRESH_MARGIN = 300  # refresh if expiring within 5 minutes
+
+
+def _decode_jwt_exp(token: str) -> float | None:
+    """Extract expiry timestamp from a JWT without validating signature."""
+    import base64
+    try:
+        payload = token.split(".")[1]
+        # Pad to multiple of 4
+        payload += "=" * (4 - len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("exp")
+    except Exception:
+        return None
+
+
+def _refresh_codex_token_if_needed(data: dict, auth_path: Path) -> str | None:
+    """Check Codex OAuth token expiry and refresh if needed.
+
+    Returns a valid access_token, or None if refresh fails.
+    """
+    import time
+    import urllib.request
+    import urllib.parse
+
+    tokens = data.get("tokens", {})
+    access_token = tokens.get("access_token", "")
+    refresh_token = tokens.get("refresh_token", "")
+
+    if not access_token:
+        return None
+
+    # Check if token is still valid
+    exp = _decode_jwt_exp(access_token)
+    if exp and exp > time.time() + _CODEX_REFRESH_MARGIN:
+        log.debug("Codex token valid until %s", datetime.fromtimestamp(exp))
+        return access_token
+
+    # Token expired or expiring soon — refresh
+    if not refresh_token:
+        log.warning("Codex token expired but no refresh_token available")
+        return None
+
+    log.info("Codex OAuth token expired — refreshing")
+    try:
+        body = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": _CODEX_CLIENT_ID,
+        }).encode()
+        req = urllib.request.Request(
+            _CODEX_TOKEN_URL, data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+
+        new_access = result.get("access_token")
+        if not new_access:
+            log.warning("Codex refresh returned no access_token")
+            return None
+
+        # Update tokens in auth.json
+        tokens["access_token"] = new_access
+        if result.get("refresh_token"):
+            tokens["refresh_token"] = result["refresh_token"]
+        if result.get("id_token"):
+            tokens["id_token"] = result["id_token"]
+        data["last_refresh"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        tmp = auth_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.rename(auth_path)
+        log.info("Codex OAuth token refreshed successfully")
+        return new_access
+
+    except Exception as e:
+        log.warning("Codex token refresh failed: %s", e)
+        # Return the old token — it might still work for a few seconds
+        return access_token if exp and exp > time.time() else None
+
+
 class KilnHarness:
     """Default session manager for agents using agent.yml configuration.
 
@@ -110,7 +207,7 @@ class KilnHarness:
             worklogs_dir=config.worklogs_path,
         )
         self.session_id: str | None = None
-        self._client: ClaudeSDKClient | None = None
+        self._backend: Backend | None = None
         self._expected_model = resolve_model(config.model)
         self._model_verified = False
         self._permission_hook = None
@@ -127,8 +224,8 @@ class KilnHarness:
         self.steering_queue: list[str] = []
         self.followup_queue: list[str] = []
         self.ui_events: list[dict] = []
-        self.session_config: SessionConfig | None = None  # created in _build_options
-        self._resume_uuid: str | None = None  # set in _build_options if resuming
+        self.session_config: SessionConfig | None = None  # created in _build_backend_config
+        self._resume_uuid: str | None = None  # set in _build_backend_config if resuming
         self._worklog_path = self._resolve_worklog_path()
 
         # Spawned subagents default to yolo — no human watching
@@ -329,8 +426,69 @@ class KilnHarness:
 
     # -- Options builder ----------------------------------------------------
 
-    def _build_options(self) -> ClaudeAgentOptions:
-        """Build ClaudeAgentOptions from config."""
+    def _select_backend(self) -> Backend:
+        """Choose backend based on config."""
+        from .config import infer_backend
+        backend_name = self.config.backend or infer_backend(self.config.model)
+        if backend_name == "claude":
+            return ClaudeBackend()
+        elif backend_name == "openai":
+            from .backends.custom import CustomBackend
+            from .providers.openai_responses import OpenAIResponsesProvider
+            api_key = self._resolve_openai_key()
+            provider = OpenAIResponsesProvider(
+                api_key=api_key, session_id=self.agent_id,
+            )
+            return CustomBackend(provider)
+        raise ValueError(f"Unknown backend: {backend_name}")
+
+    def _resolve_openai_key(self) -> str:
+        """Resolve OpenAI API key from available sources.
+
+        Priority order:
+        1. Codex CLI OAuth token (~/.codex/auth.json) — zero-config default
+           Automatically refreshes expired tokens via OpenAI's OAuth endpoint.
+        2. OPENAI_API_KEY env var
+        3. credentials/OPENAI_API_KEY file
+        """
+        # 1. Codex CLI OAuth — zero-config default
+        codex_auth = Path.home() / ".codex" / "auth.json"
+        if codex_auth.exists():
+            try:
+                data = json.loads(codex_auth.read_text())
+                tokens = data.get("tokens", {})
+                if isinstance(tokens, dict):
+                    access_token = tokens.get("access_token", "")
+                    if access_token:
+                        access_token = _refresh_codex_token_if_needed(
+                            data, codex_auth,
+                        )
+                        if access_token:
+                            return access_token
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning("Failed to read Codex auth: %s", e)
+
+        # 2. Environment variable
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if api_key:
+            return api_key
+
+        # 3. Credentials file
+        creds = self.config.home / "credentials" / "OPENAI_API_KEY"
+        if creds.exists():
+            api_key = creds.read_text().strip()
+            if api_key:
+                return api_key
+
+        raise RuntimeError(
+            "OpenAI backend requires authentication. Options:\n"
+            "  1. Run 'codex login' to set up Codex OAuth (recommended)\n"
+            "  2. Set OPENAI_API_KEY env var\n"
+            "  3. Write key to credentials/OPENAI_API_KEY"
+        )
+
+    def _build_backend_config(self) -> BackendConfig:
+        """Build backend-agnostic config from agent spec."""
         # Restore saved state if resuming (--resume and --last both set resume_session).
         saved_state = self._load_session_state() if self.config.resume_session else None
 
@@ -533,8 +691,8 @@ class KilnHarness:
         else:
             env["PATH"] = f"{tools_dirs}:{base_path}"
 
-        # Build MCP server
-        mcp_server, self._shell_cleanup, self._get_shell_cwd = create_mcp_server(
+        # Build MCP server and extract tool definitions
+        mcp_server, self._shell_cleanup, self._get_shell_cwd, mcp_tools = create_mcp_server(
             self.config.inbox_path, self.config.skills_path,
             agent_id=self.agent_id,
             cwd=cwd, env=env, file_state=file_state,
@@ -543,6 +701,18 @@ class KilnHarness:
             supplemental=self._supplemental,
         )
         mcp_servers = {"kiln": mcp_server}
+
+        # Backend-agnostic tool definitions from MCP tool instances.
+        # ClaudeBackend ignores these; CustomBackend calls handler() directly.
+        tool_defs = [
+            ToolDef(
+                name=t.name,
+                description=t.description,
+                input_schema=t.input_schema if isinstance(t.input_schema, dict) else {},
+                handler=t.handler,
+            )
+            for t in mcp_tools
+        ]
 
         # Resolve conversation continuity for --resume / --last.
         resume_uuid = None
@@ -573,37 +743,66 @@ class KilnHarness:
             self._stderr_fh.write(line)
             self._stderr_fh.flush()
 
-        opts = dict(
+        return BackendConfig(
             system_prompt=full_prompt,
-            tools=base_tools,
-            allowed_tools=[],
-            hooks=hooks,
-            mcp_servers=mcp_servers,
             model=self.config.model,
+            mcp_servers=mcp_servers,
+            tool_defs=tool_defs,
+            hooks=hooks,
+            hook_dispatcher=self._build_hook_dispatcher(hooks),
             cwd=cwd,
             env=env,
-            permission_mode="bypassPermissions",
-            include_partial_messages=True,
-            continue_conversation=False,
-            resume=resume_uuid,
-            stderr=_stderr_callback,
-            extra_args={"setting-sources": ""},  # don't inherit user's CLI settings/MCP servers
+            effort=self.config.effort,
+            temperature=getattr(self.config, "temperature", None),
+            max_output_tokens=getattr(self.config, "max_output_tokens", None),
+            session_id=self.agent_id,
+            resume_conversation_id=resume_uuid,
+            stream_timeout=self.config.stream_timeout,
+            stderr_callback=_stderr_callback,
+            base_tools=base_tools,
+            extra_args={"setting-sources": ""},
         )
-        if self.config.effort:
-            opts["effort"] = self.config.effort
-        return ClaudeAgentOptions(**opts)
 
     def _agent_hooks(self) -> dict[str, list[HookMatcher]]:
         """Return agent-specific hooks to merge into the infrastructure hooks.
 
         Subclasses override this to inject custom PostToolUse/PreToolUse hooks
-        without reimplementing _build_options. Called after all infra hooks are
+        without reimplementing _build_backend_config. Called after all infra hooks are
         assembled. Returned matchers are appended to the corresponding event lists.
 
         Returns:
             Dict mapping hook event names to lists of HookMatchers.
         """
         return {}
+
+    @staticmethod
+    def _strip_mcp_prefix(name: str) -> str:
+        """Strip MCP server namespace prefix: mcp__server__Tool → Tool."""
+        if "__" in name:
+            return name.rsplit("__", 1)[-1]
+        return name
+
+    def _build_hook_dispatcher(self, hooks: dict[str, list]) -> HookDispatcher:
+        """Translate CC SDK HookMatcher hooks into a HookDispatcher for CustomBackend.
+
+        HookMatchers use MCP-namespaced patterns (mcp__kiln__Read) but
+        CustomBackend tools have short names (Read). Patterns are stripped
+        during translation so HookRule.matches() works correctly.
+        """
+        pre_rules: list[HookRule] = []
+        post_rules: list[HookRule] = []
+
+        for matcher in hooks.get("PreToolUse", []):
+            pattern = self._strip_mcp_prefix(matcher.matcher) if matcher.matcher else None
+            for hook in matcher.hooks:
+                pre_rules.append(HookRule(pattern=pattern, hook=hook))
+
+        for matcher in hooks.get("PostToolUse", []):
+            pattern = self._strip_mcp_prefix(matcher.matcher) if matcher.matcher else None
+            for hook in matcher.hooks:
+                post_rules.append(HookRule(pattern=pattern, hook=hook))
+
+        return HookDispatcher(pre_tool_hooks=pre_rules, post_tool_hooks=post_rules)
 
     def _template_vars(self) -> dict[str, str]:
         """Build template variable dict for orientation and cleanup messages.
@@ -681,10 +880,10 @@ class KilnHarness:
         If no orientation, --prompt is the startup message on followup_queue.
         """
         self._run_startup_commands()
-        options = self._build_options()
-        self._client = ClaudeSDKClient(options)
+        self._backend = self._select_backend()
+        config = self._build_backend_config()
+        await self._backend.start(config)
         self.register_session()
-        await self._client.connect()
 
         # Queue startup messages onto followup_queue (programmatic user turns).
         # steering_queue is for user-typed mid-turn input only.
@@ -752,129 +951,64 @@ class KilnHarness:
 
     async def send(self, message: str):
         """Send a user message to the agent."""
-        if not self._client:
+        if not self._backend:
             raise RuntimeError("Harness not started. Call start() first.")
-        await self._client.query(message)
+        await self._backend.send(message)
 
     async def receive(self):
-        """Yield messages from the agent until the turn ends.
+        """Yield Kiln Events from the backend until the turn ends.
 
-        After each inner receive cycle, checks for pending supplemental
-        content (e.g. PDF document blocks). If found, transparently injects
-        it as a new user turn and continues yielding — the caller never
-        needs to know about the two-turn handshake.
+        After each receive cycle, checks for pending supplemental content
+        (e.g. PDF document blocks). If found, transparently injects it as
+        a new user turn and continues yielding.
 
-        If stream_timeout is configured and no message arrives within the
-        timeout window, sends an interrupt to the stalled Claude Code
-        subprocess and queues a recovery message so the agent gets another
-        turn automatically.
+        Stream timeout is handled by the backend. If the backend yields an
+        ErrorEvent(is_retryable=True), queues a recovery message so the
+        agent gets another turn automatically.
         """
-        if not self._client:
+        if not self._backend:
             raise RuntimeError("Harness not started. Call start() first.")
 
-        async for msg in self._receive_inner():
-            yield msg
+        async for event in self._backend.receive():
+            if isinstance(event, ErrorEvent) and event.is_retryable:
+                self.followup_queue.append(
+                    "[SYSTEM] The previous model generation stalled — "
+                    + event.message
+                    + " Your partial response (if any) is preserved in "
+                    "context above. Please continue where you left off."
+                )
+                continue
+            yield event
 
         # Transparent supplemental content injection.
-        # The loop handles the (unlikely) case where a supplemental response
-        # itself triggers more supplemental content.
         while self._supplemental and self._supplemental.has_pending:
             items = self._supplemental.drain()
-            rich_msg = self._build_supplemental_message(items)
-            await self._client.query(rich_msg)
-            async for msg in self._receive_inner():
-                yield msg
+            rich_blocks = self._build_supplemental_blocks(items)
+            await self._backend.send(rich_blocks)
+            async for event in self._backend.receive():
+                if isinstance(event, ErrorEvent) and event.is_retryable:
+                    self.followup_queue.append(
+                        "[SYSTEM] " + event.message
+                        + " Please continue where you left off."
+                    )
+                    continue
+                yield event
 
-    async def _receive_inner(self):
-        """Single receive cycle with optional stream timeout."""
-        timeout = self.session_config.get("stream_timeout", self.config.stream_timeout) if self.session_config else self.config.stream_timeout
-        if not timeout:
-            async for msg in self._client.receive_response():
-                yield msg
-            return
-
-        ait = self._client.receive_response().__aiter__()
-        while True:
-            try:
-                msg = await asyncio.wait_for(anext(ait), timeout=timeout)
-                yield msg
-            except StopAsyncIteration:
-                return
-            except asyncio.TimeoutError:
-                log.warning(
-                    "Stream stall: no data for %ds. Interrupting.", int(timeout)
-                )
-                try:
-                    await asyncio.wait_for(self._client.interrupt(), timeout=10)
-                except Exception:
-                    pass
-                # Drain remaining messages. The original iterator is dead —
-                # asyncio.wait_for cancelled it. Use a fresh one.
-                try:
-                    drain = self._client.receive_response().__aiter__()
-                    while True:
-                        msg = await asyncio.wait_for(anext(drain), timeout=15)
-                        yield msg
-                except (StopAsyncIteration, asyncio.TimeoutError, Exception):
-                    pass
-                self.followup_queue.append(
-                    "[SYSTEM] The previous model generation stalled — no data "
-                    "was received for %d seconds, likely due to an API streaming "
-                    "connection issue. The stalled turn was interrupted. Your "
-                    "partial response (if any) is preserved in context above. "
-                    "Please continue where you left off." % int(timeout)
-                )
-                return
-
-    def _build_supplemental_message(self, items: list[dict]):
-        """Build a rich user message from pending supplemental content items.
-
-        Returns an async iterable of message dicts for client.query().
-        Override in subclasses for backend-specific formatting.
-        """
-        import base64 as _b64
-
-        content_blocks = []
+    def _build_supplemental_blocks(self, items: list[dict]) -> list[ContentBlock]:
+        """Convert pending supplemental content to backend-agnostic ContentBlocks."""
+        blocks: list[ContentBlock] = []
         labels = []
         for item in items:
-            mime = item["mime_type"]
-            label = item.get("label", "file")
-            labels.append(label)
-
-            if mime == "application/pdf":
-                content_blocks.append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": _b64.b64encode(item["data"]).decode("ascii"),
-                    },
-                })
-            else:
-                # Generic fallback — encode as base64 document
-                content_blocks.append({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime,
-                        "data": _b64.b64encode(item["data"]).decode("ascii"),
-                    },
-                })
-
-        files_str = ", ".join(labels)
-        content_blocks.append({
-            "type": "text",
-            "text": f"Document content loaded for: {files_str}. Continue with your task.",
-        })
-
-        async def _message_iter():
-            yield {
-                "type": "user",
-                "message": {"role": "user", "content": content_blocks},
-                "parent_tool_use_id": None,
-            }
-
-        return _message_iter()
+            labels.append(item.get("label", "file"))
+            blocks.append(DocumentContent(
+                data=item["data"],
+                mime_type=item["mime_type"],
+                label=item.get("label", "file"),
+            ))
+        blocks.append(TextContent(
+            text=f"Document content loaded for: {', '.join(labels)}. Continue with your task.",
+        ))
+        return blocks
 
     def check_model(self, actual_model: str) -> str | None:
         """Check actual model against expected. Returns warning or None."""
@@ -897,17 +1031,17 @@ class KilnHarness:
 
     async def interrupt(self):
         """Interrupt the agent's current turn."""
-        if self._client:
-            await self._client.interrupt()
+        if self._backend:
+            await self._backend.interrupt()
 
     async def force_stop(self):
-        """Force-kill the CLI subprocess."""
+        """Force-kill the backend."""
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None
-        if self._client:
-            await self._client.disconnect()
-            self._client = None
+        if self._backend:
+            await self._backend.stop()
+            self._backend = None
         if self.session_config:
             self.session_config.cleanup()
 
@@ -1064,9 +1198,9 @@ class KilnHarness:
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None
-        if self._client:
-            await self._client.disconnect()
-            self._client = None
+        if self._backend:
+            await self._backend.stop()
+            self._backend = None
         if self._stderr_fh:
             self._stderr_fh.close()
             self._stderr_fh = None

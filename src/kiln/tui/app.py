@@ -44,16 +44,20 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import print_formatted_text
 from prompt_toolkit.styles import Style
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ResultMessage,
-    SystemMessage,
-    TextBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
+from ..types import (
+    ContentBlockDeltaEvent,
+    ContentBlockEndEvent,
+    ContentBlockStartEvent,
+    ErrorEvent,
+    Event,
+    SystemMessageEvent,
+    TextEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    TurnCompleteEvent,
+    UsageUpdateEvent,
 )
-from claude_agent_sdk.types import StreamEvent
 
 from ..hooks import _resolve_live_trust, format_message_source, parse_message
 from ..state import write_presence
@@ -1311,12 +1315,12 @@ class KilnApp:
                 stamped = f"[{ts}]\n{text}"
             await self._harness.send(stamped)
 
-            async for msg in self._harness.receive():
+            async for event in self._harness.receive():
                 if self._interrupt_in_flight:
-                    if isinstance(msg, ResultMessage):
+                    if isinstance(event, TurnCompleteEvent):
                         break
                     continue
-                self._handle_sdk_message(msg)
+                self._handle_event(event)
 
             if not self._interrupt_in_flight:
                 self._commit_stream()
@@ -1700,77 +1704,80 @@ class KilnApp:
                 elif updated:
                     _tprint("\n<hook>  \u26a1 hook:{} \u2192 (output replaced)</hook>", hook_name)
 
-    def _capture_session_id(self, session_id: str | None) -> None:
-        """Register session UUID on first sight — called from any message type."""
-        if session_id and not self._harness.session_id:
-            self._harness.session_id = session_id
-            self._harness.register_session()
-
-    def _handle_sdk_message(self, msg: object) -> None:
-        """Route an incoming SDK message to the appropriate handler."""
+    def _handle_event(self, event: Event) -> None:
+        """Route an incoming Kiln Event to the appropriate handler."""
         self._drain_ui_events()
 
-        if isinstance(msg, StreamEvent):
-            self._capture_session_id(msg.session_id)
-            event = msg.event
-            etype = event.get("type", "")
-            if etype == "content_block_delta":
-                delta = event.get("delta", {})
-                delta_type = delta.get("type", "")
-                if delta_type == "text_delta":
-                    text = delta.get("text", "")
-                    if text:
-                        if not self._stream_chunks:
-                            self._commit_thinking()
-                        self._stream_chunks.append(text)
-                elif delta_type == "thinking_delta":
-                    thinking = delta.get("thinking", "")
-                    if thinking:
-                        self._on_stream_thinking(thinking)
-            elif etype == "message_delta":
-                usage = event.get("usage", {})
-                if usage:
-                    self._last_call_usage = usage
-                    self._context_tokens = (
-                        usage.get("input_tokens", 0)
-                        + usage.get("cache_read_input_tokens", 0)
-                        + usage.get("cache_creation_input_tokens", 0)
-                    )
-                    if self._harness.session_control:
-                        self._harness.session_control.context_tokens = self._context_tokens
-                    if self._app:
-                        self._app.invalidate()
+        if isinstance(event, ContentBlockDeltaEvent):
+            if event.text is not None:
+                if not self._stream_chunks:
+                    self._commit_thinking()
+                self._stream_chunks.append(event.text)
+            elif event.thinking is not None:
+                self._on_stream_thinking(event.thinking)
 
-        elif isinstance(msg, AssistantMessage):
-            warning = self._harness.check_model(msg.model)
-            if warning:
-                _tprint("\n<err-b>Warning:</err-b> <err>{}</err>", warning)
+        elif isinstance(event, TextEvent):
+            # Final complete text — fallback if streaming didn't deliver
+            if not self._stream_chunks:
+                self._stream_chunks.append(event.text)
 
-            for block in msg.content:
-                if isinstance(block, TextBlock) and block.text:
-                    if not self._stream_chunks:
-                        self._stream_chunks.append(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    self._tool_name_queue.append(block.name)
-                    self._on_tool_call_start(block.name, block.input)
+        elif isinstance(event, ThinkingEvent):
+            # Final complete thinking block (if not streamed via deltas)
+            if not self._thinking_buffer:
+                self._thinking_buffer = event.text
 
-        elif isinstance(msg, UserMessage):
-            content = msg.content
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, ToolResultBlock):
-                        tool_name = self._tool_name_queue.pop(0) if self._tool_name_queue else ""
-                        self._on_tool_call_result(
-                            tool_name, block.content, block.is_error
-                        )
+        elif isinstance(event, ToolCallEvent):
+            self._tool_name_queue.append(event.name)
+            self._on_tool_call_start(event.name, event.input)
 
-        elif isinstance(msg, ResultMessage):
-            self._capture_session_id(msg.session_id)
-            self._on_turn_complete(msg)
+        elif isinstance(event, ToolResultEvent):
+            tool_name = self._tool_name_queue.pop(0) if self._tool_name_queue else ""
+            self._on_tool_call_result(
+                tool_name, event.output, event.is_error,
+            )
 
-        elif isinstance(msg, SystemMessage):
-            if msg.subtype not in ("init",):
-                _tprint("<dim-i>System: {}</dim-i>", msg.subtype)
+        elif isinstance(event, TurnCompleteEvent):
+            if event.model:
+                warning = self._harness.check_model(event.model)
+                if warning:
+                    _tprint("\n<err-b>Warning:</err-b> <err>{}</err>", warning)
+            if event.session_id and not self._harness.session_id:
+                self._harness.session_id = event.session_id
+                self._harness.register_session()
+            if event.usage:
+                self._last_call_usage = {
+                    "input_tokens": event.usage.input_tokens,
+                    "output_tokens": event.usage.output_tokens,
+                    "cache_read_input_tokens": event.usage.cache_read_tokens or 0,
+                    "cache_creation_input_tokens": event.usage.cache_write_tokens or 0,
+                }
+                self._context_tokens = (
+                    event.usage.input_tokens
+                    + (event.usage.cache_read_tokens or 0)
+                    + (event.usage.cache_write_tokens or 0)
+                )
+                if self._harness.session_control:
+                    self._harness.session_control.context_tokens = self._context_tokens
+            self._on_turn_complete_event(event)
+
+        elif isinstance(event, UsageUpdateEvent):
+            if event.usage:
+                self._context_tokens = (
+                    event.usage.input_tokens
+                    + (event.usage.cache_read_tokens or 0)
+                    + (event.usage.cache_write_tokens or 0)
+                )
+                if self._harness.session_control:
+                    self._harness.session_control.context_tokens = self._context_tokens
+                if self._app:
+                    self._app.invalidate()
+
+        elif isinstance(event, ErrorEvent):
+            _tprint("\n<err-b>Error:</err-b> <err>{}</err>", event.message)
+
+        elif isinstance(event, SystemMessageEvent):
+            if event.subtype not in ("init",):
+                _tprint("<dim-i>System: {}</dim-i>", event.subtype)
 
     # ---- Permissions ----
 
@@ -1902,21 +1909,23 @@ class KilnApp:
         else:
             _tprint("<dim>{}</dim>", indented)
 
-    def _on_turn_complete(self, msg: ResultMessage) -> None:
+    def _on_turn_complete_event(self, event: TurnCompleteEvent) -> None:
         """Render turn completion stats."""
         self._commit_stream()
         self._commit_thinking()
 
-        last = self._last_call_usage
-        if last:
-            self._context_tokens = (
-                last.get("input_tokens", 0)
-                + last.get("cache_read_input_tokens", 0)
-                + last.get("cache_creation_input_tokens", 0)
+        parts = []
+        if event.usage:
+            total = event.usage.total_tokens or (
+                event.usage.input_tokens + event.usage.output_tokens
             )
-
-        parts = [f"{msg.num_turns} turns", f"{msg.duration_ms}ms"]
-        summary = "  |  ".join(parts)
+            parts.append(f"{_fmt_tokens(total)} tokens")
+            cached = event.usage.cache_read_tokens
+            if cached:
+                parts.append(f"{_fmt_tokens(cached)} cached")
+        if event.stop_reason and event.stop_reason != "stop":
+            parts.append(f"stop: {event.stop_reason}")
+        summary = "  |  ".join(parts) if parts else "done"
         _tprint("\n<dim>--- {} ---</dim>", summary)
 
         self._last_call_usage = {}

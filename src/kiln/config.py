@@ -83,6 +83,10 @@ class AgentConfig:
     # None means use the SDK/CLI default.
     effort: str | None = None
 
+    # Backend selection — "claude" (default), "openai", "openai-compat", "litellm".
+    # None means infer from model name. Explicit setting overrides inference.
+    backend: str | None = None
+
     # Heartbeat
     heartbeat: bool = False
     heartbeat_max: float = 1800.0       # cap for exponential backoff (seconds)
@@ -247,6 +251,35 @@ class AgentConfig:
         return result
 
 
+# ---------------------------------------------------------------------------
+# Backend inference
+# ---------------------------------------------------------------------------
+
+# Model name prefixes that map to known backends.
+_BACKEND_PREFIXES = {
+    "claude": "claude",
+    "gpt": "openai",
+    "o1": "openai",
+    "o3": "openai",
+    "o4": "openai",
+}
+
+
+def infer_backend(model: str | None) -> str:
+    """Infer the backend from a model name.
+
+    Returns "claude" (default), "openai", or raises ValueError for
+    unrecognized models with no explicit backend set.
+    """
+    if not model:
+        return "claude"
+    model_lower = model.lower()
+    for prefix, backend in _BACKEND_PREFIXES.items():
+        if model_lower.startswith(prefix):
+            return backend
+    return "claude"  # default — ClaudeBackend handles unknown models
+
+
 def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
     """Apply raw YAML fields to an AgentConfig.
 
@@ -255,7 +288,7 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
     """
     # Scalar fields — simple setattr
     for field_name in [
-        "identity_doc", "owner_name", "model", "effort", "session_prefix",
+        "identity_doc", "owner_name", "model", "effort", "backend", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
         "orientation", "cleanup", "initial_mode",
