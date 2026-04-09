@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -257,28 +258,31 @@ def _launch_in_tmux(args: argparse.Namespace, config: AgentConfig, spec_path: Pa
             os.execvp("tmux", ["tmux", "attach", "-t", agent_id])
 
 
-def _start_caffeinate() -> int | None:
-    """Start caffeinate to prevent system sleep on macOS. Returns PID or None."""
+def _start_caffeinate() -> subprocess.Popen | None:
+    """Start caffeinate to prevent system sleep on macOS. Returns Popen or None."""
     if not shutil.which("caffeinate"):
         return None
     try:
-        proc = subprocess.Popen(
+        return subprocess.Popen(
             ["caffeinate", "-i"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return proc.pid
     except OSError:
         return None
 
 
-def _stop_caffeinate(pid: int | None) -> None:
-    if pid is None:
+def _stop_caffeinate(proc: subprocess.Popen | None) -> None:
+    if proc is None:
         return
     try:
-        os.kill(pid, 15)
-    except (ProcessLookupError, OSError):
-        pass
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
 
 
 def _most_recent_agent_id(config: AgentConfig) -> str | None:
@@ -376,7 +380,17 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             capture_output=True,
         )
 
-    _caffeinate_pid = _start_caffeinate()
+    _caffeinate_proc = _start_caffeinate()
+
+    def _sighup_handler(signum, frame):
+        """Clean up on SIGHUP (tmux kill-session). Default SIGHUP terminates
+        without running finally blocks, so we handle cleanup explicitly."""
+        _stop_caffeinate(_caffeinate_proc)
+        if harness.session_config:
+            harness.session_config.cleanup()
+        sys.exit(1)
+
+    signal.signal(signal.SIGHUP, _sighup_handler)
 
     # Import TUI here — it has heavy dependencies
     from .tui import KilnApp
@@ -385,7 +399,7 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     try:
         app.run()
     finally:
-        _stop_caffeinate(_caffeinate_pid)
+        _stop_caffeinate(_caffeinate_proc)
 
     if harness.continue_requested:
         cli_bin = _cli_bin()
