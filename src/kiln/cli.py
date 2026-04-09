@@ -22,7 +22,13 @@ _TMUX_GUARD = "KILN_IN_TMUX"
 def _find_agent_spec(spec_arg: str | None) -> Path:
     """Resolve the agent spec path.
 
-    Searches: explicit path > ./agent.yml > ~/.<name>/agent.yml > error.
+    With a name/path argument:
+      1. Explicit path (file or directory containing agent.yml)
+      2. ~/.kiln/agents/<name>/agent.yml
+      3. ~/.<name>/agent.yml  (legacy — Beth, Aleph, etc.)
+
+    With no argument:
+      1. ./agent.yml in the current directory
     """
     if spec_arg:
         p = Path(spec_arg)
@@ -31,10 +37,15 @@ def _find_agent_spec(spec_arg: str | None) -> Path:
         if p.exists():
             return p
 
-        # Try ~/.<name>/agent.yml as a shorthand (e.g. "kiln run beth")
-        home_spec = Path.home() / f".{spec_arg}" / "agent.yml"
-        if home_spec.exists():
-            return home_spec
+        # Standard location: ~/.kiln/agents/<name>/
+        kiln_spec = Path.home() / ".kiln" / "agents" / spec_arg / "agent.yml"
+        if kiln_spec.exists():
+            return kiln_spec
+
+        # Legacy: ~/.<name>/ (for agents with custom harnesses)
+        legacy_spec = Path.home() / f".{spec_arg}" / "agent.yml"
+        if legacy_spec.exists():
+            return legacy_spec
 
         raise FileNotFoundError(f"Agent spec not found: {spec_arg}")
 
@@ -121,7 +132,7 @@ def _parse_init_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("name", help="Agent name")
     parser.add_argument(
         "--dir", default=None,
-        help="Directory to create (default: ./<name>)",
+        help="Directory to create (default: ~/.kiln/agents/<name>)",
     )
     parser.add_argument(
         "--model", default="claude-sonnet-4-6",
@@ -527,7 +538,11 @@ def _scaffold_harness(target: Path, name: str) -> None:
 
 def cmd_init(args: argparse.Namespace) -> None:
     """Scaffold a new agent home directory."""
-    target = Path(args.dir or args.name)
+    if args.dir:
+        target = Path(args.dir)
+    else:
+        target = Path.home() / ".kiln" / "agents" / args.name
+
     if target.exists():
         print(f"Error: {target} already exists")
         sys.exit(1)
@@ -572,7 +587,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"  Install the harness:  uv tool install --editable {target}/harness")
         print(f"  Then launch with:     {args.name}")
     else:
-        print(f"  Edit identity.md and agent.yml, then: kiln run {target}")
+        print(f"  Edit {doc_name} and agent.yml, then: kiln run {args.name}")
 
 
 # ---------------------------------------------------------------------------
