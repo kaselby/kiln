@@ -252,8 +252,13 @@ class Provider(Protocol):
         temperature: float | None = None,
         max_output_tokens: int | None = None,
         extra_params: dict[str, Any] | None = None,
+        raw_output_collector: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[Event]:
-        """Stream a model response, yielding Kiln Events."""
+        """Stream a model response, yielding Kiln Events.
+
+        If raw_output_collector is provided, raw API output items are
+        appended to it for conversation replay (multi-turn continuity).
+        """
         ...
 
     def build_tool_schemas(self, tools: list[ToolDef]) -> list[dict[str, Any]]:

@@ -1,1 +1,1 @@
-"""Provider implementations — API communication for CustomBackend."""
+"""LLM API providers for Kiln's custom backend."""
