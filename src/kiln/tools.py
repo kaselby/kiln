@@ -14,8 +14,12 @@ Agent extensions can:
 
 import base64
 import json
+import logging
 import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,9 +181,13 @@ IMAGE_MIME_TYPES = {
     "webp": "image/webp",
 }
 
-# Max image file size before we bail (10 MB). CC handles resize/compression
-# for MCP ImageContent automatically, but we still want to catch absurd files.
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+# Image size limits. TARGET is what we aim for after resize; HARD is the
+# absolute ceiling (bail rather than attempt processing).
+IMAGE_TARGET_BASE64 = 5 * 1024 * 1024   # 5MB base64 (~3.75MB raw) — Claude API limit
+IMAGE_HARD_LIMIT     = 20 * 1024 * 1024  # 20MB raw — don't even try
+IMAGE_MAX_DIM        = 2000               # max width or height in pixels
+
+_tools_log = logging.getLogger("kiln.tools")
 
 MAX_LINES = 2000
 MAX_LINE_LEN = 2000
@@ -302,13 +310,19 @@ def read_file(
 
 
 def _read_image(normalized: str, file_path: str, ext: str, file_state: FileState) -> dict:
-    """Read an image file and return as MCP ImageContent."""
+    """Read an image file and return as MCP ImageContent.
+
+    Large images are resized to fit within the MCP transport buffer
+    (JSON-RPC messages have a finite size limit). Uses sips (macOS)
+    or Pillow for resizing; returns an error if neither is available
+    and the image is too large.
+    """
     try:
         size = os.path.getsize(normalized)
-        if size > MAX_IMAGE_BYTES:
+        if size > IMAGE_HARD_LIMIT:
             return _error(
                 f"Image too large ({size / 1024 / 1024:.1f} MB). "
-                f"Maximum supported size is {MAX_IMAGE_BYTES // 1024 // 1024} MB."
+                f"Maximum supported size is {IMAGE_HARD_LIMIT // 1024 // 1024} MB."
             )
         data = Path(normalized).read_bytes()
     except OSError as e:
@@ -317,10 +331,116 @@ def _read_image(normalized: str, file_path: str, ext: str, file_state: FileState
     mime = IMAGE_MIME_TYPES.get(ext, "image/png")
     b64 = base64.b64encode(data).decode("ascii")
 
+    if len(b64) <= IMAGE_TARGET_BASE64:
+        file_state.record_read(normalized, partial=False)
+        return {"content": [{"type": "image", "data": b64, "mimeType": mime}]}
+
+    # Image exceeds target — resize it.
+    _tools_log.info("Image %s is %dKB base64, resizing (target %dKB)",
+                    file_path, len(b64) // 1024, IMAGE_TARGET_BASE64 // 1024)
+
+    resized = _resize_image(normalized, IMAGE_TARGET_BASE64)
+    if resized is None:
+        return _error(
+            f"Image too large for transport ({len(b64) // 1024}KB base64, "
+            f"target {IMAGE_TARGET_BASE64 // 1024}KB). "
+            f"Install Pillow or use macOS (sips) for automatic resizing."
+        )
+
+    data, mime = resized
+    b64 = base64.b64encode(data).decode("ascii")
     file_state.record_read(normalized, partial=False)
-    return {
-        "content": [{"type": "image", "data": b64, "mimeType": mime}],
-    }
+    return {"content": [{"type": "image", "data": b64, "mimeType": mime}]}
+
+
+def _resize_image(path: str, max_base64_bytes: int) -> tuple[bytes, str] | None:
+    """Resize an image to fit within a base64 byte budget.
+
+    Returns (raw_bytes, mime_type) or None if no resizer is available.
+    Tries sips (macOS built-in) first, then Pillow.
+    """
+    max_raw = int(max_base64_bytes * 3 / 4)
+
+    if shutil.which("sips"):
+        result = _resize_with_sips(path, max_raw)
+        if result is not None:
+            return result
+
+    try:
+        from PIL import Image as _PILImage
+        return _resize_with_pillow(path, max_raw, _PILImage)
+    except ImportError:
+        pass
+
+    return None
+
+
+def _resize_with_sips(path: str, max_raw_bytes: int) -> tuple[bytes, str] | None:
+    """Resize using macOS sips. Progressive strategy: JPEG convert, then shrink."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Try JPEG conversion at original dimensions first (huge win for PNGs)
+            out = os.path.join(tmpdir, "out.jpg")
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", "-s", "formatOptions", "85",
+                 path, "--out", out],
+                capture_output=True, timeout=15,
+            )
+            if os.path.exists(out) and os.path.getsize(out) <= max_raw_bytes:
+                return Path(out).read_bytes(), "image/jpeg"
+
+            # Progressive dimension reduction
+            for width in [IMAGE_MAX_DIM, 1500, 1024, 768, 512]:
+                out = os.path.join(tmpdir, f"out_{width}.jpg")
+                subprocess.run(
+                    ["sips", "-s", "format", "jpeg", "-s", "formatOptions", "80",
+                     "--resampleWidth", str(width), path, "--out", out],
+                    capture_output=True, timeout=15,
+                )
+                if os.path.exists(out) and os.path.getsize(out) <= max_raw_bytes:
+                    return Path(out).read_bytes(), "image/jpeg"
+
+            # Last resort: tiny aggressive JPEG
+            out = os.path.join(tmpdir, "out_tiny.jpg")
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", "-s", "formatOptions", "50",
+                 "--resampleWidth", "400", path, "--out", out],
+                capture_output=True, timeout=15,
+            )
+            if os.path.exists(out):
+                return Path(out).read_bytes(), "image/jpeg"
+    except Exception as e:
+        _tools_log.warning("sips resize failed: %s", e)
+
+    return None
+
+
+def _resize_with_pillow(path: str, max_raw_bytes: int, Image) -> tuple[bytes, str] | None:
+    """Resize using Pillow. Progressive strategy matching sips."""
+    import io
+    try:
+        img = Image.open(path)
+        img = img.convert("RGB")  # Drop alpha for JPEG
+
+        # Try at original dimensions with JPEG compression
+        for quality in [85, 70, 50]:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            if buf.tell() <= max_raw_bytes:
+                return buf.getvalue(), "image/jpeg"
+
+        # Progressive dimension reduction
+        for max_dim in [IMAGE_MAX_DIM, 1500, 1024, 768, 512, 400]:
+            resized = img.copy()
+            resized.thumbnail((max_dim, max_dim))
+            buf = io.BytesIO()
+            resized.save(buf, format="JPEG", quality=70)
+            if buf.tell() <= max_raw_bytes:
+                return buf.getvalue(), "image/jpeg"
+    except Exception as e:
+        _tools_log.warning("Pillow resize failed: %s", e)
+
+    return None
 
 
 def _read_notebook(normalized: str, file_path: str, file_state: FileState) -> dict:

@@ -422,26 +422,36 @@ class CustomBackend:
     # -------------------------------------------------------------------
 
     async def _execute_tool(self, tc: ToolCallEvent) -> tuple[str, bool]:
-        """Execute a tool call. Returns (output, is_error)."""
+        """Execute a tool call. Returns (output, is_error).
+
+        MCP results can contain text, images, and other block types.
+        Only text is extracted — images get a placeholder to avoid dumping
+        raw base64 into the conversation history.
+        """
         tool = self._tool_registry.get(tc.name)
         if not tool:
             return f"Unknown tool: {tc.name}", True
 
         try:
             result = await tool.handler(tc.input)
-            # SdkMcpTool handler returns {"content": [{"type": "text", "text": "..."}]}
-            content = result.get("content", [])
-            if content and isinstance(content, list):
-                output = "\n".join(
-                    c.get("text", "") for c in content
-                    if isinstance(c, dict) and c.get("text")
-                )
-                if not output:
-                    output = str(result)
-            else:
-                output = str(result)
             is_error = result.get("isError", False)
-            return output, is_error
+            content = result.get("content", [])
+
+            if not content or not isinstance(content, list):
+                return str(result), is_error
+
+            parts = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type", "")
+                if btype == "text" and block.get("text"):
+                    parts.append(block["text"])
+                elif btype == "image":
+                    mime = block.get("mimeType", "image/png")
+                    parts.append(f"[Image: {mime}]")
+
+            return "\n".join(parts) if parts else "(no output)", is_error
         except Exception as e:
             log.error("Tool %s raised: %s", tc.name, e)
             return f"Tool execution error: {e}", True

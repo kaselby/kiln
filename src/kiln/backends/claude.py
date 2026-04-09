@@ -85,6 +85,7 @@ class ClaudeBackend:
             resume=config.resume_conversation_id,
             stderr=config.stderr_callback,
             extra_args=config.extra_args,
+            max_buffer_size=10 * 1024 * 1024,  # 10MB — images as base64 exceed default 1MB
         )
         if config.effort:
             opts["effort"] = config.effort
