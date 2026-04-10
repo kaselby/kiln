@@ -346,8 +346,10 @@ class ClaudeBackend:
             if isinstance(block, TextContent):
                 content_parts.append({"type": "text", "text": block.text})
             elif isinstance(block, DocumentContent):
+                # Claude API uses "image" for image/* types, "document" for PDFs etc.
+                block_type = "image" if block.mime_type.startswith("image/") else "document"
                 content_parts.append({
-                    "type": "document",
+                    "type": block_type,
                     "source": {
                         "type": "base64",
                         "media_type": block.mime_type,

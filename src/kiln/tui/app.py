@@ -18,6 +18,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,12 +46,15 @@ from prompt_toolkit.shortcuts import print_formatted_text
 from prompt_toolkit.styles import Style
 
 from ..types import (
+    ContentBlock,
     ContentBlockDeltaEvent,
     ContentBlockEndEvent,
     ContentBlockStartEvent,
+    DocumentContent,
     ErrorEvent,
     Event,
     SystemMessageEvent,
+    TextContent,
     TextEvent,
     ThinkingEvent,
     ToolCallEvent,
@@ -471,6 +475,48 @@ def _format_tool_result(name: str, content: str | list | None, is_error: bool | 
     return output
 
 
+# ---- Clipboard helpers (macOS) ----
+
+def _clipboard_has_image() -> bool:
+    """Check if the system clipboard contains image data."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", "clipboard info"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return "«class PNGf»" in r.stdout or "«class TIFF»" in r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _save_clipboard_image() -> Path | None:
+    """Save clipboard image to a temp file. Returns path or None on failure."""
+    try:
+        tmp = Path(tempfile.mktemp(suffix=".png", prefix="kiln-clipboard-"))
+        subprocess.run(
+            [
+                "osascript",
+                "-e", "set theImage to the clipboard as «class PNGf»",
+                "-e", f'set theFile to open for access POSIX file "{tmp}" with write permission',
+                "-e", "write theImage to theFile",
+                "-e", "close access theFile",
+            ],
+            capture_output=True, timeout=5, check=True,
+        )
+        return tmp
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def _get_clipboard_text() -> str:
+    """Get text content from system clipboard."""
+    try:
+        r = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=2)
+        return r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
 class KilnApp:
     """Scrollback-mode terminal interface for agent sessions.
 
@@ -540,6 +586,9 @@ class KilnApp:
 
         # Plan cache: (mtime, formatted_progress_string)
         self._plan_cache: tuple[float, str | None] = (0.0, None)
+
+        # Clipboard image paste: queued images sent with the next message
+        self._pending_images: list[Path] = []
 
         # Build the prompt_toolkit Application
         self._input_buffer = Buffer(multiline=True)
@@ -629,7 +678,8 @@ class KilnApp:
         @kb.add("enter", filter=is_idle & ~is_permission_pending)
         def handle_enter(event):
             text = app_ref._input_buffer.text.strip()
-            if not text:
+            has_images = bool(app_ref._pending_images)
+            if not text and not has_images:
                 return
 
             app_ref._input_buffer.reset()
@@ -672,9 +722,19 @@ class KilnApp:
             if app_ref._app:
                 app_ref._app.invalidate()
 
-            _tprint("<user>You:</user> {}", text)
+            # Collect pending images before sending
+            images = list(app_ref._pending_images) if app_ref._pending_images else None
+            app_ref._pending_images.clear()
 
-            app_ref._receive_task = asyncio.ensure_future(app_ref._send_and_receive(text))
+            if images:
+                label = f" [📎 {len(images)} image{'s' if len(images) > 1 else ''}]"
+            else:
+                label = ""
+            _tprint("<user>You:</user> {}{}", text or "(image)", label)
+
+            app_ref._receive_task = asyncio.ensure_future(
+                app_ref._send_and_receive(text, images=images)
+            )
 
         @kb.add("enter", filter=is_receiving & ~is_permission_pending)
         def handle_enter_receiving(event):
@@ -691,6 +751,23 @@ class KilnApp:
         @kb.add(Keys.F20)           # CSI u Shift+Enter (kitty/WezTerm/Ghostty)
         def handle_newline(event):
             event.current_buffer.newline()
+
+        # Smart paste: Ctrl+V checks clipboard for images, falls back to text.
+        @kb.add("c-v")
+        def handle_paste(event):
+            if _clipboard_has_image():
+                path = _save_clipboard_image()
+                if path:
+                    app_ref._pending_images.append(path)
+                    n = len(app_ref._pending_images)
+                    _tprint("<dim>📎 Image attached{}</dim>",
+                            f" ({n})" if n > 1 else "")
+                else:
+                    _tprint("<warning>⚠ Failed to capture clipboard image</warning>")
+            else:
+                text = _get_clipboard_text()
+                if text:
+                    event.current_buffer.insert_text(text)
 
         @kb.add("escape", filter=is_permission_pending)
         def handle_escape_permission(event):
@@ -1287,7 +1364,10 @@ class KilnApp:
 
         _tprint("\n<dim>\u2500\u2500\u2500 Resuming \u2500\u2500\u2500\n</dim>")
 
-    async def _send_and_receive(self, text: str, source: str = "user") -> None:
+    async def _send_and_receive(
+        self, text: str, source: str = "user",
+        images: list[Path] | None = None,
+    ) -> None:
         """Send a message and render the full response."""
         self._stream_chunks = []
         self._thinking_buffer = ""
@@ -1315,7 +1395,18 @@ class KilnApp:
                     stamped = f"[{ts}]\n{text}"
             else:
                 stamped = f"[{ts}]\n{text}"
-            await self._harness.send(stamped)
+
+            if images:
+                blocks: list[ContentBlock] = [TextContent(text=stamped)]
+                for img_path in images:
+                    blocks.append(DocumentContent(
+                        data=img_path.read_bytes(),
+                        mime_type="image/png",
+                        label="clipboard image",
+                    ))
+                await self._harness.send(blocks)
+            else:
+                await self._harness.send(stamped)
 
             async for event in self._harness.receive():
                 if self._interrupt_in_flight:

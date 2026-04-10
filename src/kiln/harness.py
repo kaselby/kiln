@@ -954,7 +954,7 @@ class KilnHarness:
             return None
         return self.config.orientation.rstrip().format(**self._template_vars())
 
-    async def send(self, message: str):
+    async def send(self, message: str | list[ContentBlock]):
         """Send a user message to the agent."""
         if not self._backend:
             raise RuntimeError("Harness not started. Call start() first.")
