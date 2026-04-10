@@ -235,6 +235,7 @@ def read_file(
     file_state: FileState,
     offset: int | None = None,
     limit: int | None = None,
+    pages: str | None = None,
     supplemental: "SupplementalContent | None" = None,
 ) -> dict:
     """Read a file and return formatted MCP result.
@@ -275,7 +276,7 @@ def read_file(
 
     # --- PDFs: stash for supplemental content injection ---
     if ext == "pdf":
-        return _read_pdf(normalized, file_path, file_state, supplemental)
+        return _read_pdf(normalized, file_path, file_state, supplemental, pages)
 
     # --- Text files ---
     return _read_text(normalized, file_path, file_state, offset, limit)
@@ -502,11 +503,55 @@ def _read_notebook(normalized: str, file_path: str, file_state: FileState) -> di
     return {"content": content_blocks}
 
 
+def _parse_page_range(pages: str) -> tuple[int, int | None] | str:
+    """Parse a page range string like '1-5', '3', or '10-'.
+
+    Returns (first, last) with 1-based page numbers, or an error string.
+    last=None means open-ended (to end of document).
+    """
+    trimmed = pages.strip()
+    if not trimmed:
+        return "Empty page range."
+
+    # Open-ended: "3-"
+    if trimmed.endswith("-"):
+        try:
+            first = int(trimmed[:-1])
+        except ValueError:
+            return f'Invalid page range: "{pages}". Use formats like "1-5", "3", or "10-".'
+        if first < 1:
+            return "Page numbers are 1-indexed."
+        return (first, None)
+
+    # Range: "1-5"
+    if "-" in trimmed:
+        parts = trimmed.split("-", 1)
+        try:
+            first, last = int(parts[0]), int(parts[1])
+        except ValueError:
+            return f'Invalid page range: "{pages}". Use formats like "1-5", "3", or "10-".'
+        if first < 1 or last < 1:
+            return "Page numbers are 1-indexed."
+        if last < first:
+            return f"Invalid range: last page ({last}) < first page ({first})."
+        return (first, last)
+
+    # Single page: "3"
+    try:
+        page = int(trimmed)
+    except ValueError:
+        return f'Invalid page range: "{pages}". Use formats like "1-5", "3", or "10-".'
+    if page < 1:
+        return "Page numbers are 1-indexed."
+    return (page, page)
+
+
 def _read_pdf(
     normalized: str,
     file_path: str,
     file_state: FileState,
     supplemental: "SupplementalContent | None",
+    pages: str | None = None,
 ) -> dict:
     """Read a PDF — stash content for supplemental injection, return summary."""
     if supplemental is None:
@@ -532,10 +577,47 @@ def _read_pdf(
             f"PDF too large ({size_mb:.1f} MB). Maximum supported size is 32 MB."
         )
 
-    # Estimate page count from the PDF cross-reference table.
-    # This is a rough heuristic — count /Type /Page occurrences.
-    page_count = data.count(b"/Type /Page") - data.count(b"/Type /Pages")
-    page_count = max(page_count, 0) or None  # None if heuristic fails
+    # If pages requested, extract subset using pypdf.
+    if pages:
+        parsed = _parse_page_range(pages)
+        if isinstance(parsed, str):
+            return _error(parsed)
+        first, last = parsed
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            return _error(
+                "Page-range PDF reading requires pypdf. "
+                "Install it: pip install pypdf"
+            )
+        try:
+            import io
+            reader = PdfReader(io.BytesIO(data))
+            total_pages = len(reader.pages)
+            if first > total_pages:
+                return _error(
+                    f"Page {first} out of range — PDF has {total_pages} pages."
+                )
+            last_idx = min(last, total_pages) if last else total_pages
+            writer = PdfWriter()
+            for i in range(first - 1, last_idx):
+                writer.add_page(reader.pages[i])
+            buf = io.BytesIO()
+            writer.write(buf)
+            data = buf.getvalue()
+            page_count = last_idx - first + 1
+            page_desc = f"pages {first}-{last_idx}" if page_count > 1 else f"page {first}"
+        except Exception as e:
+            return _error(f"Failed to extract pages: {e}")
+
+        file_state.record_read(normalized, partial=True)
+    else:
+        # Estimate page count from the PDF cross-reference table.
+        page_count = data.count(b"/Type /Page") - data.count(b"/Type /Pages")
+        page_count = max(page_count, 0) or None
+        page_desc = None
+
+        file_state.record_read(normalized, partial=False)
 
     supplemental.add_file(
         data=data,
@@ -543,9 +625,13 @@ def _read_pdf(
         label=os.path.basename(file_path),
     )
 
-    file_state.record_read(normalized, partial=False)
-
-    size_str = f"{size_mb:.1f} MB" if size_mb >= 1 else f"{len(data) / 1024:.0f} KB"
+    out_size = len(data) / (1024 * 1024)
+    size_str = f"{out_size:.1f} MB" if out_size >= 1 else f"{len(data) / 1024:.0f} KB"
+    if page_desc:
+        return _ok(
+            f"PDF detected: {file_path} ({page_desc}, {size_str}). "
+            f"Document content will be provided in the next turn for native reading."
+        )
     page_str = f", ~{page_count} pages" if page_count else ""
     return _ok(
         f"PDF detected: {file_path} ({size_str}{page_str}). "
@@ -1029,7 +1115,8 @@ READ_DESC = (
     "- This tool can read Jupyter notebooks (.ipynb) and returns all cells "
     "with their outputs, combining code, text, and visualizations.\n"
     "- This tool can read PDF files (.pdf). PDF content is injected as a "
-    "native document for full reading.\n"
+    "native document for full reading. Use the `pages` parameter to read "
+    "specific pages (e.g., '1-3', '5', '10-') to save context on large PDFs.\n"
     "- Re-reading an unchanged file returns a short stub instead of the "
     "full contents."
 )
@@ -1052,6 +1139,13 @@ READ_SCHEMA = {
             "description": (
                 "The number of lines to read. "
                 "Only provide if the file is too large to read at once."
+            ),
+        },
+        "pages": {
+            "type": "string",
+            "description": (
+                'Page range for PDF files (e.g., "1-5", "3", "10-"). '
+                "Only applicable to PDF files."
             ),
         },
     },
@@ -1359,6 +1453,7 @@ def create_mcp_server(
             file_state,
             offset=args.get("offset"),
             limit=args.get("limit"),
+            pages=args.get("pages"),
             supplemental=supplemental,
         )
 
