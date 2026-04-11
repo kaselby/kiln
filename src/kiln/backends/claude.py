@@ -8,7 +8,9 @@ harness and TUI never see SDK internals.
 import asyncio
 import base64 as _b64
 import logging
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import (
@@ -57,6 +59,7 @@ class ClaudeBackend:
     def __init__(self) -> None:
         self._client: ClaudeSDKClient | None = None
         self._config: BackendConfig | None = None
+        self._prompt_file: Path | None = None  # Temp file for system prompt
         # Accumulated state across stream events within a turn.
         self._block_index: int = 0
         self._pending_usage: dict | None = None
@@ -70,8 +73,26 @@ class ClaudeBackend:
         await self._client.connect()
 
     def _build_sdk_options(self, config: BackendConfig) -> ClaudeAgentOptions:
+        # Write system prompt to a temp file so it doesn't leak via ps aux.
+        # CC's --system-prompt-file reads the file and uses the content
+        # identically to --system-prompt (full override of the default prompt).
+        system_prompt: str | dict | None = None
+        if config.system_prompt:
+            fd, path = tempfile.mkstemp(prefix="kiln-prompt-", suffix=".txt")
+            try:
+                with open(fd, "w", encoding="utf-8") as f:
+                    f.write(config.system_prompt)
+            except Exception:
+                Path(path).unlink(missing_ok=True)
+                raise
+            self._prompt_file = Path(path)
+            system_prompt = {"type": "file", "path": path}
+        elif config.system_prompt is not None:
+            # Explicit empty string — pass through so SDK sends --system-prompt ""
+            system_prompt = config.system_prompt
+
         opts = dict(
-            system_prompt=config.system_prompt,
+            system_prompt=system_prompt,
             tools=config.base_tools,
             allowed_tools=[],
             hooks=config.hooks,
@@ -157,6 +178,9 @@ class ClaudeBackend:
         if self._client:
             await self._client.disconnect()
             self._client = None
+        if self._prompt_file:
+            self._prompt_file.unlink(missing_ok=True)
+            self._prompt_file = None
 
     # ------------------------------------------------------------------
     # SDK message → Kiln Event mapping
