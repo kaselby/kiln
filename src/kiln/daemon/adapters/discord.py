@@ -577,6 +577,154 @@ def _save_json(path: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Permission approval UI — discord.py Views
+# ---------------------------------------------------------------------------
+
+class _PermissionView(discord.ui.View):
+    """Discord view with Approve/Reject/Details buttons for permission approval.
+
+    Trust-gated: only users with ``max_trust == "full"`` in the adapter's
+    user registry can approve or reject.  The *future* resolves with
+    ``(approved: bool, responder_name: str)`` when a trusted user clicks.
+    """
+
+    def __init__(
+        self, future: asyncio.Future, discord_config: DiscordAdapterConfig,
+        detail: str | None = None,
+    ):
+        super().__init__(timeout=None)  # timeout handled by the caller
+        self._future = future
+        self._discord_config = discord_config
+        self._detail = detail
+        if not detail:
+            self.details.disabled = True
+            self.details.style = discord.ButtonStyle.secondary
+
+    def _check_trust(self, user_id: str) -> bool:
+        """Only users with 'full' max_trust can approve permissions."""
+        _name, trust = self._discord_config.resolve_user(str(user_id))
+        return trust == "full"
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, emoji="\u2705")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_trust(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "You don't have permission to approve commands.", ephemeral=True,
+            )
+            return
+        if not self._future.done():
+            self._future.set_result((True, interaction.user.display_name))
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, emoji="\u274c")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_trust(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "You don't have permission to reject commands.", ephemeral=True,
+            )
+            return
+        if not self._future.done():
+            self._future.set_result((False, interaction.user.display_name))
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="Details", style=discord.ButtonStyle.secondary, emoji="\U0001f50d")
+    async def details(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._detail:
+            await interaction.response.send_message("No details available.", ephemeral=True)
+            return
+        if len(self._detail) < 1800:
+            await interaction.response.send_message(
+                f"```\n{self._detail}\n```", ephemeral=True,
+            )
+        else:
+            import io
+            buf = io.BytesIO(self._detail.encode("utf-8"))
+            buf.seek(0)
+            await interaction.response.send_message(
+                file=discord.File(buf, filename="details.txt"), ephemeral=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Security challenge transport — Discord implementation
+# ---------------------------------------------------------------------------
+
+class _DiscordChallengeTransport:
+    """Discord-specific transport for :func:`run_security_challenge`.
+
+    Handles posting/deleting messages in #security, @mentioning full-trust
+    users, and bridging the adapter's message intercept into the transport's
+    ``wait_for_response`` future.
+
+    Constructed by the adapter for each challenge invocation.
+    """
+
+    def __init__(self, adapter: DiscordAdapter, channel: discord.abc.Messageable):
+        self._adapter = adapter
+        self._channel = channel
+        self._message_ids: list[int] = []
+
+    async def post_challenge(self, text: str) -> None:
+        mentions = self._adapter._build_owner_mentions()
+        prefix = f"{mentions}\n" if mentions else ""
+        try:
+            msg = await self._channel.send(f"{prefix}{text}")
+            self._message_ids.append(msg.id)
+        except discord.HTTPException as e:
+            raise RuntimeError(f"Failed to post security challenge: {e}") from e
+
+    async def wait_for_response(self, timeout: float) -> tuple[str, str, str] | None:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[str, str, str]] = loop.create_future()
+        self._adapter._security_challenge_state = {
+            "future": future,
+            "channel_id": str(self._channel.id)
+                          if hasattr(self._channel, "id") else "",
+            "message_ids": self._message_ids,
+        }
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            content, author_id, msg_id = result
+            # Track response message for cleanup
+            try:
+                self._message_ids.append(int(msg_id))
+            except (ValueError, TypeError):
+                pass
+            return (content, author_id, str(msg_id))
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._adapter._security_challenge_state = None
+
+    async def post_message(self, text: str) -> None:
+        try:
+            msg = await self._channel.send(text)
+            self._message_ids.append(msg.id)
+        except discord.HTTPException:
+            pass
+
+    async def delete_message(self, message_id: str) -> None:
+        try:
+            partial = self._channel.get_partial_message(int(message_id))
+            await partial.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException,
+                ValueError, TypeError):
+            pass
+
+    async def cleanup(self) -> None:
+        for mid in self._message_ids:
+            try:
+                partial = self._channel.get_partial_message(mid)
+                await partial.delete()
+            except (discord.NotFound, discord.Forbidden,
+                    discord.HTTPException):
+                pass
+        log.info("Security challenge cleanup: %d message(s)", len(self._message_ids))
+
+
+# ---------------------------------------------------------------------------
 # Discord client — thin extraction layer
 # ---------------------------------------------------------------------------
 
@@ -737,6 +885,14 @@ class DiscordAdapter:
         # Reverse indexes (rebuilt on load/mutation)
         self._thread_to_session: dict[int, str] = {}  # thread_id -> session_id
         self._thread_to_channel: dict[int, str] = {}  # thread_id -> channel_name
+
+        # Security challenge state (D3b) — non-None while a challenge is active
+        # Shape: {future: Future, channel_id: str, message_ids: list[int]}
+        self._security_challenge_state: dict | None = None
+
+        # Pending permission requests (D3b) — keyed by session_id
+        # Shape: {future: Future, message: discord.Message, embed: Embed, externally_resolved: bool}
+        self._pending_permissions: dict[str, dict] = {}
 
         # Status display state (D3c)
         self._status_refresh_task: asyncio.Task | None = None
@@ -1701,6 +1857,14 @@ class DiscordAdapter:
             log.warning("handle_message called before adapter started")
             return None
 
+        # --- Security challenge intercept (before access control) ---
+        # Active challenges consume messages from the security channel
+        # regardless of normal access policy — this is a recovery/auth
+        # flow, not ordinary routed traffic.
+        if self._security_challenge_state is not None:
+            if self._try_security_intercept(msg):
+                return None
+
         # --- Access control ---
         if not self._check_access(msg):
             return None
@@ -1817,6 +1981,39 @@ class DiscordAdapter:
         """Check if a channel ID is the configured control channel."""
         control_id = self._discord_config.channels.get("control")
         return bool(control_id and channel_id == control_id)
+
+    def _try_security_intercept(self, msg: InboundMessage) -> bool:
+        """Check if *msg* is a response to an active security challenge.
+
+        If the message is in the challenge channel and the challenge future
+        is still pending, resolves the future and returns True (consumed).
+        Otherwise returns False to let normal routing proceed.
+        """
+        state = self._security_challenge_state
+        if state is None:
+            return False
+        if msg.channel_id != str(state["channel_id"]):
+            return False
+
+        # Track message for cleanup
+        try:
+            state["message_ids"].append(int(msg.message_id))
+        except (ValueError, TypeError):
+            pass
+
+        future: asyncio.Future = state["future"]
+        if not future.done():
+            future.set_result((msg.content, msg.sender_id, msg.message_id))
+        return True
+
+    def _build_owner_mentions(self) -> str | None:
+        """Build a Discord @mention string for all full-trust users."""
+        mentions = []
+        for uid, entry in self._discord_config.users.items():
+            trust = entry.get("max_trust") or entry.get("trust")
+            if trust == "full":
+                mentions.append(f"<@{uid}>")
+        return " ".join(mentions) if mentions else None
 
     def _build_surface_ref(self, msg: InboundMessage) -> str:
         """Build the canonical surface ref for routing lookups."""
@@ -2472,10 +2669,174 @@ class DiscordAdapter:
             audio_path.unlink(missing_ok=True)
 
     async def _op_security_challenge(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D3")
+        """Run an OTP security challenge via #security channel.
+
+        Delegates core logic to ``run_security_challenge()`` in
+        ``kiln.daemon.security``; this method just resolves the Discord
+        channel and provides the transport.
+        """
+        if not self._client:
+            return {"result": "error", "error": "not connected"}
+
+        channel = await self._resolve_target("#security")
+        if not channel:
+            return {"result": "error", "error": "no #security channel found"}
+
+        from ..security import run_security_challenge
+
+        transport = _DiscordChallengeTransport(self, channel)
+        try:
+            return await run_security_challenge(
+                transport,
+                reason=args.get("reason") or "Unspecified",
+                passwords=args.get("passwords", []),
+                timeout=args.get("timeout", 60),
+                max_attempts=args.get("max_attempts", 2),
+            )
+        except Exception as e:
+            log.exception("Security challenge transport error")
+            return {"result": "error", "error": str(e)}
 
     async def _op_permission_request(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D3")
+        """Show a permission approval prompt in the agent's branch thread.
+
+        Creates an embed with Approve/Reject/Details buttons and waits
+        for a trusted user to respond (or timeout).
+
+        NOTE: Always pings full-trust users. The old gateway skipped pings
+        when the owner was at terminal, but the daemon doesn't have a
+        single-agent presence model. This is an intentional temporary
+        divergence — refine with daemon-level presence awareness later.
+        """
+        if not self._client:
+            return {"error": "not connected"}
+
+        # Resolve target — permission prompts go to the agent's branch thread
+        session_id = ctx.session_id if ctx else args.get("session_id", "")
+        thread_id = self._branch_threads.get(session_id)
+        if not thread_id:
+            return {"error": f"no branch thread for {session_id}"}
+
+        try:
+            thread = self._client.get_channel(thread_id)
+            if not thread:
+                thread = await self._client.fetch_channel(thread_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.error("Failed to get branch thread for %s: %s", session_id, e)
+            return {"error": f"branch thread inaccessible: {e}"}
+
+        title = args.get("title", "Permission Required")
+        preview = args.get("preview", "")
+        detail = args.get("detail")
+        severity = args.get("severity", "info")
+        timeout = args.get("timeout", 300)
+
+        # Severity-based coloring
+        color = 0xE74C3C if severity == "warn" else 0x3498DB  # red or blue
+
+        embed = discord.Embed(
+            title=title,
+            description=preview[:2000],
+            color=color,
+        )
+        embed.set_footer(text=f"Session: {session_id}")
+
+        # Create view with buttons — future resolves on button click
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[bool, str]] = loop.create_future()
+        view = _PermissionView(future, self._discord_config, detail=detail)
+
+        # Always ping full-trust users (intentional divergence — see docstring)
+        mention = self._build_owner_mentions()
+        mention_content = mention or ""
+
+        try:
+            msg = await thread.send(content=mention_content, embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.error("Failed to send permission prompt: %s", e)
+            return {"error": f"failed to send permission prompt: {e}"}
+
+        # Register as pending so resolve can find it
+        pending = {
+            "future": future,
+            "message": msg,
+            "embed": embed,
+            "view": view,
+            "externally_resolved": False,
+        }
+        self._pending_permissions[session_id] = pending
+
+        try:
+            approved, responder = await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            view.stop()
+            if not pending["externally_resolved"]:
+                try:
+                    embed.color = 0x95A5A6  # gray
+                    embed.title = "\u23f0 Permission Timed Out"
+                    await msg.edit(embed=embed, view=None)
+                except discord.HTTPException:
+                    pass
+            return {"approved": False, "timed_out": True, "responder": ""}
+        finally:
+            self._pending_permissions.pop(session_id, None)
+
+        # Update the message only if not already updated by resolve
+        if not pending["externally_resolved"]:
+            try:
+                if approved:
+                    embed.color = 0x2ECC71  # green
+                    embed.title = "\u2705 Approved"
+                else:
+                    embed.color = 0xE74C3C  # red
+                    embed.title = "\u274c Rejected"
+                embed.set_footer(text=f"Session: {session_id} | By: {responder}")
+                await msg.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+        return {"approved": approved, "timed_out": False, "responder": responder}
 
     async def _op_permission_resolve(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D3")
+        """Externally resolve a pending permission request.
+
+        Called when the terminal (or timeout) resolves the approval before
+        Discord.  Updates the Discord embed and unblocks the waiting handler.
+        """
+        session_id = args.get("session_id", "")
+        status = args.get("status", "")
+
+        pending = self._pending_permissions.get(session_id)
+        if not pending:
+            return {"ok": False, "error": f"No pending permission for {session_id}"}
+
+        pending["externally_resolved"] = True
+        future: asyncio.Future = pending["future"]
+        msg = pending["message"]
+        embed = pending["embed"]
+        view: discord.ui.View | None = pending.get("view")
+
+        # Stop the live View so discord.py cleans up the listener
+        if view is not None:
+            view.stop()
+
+        # Update the Discord embed
+        status_display = {
+            "approved": ("\u2705 Approved (terminal)", 0x2ECC71),
+            "rejected": ("\u274c Rejected (terminal)", 0xE74C3C),
+            "timed_out": ("\u23f0 Timed Out", 0x95A5A6),
+        }
+        title, color = status_display.get(status, (f"\u2139\ufe0f {status}", 0x95A5A6))
+        try:
+            embed.title = title
+            embed.color = color
+            await msg.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+
+        # Resolve the future to unblock _op_permission_request
+        if not future.done():
+            approved = status == "approved"
+            future.set_result((approved, "terminal"))
+
+        return {"ok": True}

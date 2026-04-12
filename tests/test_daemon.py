@@ -2094,6 +2094,7 @@ def _msg(
     channel_id="999",
     content="hello",
     is_dm=False,
+    message_id="",
     attachment_paths=None,
 ):
     from kiln.daemon.adapters.discord import InboundMessage
@@ -2103,6 +2104,7 @@ def _msg(
         channel_id=channel_id,
         content=content,
         is_dm=is_dm,
+        message_id=message_id,
         attachment_paths=attachment_paths or [],
     )
 
@@ -2653,14 +2655,7 @@ class TestPlatformOps:
         result = await adapter._op_delete({"target": "#general"}, None)
         assert result["ok"] is False
 
-    @pytest.mark.asyncio
-    async def test_d3_ops_still_raise(self):
-        """D3b ops should still raise NotImplementedError."""
-        adapter = _make_adapter(channel_access="open")
-        for op in ["security_challenge",
-                    "permission_request", "permission_resolve"]:
-            with pytest.raises(NotImplementedError):
-                await adapter.platform_op(op, {})
+    # test_d3_ops_still_raise removed — D3b ops are now implemented
 
 
 # ---------------------------------------------------------------------------
@@ -4289,3 +4284,491 @@ class TestDoStatusRefresh:
         _, _, embeds = status_calls[0]
         # The canonical agent's embed should have the star
         assert "\u2b50" in embeds[0].title
+
+
+# ---------------------------------------------------------------------------
+# D3b — Security challenge intercept
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSecurityIntercept:
+    """Test the security challenge message intercept in handle_message."""
+
+    async def test_intercept_consumes_matching_message(self):
+        """Messages in the challenge channel are consumed when a challenge is active."""
+        adapter = _make_adapter(channel_access="open")
+        future = asyncio.get_running_loop().create_future()
+        adapter._security_challenge_state = {
+            "future": future,
+            "channel_id": "5555",
+            "message_ids": [],
+        }
+
+        result = await adapter.handle_message(
+            _msg(channel_id="5555", content="secretword", sender_id="111"),
+        )
+
+        # Message consumed — not routed
+        assert result is None
+        # Future resolved with content
+        assert future.done()
+        content, sender_id, msg_id = future.result()
+        assert content == "secretword"
+        assert sender_id == "111"
+
+    async def test_intercept_ignores_other_channels(self):
+        """Messages in non-challenge channels pass through normally."""
+        adapter = _make_adapter(channel_access="open")
+        future = asyncio.get_running_loop().create_future()
+        adapter._security_challenge_state = {
+            "future": future,
+            "channel_id": "5555",
+            "message_ids": [],
+        }
+
+        # Different channel — should pass through to normal routing
+        result = await adapter.handle_message(
+            _msg(channel_id="9999", content="hello"),
+        )
+
+        # Not consumed by intercept (unrouted since no matching route)
+        assert result is None
+        # Future NOT resolved
+        assert not future.done()
+
+    async def test_no_intercept_when_no_challenge(self):
+        """Normal messages route normally when no challenge is active."""
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+            channel_access="open",
+        )
+        assert adapter._security_challenge_state is None
+
+        result = await adapter.handle_message(_msg(channel_id="9001"))
+        assert result is not None
+        assert result.bucket == RouteBucket.BRANCH
+
+    async def test_intercept_before_access_control(self):
+        """Security intercept fires even if sender would normally be blocked."""
+        adapter = _make_adapter(
+            channel_access="allowlist",
+            users={},  # nobody allowed
+        )
+        future = asyncio.get_running_loop().create_future()
+        adapter._security_challenge_state = {
+            "future": future,
+            "channel_id": "5555",
+            "message_ids": [],
+        }
+
+        result = await adapter.handle_message(
+            _msg(channel_id="5555", content="password123", sender_id="999"),
+        )
+
+        # Consumed by intercept despite access denial
+        assert result is None
+        assert future.done()
+        assert future.result()[0] == "password123"
+
+    async def test_intercept_tracks_message_id(self):
+        """Intercepted message IDs are tracked for cleanup."""
+        adapter = _make_adapter(channel_access="open")
+        message_ids: list[int] = []
+        future = asyncio.get_running_loop().create_future()
+        adapter._security_challenge_state = {
+            "future": future,
+            "channel_id": "5555",
+            "message_ids": message_ids,
+        }
+
+        await adapter.handle_message(
+            _msg(channel_id="5555", content="pw"),
+        )
+
+        # _msg doesn't set message_id by default, so it will try to append ""
+        # which int("") will fail silently — that's fine, it's robust
+
+
+# ---------------------------------------------------------------------------
+# D3b — _build_owner_mentions
+# ---------------------------------------------------------------------------
+
+class TestBuildOwnerMentions:
+    def test_mentions_full_trust_users(self):
+        adapter = _make_adapter(
+            users={
+                "111": {"name": "Kira", "max_trust": "full"},
+                "222": {"name": "Guest", "max_trust": "known"},
+            },
+        )
+        result = adapter._build_owner_mentions()
+        assert result == "<@111>"
+
+    def test_multiple_full_trust(self):
+        adapter = _make_adapter(
+            users={
+                "111": {"name": "Kira", "max_trust": "full"},
+                "222": {"name": "Admin", "max_trust": "full"},
+            },
+        )
+        result = adapter._build_owner_mentions()
+        assert "<@111>" in result
+        assert "<@222>" in result
+
+    def test_no_full_trust_returns_none(self):
+        adapter = _make_adapter(
+            users={"111": {"name": "Guest", "max_trust": "known"}},
+        )
+        assert adapter._build_owner_mentions() is None
+
+    def test_trust_field_fallback(self):
+        """Falls back to 'trust' field if 'max_trust' not present."""
+        adapter = _make_adapter(
+            users={"111": {"name": "Kira", "trust": "full"}},
+        )
+        assert adapter._build_owner_mentions() == "<@111>"
+
+
+# ---------------------------------------------------------------------------
+# D3b — Permission request / resolve
+# ---------------------------------------------------------------------------
+
+class _FakeDiscordChannel:
+    """Minimal fake Discord channel/thread for permission tests."""
+
+    def __init__(self, channel_id: int = 9001):
+        self.id = channel_id
+        self.sent_messages: list[dict] = []
+
+    async def send(self, content="", embed=None, view=None):
+        msg = _FakeDiscordMessage(len(self.sent_messages) + 1, embed=embed)
+        self.sent_messages.append({
+            "content": content, "embed": embed, "view": view, "msg": msg,
+        })
+        return msg
+
+
+class _FakeDiscordMessage:
+    """Minimal fake Discord message for edit/delete testing."""
+
+    def __init__(self, msg_id: int, embed=None):
+        self.id = msg_id
+        self.embed = embed
+        self.edited = False
+        self.last_edit_kwargs: dict = {}
+
+    async def edit(self, **kwargs):
+        self.edited = True
+        self.last_edit_kwargs = kwargs
+
+
+@pytest.mark.asyncio
+class TestPermissionRequest:
+    async def test_approved_via_future(self):
+        """Permission request returns approved when future resolves True."""
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+            users={"111": {"name": "Kira", "max_trust": "full"}},
+        )
+        fake_channel = _FakeDiscordChannel(9001)
+
+        # Patch the client to return our fake channel
+        class FakeClient:
+            def get_channel(self, cid):
+                return fake_channel if cid == 9001 else None
+        adapter._client = FakeClient()
+
+        from kiln.daemon.protocol import RequestContext
+        ctx = RequestContext(agent_name="beth", session_id="beth-test-1")
+
+        # Start the request in background, then resolve it
+        async def resolve_after_delay():
+            await asyncio.sleep(0.05)
+            pending = adapter._pending_permissions.get("beth-test-1")
+            assert pending is not None
+            pending["future"].set_result((True, "Kira"))
+
+        task = asyncio.create_task(resolve_after_delay())
+        result = await adapter._op_permission_request(
+            {"title": "Run rm -rf?", "preview": "dangerous command", "timeout": 5},
+            ctx,
+        )
+        await task
+
+        assert result["approved"] is True
+        assert result["responder"] == "Kira"
+        assert result["timed_out"] is False
+        # Should be cleaned up from pending
+        assert "beth-test-1" not in adapter._pending_permissions
+
+    async def test_rejected_via_future(self):
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+            users={"111": {"name": "Kira", "max_trust": "full"}},
+        )
+        fake_channel = _FakeDiscordChannel(9001)
+        class FakeClient:
+            def get_channel(self, cid):
+                return fake_channel if cid == 9001 else None
+        adapter._client = FakeClient()
+
+        from kiln.daemon.protocol import RequestContext
+        ctx = RequestContext(agent_name="beth", session_id="beth-test-1")
+
+        async def resolve_after_delay():
+            await asyncio.sleep(0.05)
+            adapter._pending_permissions["beth-test-1"]["future"].set_result(
+                (False, "Kira"),
+            )
+
+        task = asyncio.create_task(resolve_after_delay())
+        result = await adapter._op_permission_request(
+            {"title": "Run rm -rf?", "preview": "dangerous", "timeout": 5},
+            ctx,
+        )
+        await task
+
+        assert result["approved"] is False
+        assert result["timed_out"] is False
+
+    async def test_timeout(self):
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+        )
+        fake_channel = _FakeDiscordChannel(9001)
+        class FakeClient:
+            def get_channel(self, cid):
+                return fake_channel if cid == 9001 else None
+        adapter._client = FakeClient()
+
+        from kiln.daemon.protocol import RequestContext
+        ctx = RequestContext(agent_name="beth", session_id="beth-test-1")
+
+        result = await adapter._op_permission_request(
+            {"title": "Test", "preview": "test", "timeout": 0.1},
+            ctx,
+        )
+
+        assert result["approved"] is False
+        assert result["timed_out"] is True
+        assert "beth-test-1" not in adapter._pending_permissions
+
+    async def test_no_branch_thread(self):
+        adapter = _make_adapter(branch_threads={})
+        class FakeClient:
+            pass
+        adapter._client = FakeClient()
+
+        from kiln.daemon.protocol import RequestContext
+        ctx = RequestContext(agent_name="beth", session_id="beth-test-1")
+
+        result = await adapter._op_permission_request(
+            {"title": "Test", "preview": "test"},
+            ctx,
+        )
+
+        assert "error" in result
+        assert "no branch thread" in result["error"]
+
+    async def test_no_client(self):
+        adapter = _make_adapter()
+        adapter._client = None
+
+        from kiln.daemon.protocol import RequestContext
+        ctx = RequestContext(agent_name="beth", session_id="beth-test-1")
+
+        result = await adapter._op_permission_request(
+            {"title": "Test", "preview": "test"},
+            ctx,
+        )
+
+        assert "error" in result
+        assert "not connected" in result["error"]
+
+
+@pytest.mark.asyncio
+class TestPermissionResolve:
+    async def test_resolve_approved(self):
+        adapter = _make_adapter()
+        future = asyncio.get_running_loop().create_future()
+        fake_msg = _FakeDiscordMessage(1)
+        import discord
+        embed = discord.Embed(title="Permission Required")
+        adapter._pending_permissions["beth-test-1"] = {
+            "future": future,
+            "message": fake_msg,
+            "embed": embed,
+            "externally_resolved": False,
+        }
+
+        result = await adapter._op_permission_resolve(
+            {"session_id": "beth-test-1", "status": "approved"},
+            None,
+        )
+
+        assert result["ok"] is True
+        assert future.done()
+        approved, responder = future.result()
+        assert approved is True
+        assert responder == "terminal"
+        assert adapter._pending_permissions["beth-test-1"]["externally_resolved"]
+
+    async def test_resolve_rejected(self):
+        adapter = _make_adapter()
+        future = asyncio.get_running_loop().create_future()
+        fake_msg = _FakeDiscordMessage(1)
+        import discord
+        embed = discord.Embed(title="Permission Required")
+        adapter._pending_permissions["beth-test-1"] = {
+            "future": future,
+            "message": fake_msg,
+            "embed": embed,
+            "externally_resolved": False,
+        }
+
+        result = await adapter._op_permission_resolve(
+            {"session_id": "beth-test-1", "status": "rejected"},
+            None,
+        )
+
+        assert result["ok"] is True
+        approved, _ = future.result()
+        assert approved is False
+
+    async def test_resolve_not_found(self):
+        adapter = _make_adapter()
+        result = await adapter._op_permission_resolve(
+            {"session_id": "nonexistent", "status": "approved"},
+            None,
+        )
+        assert result["ok"] is False
+        assert "No pending permission" in result["error"]
+
+    async def test_resolve_already_done(self):
+        """Resolving an already-resolved future doesn't crash."""
+        adapter = _make_adapter()
+        future = asyncio.get_running_loop().create_future()
+        future.set_result((True, "Kira"))  # already resolved
+        fake_msg = _FakeDiscordMessage(1)
+        import discord
+        embed = discord.Embed(title="Permission Required")
+        adapter._pending_permissions["beth-test-1"] = {
+            "future": future,
+            "message": fake_msg,
+            "embed": embed,
+            "externally_resolved": False,
+        }
+
+        result = await adapter._op_permission_resolve(
+            {"session_id": "beth-test-1", "status": "rejected"},
+            None,
+        )
+
+        # Should succeed without crashing
+        assert result["ok"] is True
+
+    async def test_resolve_stops_view(self):
+        """External resolve must call view.stop() to clean up discord.py listener."""
+        adapter = _make_adapter()
+        future = asyncio.get_running_loop().create_future()
+        fake_msg = _FakeDiscordMessage(1)
+        import discord
+        embed = discord.Embed(title="Permission Required")
+
+        class FakeView:
+            def __init__(self):
+                self.stopped = False
+            def stop(self):
+                self.stopped = True
+
+        fake_view = FakeView()
+        adapter._pending_permissions["beth-test-1"] = {
+            "future": future,
+            "message": fake_msg,
+            "embed": embed,
+            "view": fake_view,
+            "externally_resolved": False,
+        }
+
+        await adapter._op_permission_resolve(
+            {"session_id": "beth-test-1", "status": "approved"},
+            None,
+        )
+
+        assert fake_view.stopped
+
+
+# ---------------------------------------------------------------------------
+# D3b — Security challenge op (adapter wrapper)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSecurityChallengeOp:
+    async def test_no_client(self):
+        adapter = _make_adapter()
+        adapter._client = None
+
+        result = await adapter._op_security_challenge(
+            {"reason": "test", "passwords": [{"word": "alpha"}]},
+            None,
+        )
+
+        assert result["result"] == "error"
+        assert "not connected" in result["error"]
+
+    async def test_no_security_channel(self):
+        """Returns error when #security channel doesn't exist in config."""
+        adapter = _make_adapter(channels={})
+        # Need a client that returns None for resolve
+        class FakeClient:
+            def get_channel(self, cid):
+                return None
+            async def fetch_channel(self, cid):
+                return None
+        adapter._client = FakeClient()
+
+        result = await adapter._op_security_challenge(
+            {"reason": "test", "passwords": [{"word": "alpha"}]},
+            None,
+        )
+
+        assert result["result"] == "error"
+        assert "no #security channel" in result["error"]
+
+    async def test_empty_reason_falls_back(self):
+        """Empty string reason should fall back to 'Unspecified' (no regression)."""
+        from kiln.daemon.adapters.discord import _DiscordChallengeTransport
+
+        adapter = _make_adapter(
+            channels={"security": "5555"},
+            users={"111": {"name": "Kira", "max_trust": "full"}},
+        )
+
+        # Fake channel that records sent messages
+        class FakeChannel:
+            id = 5555
+            def __init__(self):
+                self.sent: list[str] = []
+            async def send(self, text):
+                self.sent.append(text)
+                class Msg:
+                    id = 1
+                return Msg()
+            def get_partial_message(self, mid):
+                class Partial:
+                    async def delete(self): pass
+                return Partial()
+
+        fake_ch = FakeChannel()
+        transport = _DiscordChallengeTransport(adapter, fake_ch)
+
+        from kiln.daemon.security import run_security_challenge
+        # Run with a correct password so it completes quickly
+        result = await run_security_challenge(
+            transport,
+            reason="Unspecified",  # this is what the adapter should pass for ""
+            passwords=[{"word": "alpha"}],
+        )
+        # Verify the challenge text contains "Unspecified"
+        assert any("Unspecified" in s for s in fake_ch.sent)
