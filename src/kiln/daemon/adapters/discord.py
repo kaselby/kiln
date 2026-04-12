@@ -148,6 +148,7 @@ class InboundMessage:
     channel_id: str             # Discord channel or thread ID
     content: str                # Text content (already transcribed if voice)
     is_dm: bool
+    message_id: str = ""        # Discord message ID (for reply threading)
     attachment_paths: list[str] = field(default_factory=list)
 
 
@@ -341,6 +342,7 @@ class _DiscordClient(discord.Client):
             channel_id=str(message.channel.id),
             content=content,
             is_dm=is_dm,
+            message_id=str(message.id),
             attachment_paths=attachment_paths,
         )
 
@@ -1081,8 +1083,8 @@ class DiscordAdapter:
     ) -> None:
         """Handle a message in the control channel.
 
-        Control commands require full trust. Parsing and execution
-        are wired in Slice D when the Discord client is available.
+        Control commands require full trust. The adapter parses and
+        renders; all execution goes through the daemon management API.
         """
         if trust != "full":
             log.warning(
@@ -1090,8 +1092,230 @@ class DiscordAdapter:
                 sender_name, msg.sender_id,
             )
             return
-        # Stub — control command parsing is Slice D
-        log.debug("Control message from %s: %s", sender_name, msg.content[:100])
+
+        text = msg.content.strip()
+        if not text:
+            return
+
+        parts = text.split()
+        cmd = parts[0].lower()
+
+        try:
+            if cmd == "help":
+                await self._cmd_help(msg)
+            elif cmd == "mode":
+                await self._cmd_mode(msg, parts[1:], sender_name)
+            elif cmd == "spawn":
+                await self._cmd_spawn(msg, text[len("spawn"):].strip(), sender_name)
+            elif cmd == "resume":
+                await self._cmd_resume(msg, parts[1:], sender_name)
+            elif cmd == "kill":
+                await self._cmd_kill(msg, parts[1:], sender_name)
+            elif cmd == "interrupt":
+                await self._cmd_interrupt(msg, parts[1:], sender_name)
+            elif cmd == "show":
+                await self._cmd_show(msg, parts[1:])
+            else:
+                await self._control_respond(
+                    msg, f"Unknown command: `{cmd}`. Try `help`.",
+                )
+        except Exception as e:
+            log.exception("Control command error: %s", text)
+            await self._control_respond(msg, f"Error: {e}")
+
+    # ------------------------------------------------------------------
+    # Control command implementations
+    # ------------------------------------------------------------------
+
+    async def _control_respond(
+        self,
+        msg: InboundMessage,
+        content: str,
+    ) -> None:
+        """Post a response in the control channel.
+
+        Uses reply-threading when message_id is available.
+        """
+        if not self._client:
+            log.warning("_control_respond called without live client")
+            return
+
+        channel = self._client.get_channel(int(msg.channel_id))
+        if not channel:
+            try:
+                channel = await self._client.fetch_channel(int(msg.channel_id))
+            except discord.NotFound:
+                log.warning("Control channel %s not found", msg.channel_id)
+                return
+
+        # Reply-thread to the original message when possible
+        reference = None
+        if msg.message_id:
+            reference = discord.MessageReference(
+                message_id=int(msg.message_id),
+                channel_id=int(msg.channel_id),
+            )
+
+        chunks = split_message(content)
+        for i, chunk in enumerate(chunks):
+            await channel.send(
+                chunk,
+                reference=reference if i == 0 else None,
+            )
+
+    async def _cmd_help(self, msg: InboundMessage) -> None:
+        await self._control_respond(
+            msg,
+            "**Commands:**\n"
+            "`spawn <agent> [instructions]` — launch a new session\n"
+            "`kill <session-id>` — kill a session (immediate)\n"
+            "`interrupt <session-id>` — send ESC to unstick a session\n"
+            "`resume <session-id>` — resume a previous session\n"
+            "`show <session-id>` — capture current terminal pane\n"
+            "`mode <session-id> <mode>` — change permission mode "
+            "(safe, supervised, yolo)\n"
+            "`help` — this message",
+        )
+
+    async def _cmd_mode(
+        self, msg: InboundMessage, args: list[str], sender_name: str,
+    ) -> None:
+        if len(args) != 2:
+            await self._control_respond(msg, "Usage: `mode <session-id> <mode>`")
+            return
+
+        session_id, mode_str = args[0], args[1].lower()
+
+        if mode_str == "trusted":
+            await self._control_respond(msg, "Trusted mode is TUI-only.")
+            return
+
+        result = await self._daemon.management.set_session_mode(
+            session_id, mode_str, requested_by=sender_name,
+        )
+        icon = "\u2705" if result.success else "\u274c"
+        await self._control_respond(msg, f"{icon} {result.message}")
+
+    async def _cmd_spawn(
+        self, msg: InboundMessage, instructions: str, sender_name: str,
+    ) -> None:
+        # Parse: spawn <agent> [instructions]
+        parts = instructions.split(None, 1)
+        if not parts:
+            await self._control_respond(msg, "Usage: `spawn <agent> [instructions]`")
+            return
+
+        agent = parts[0].lower()
+        prompt = parts[1] if len(parts) > 1 else None
+
+        # Validate agent name against known agents
+        known_agents = self._get_known_agents()
+        if agent not in known_agents:
+            names = ", ".join(sorted(known_agents)) if known_agents else "(none)"
+            await self._control_respond(
+                msg, f"Unknown agent: `{agent}`. Known agents: {names}",
+            )
+            return
+
+        result = await self._daemon.management.spawn_session(
+            agent, prompt=prompt, requested_by=sender_name,
+        )
+        icon = "\u2705" if result.success else "\u274c"
+        await self._control_respond(msg, f"{icon} {result.message}")
+
+    async def _cmd_resume(
+        self, msg: InboundMessage, args: list[str], sender_name: str,
+    ) -> None:
+        if not args:
+            await self._control_respond(msg, "Usage: `resume <session-id>`")
+            return
+
+        session_id = args[0]
+
+        # Extract agent name from session ID prefix
+        agent = session_id.split("-")[0] if "-" in session_id else ""
+        if not agent:
+            await self._control_respond(
+                msg, f"Cannot determine agent from session ID: `{session_id}`",
+            )
+            return
+
+        result = await self._daemon.management.resume_session(
+            agent, session_id, requested_by=sender_name,
+        )
+        icon = "\u2705" if result.success else "\u274c"
+        await self._control_respond(msg, f"{icon} {result.message}")
+
+    async def _cmd_kill(
+        self, msg: InboundMessage, args: list[str], sender_name: str,
+    ) -> None:
+        if not args:
+            await self._control_respond(msg, "Usage: `kill <session-id>`")
+            return
+
+        result = await self._daemon.management.stop_session(
+            args[0], requested_by=sender_name,
+        )
+        icon = "\u2705" if result.success else "\u274c"
+        await self._control_respond(msg, f"{icon} {result.message}")
+
+    async def _cmd_interrupt(
+        self, msg: InboundMessage, args: list[str], sender_name: str,
+    ) -> None:
+        if not args:
+            await self._control_respond(msg, "Usage: `interrupt <session-id>`")
+            return
+
+        result = await self._daemon.management.interrupt_session(
+            args[0], requested_by=sender_name,
+        )
+        icon = "\u2705" if result.success else "\u274c"
+        await self._control_respond(msg, f"{icon} {result.message}")
+
+    async def _cmd_show(
+        self, msg: InboundMessage, args: list[str],
+    ) -> None:
+        if not args:
+            await self._control_respond(msg, "Usage: `show <session-id>`")
+            return
+
+        session_id = args[0]
+        result = await self._daemon.management.capture_session(session_id)
+        if not result.success:
+            await self._control_respond(msg, f"\u274c {result.message}")
+            return
+
+        # Read mode from session config for header
+        mode = "unknown"
+        config_path = self._daemon.management._session_config_path(session_id)
+        if config_path and config_path.exists():
+            try:
+                import yaml
+                data = yaml.safe_load(config_path.read_text()) or {}
+                mode = data.get("mode", "unknown")
+            except Exception:
+                pass
+
+        header = f"**{session_id}** | mode: `{mode}`\n"
+        content = result.message
+
+        # Trim to fit Discord's message limit
+        max_content = DISCORD_MAX_LENGTH - len(header) - len("```\n\n```")
+        if len(content) > max_content:
+            content = content[-max_content:]
+            newline_pos = content.find("\n")
+            if newline_pos != -1:
+                content = content[newline_pos + 1:]
+
+        await self._control_respond(
+            msg, f"{header}```\n{content}\n```" if content else f"{header}*(empty pane)*",
+        )
+
+    def _get_known_agents(self) -> set[str]:
+        """Return the set of known agent names from the daemon's registry."""
+        from ..config import load_agents_registry
+        registry = load_agents_registry(self._daemon.config.agents_registry)
+        return set(registry.keys())
 
     # ------------------------------------------------------------------
     # State persistence helper

@@ -1977,12 +1977,61 @@ class TestDiscordValidateSurfaceRef:
 # C3 — Inbound classification and routing
 # ---------------------------------------------------------------------------
 
+class _MockManagement:
+    """Mock management layer that records calls and returns configurable results."""
+
+    def __init__(self):
+        from kiln.daemon.management import ActionResult
+        self._default_result = ActionResult(True, "ok")
+        self._results: dict[str, ActionResult] = {}
+        self.calls: list[tuple[str, dict]] = []
+
+    def set_result(self, action: str, result):
+        from kiln.daemon.management import ActionResult
+        if isinstance(result, tuple):
+            result = ActionResult(*result)
+        self._results[action] = result
+
+    def _record(self, action: str, **kwargs):
+        self.calls.append((action, kwargs))
+        return self._results.get(action, self._default_result)
+
+    async def set_session_mode(self, session_id, mode, requested_by=None):
+        return self._record("set_session_mode",
+                            session_id=session_id, mode=mode, requested_by=requested_by)
+
+    async def spawn_session(self, agent, prompt=None, mode=None, requested_by=None):
+        return self._record("spawn_session",
+                            agent=agent, prompt=prompt, mode=mode, requested_by=requested_by)
+
+    async def resume_session(self, agent, session_id, requested_by=None):
+        return self._record("resume_session",
+                            agent=agent, session_id=session_id, requested_by=requested_by)
+
+    async def stop_session(self, session_id, requested_by=None):
+        return self._record("stop_session",
+                            session_id=session_id, requested_by=requested_by)
+
+    async def interrupt_session(self, session_id, requested_by=None):
+        return self._record("interrupt_session",
+                            session_id=session_id, requested_by=requested_by)
+
+    async def capture_session(self, session_id, lines=50):
+        return self._record("capture_session",
+                            session_id=session_id, lines=lines)
+
+    def _session_config_path(self, session_id):
+        return None
+
+
 class _MockDaemon:
     """Minimal daemon mock for adapter routing tests."""
 
     def __init__(self):
         from kiln.daemon.state import DaemonState
         self.state = DaemonState()
+        self.config = DaemonConfig(agents_registry=Path("/fake/agents.yml"))
+        self.management = _MockManagement()
         self.delivered: list[tuple[str, proto.PlatformMessage]] = []
         self.published: list[dict] = []
         self.surface_delivered: list[tuple[str, proto.PlatformMessage]] = []
@@ -2857,6 +2906,7 @@ def _mock_discord_message(
         })()
 
     msg = type("MockMessage", (), {
+        "id": channel_id * 1000 + author_id,  # deterministic fake snowflake
         "author": author,
         "channel": channel,
         "content": content,
@@ -2864,3 +2914,435 @@ def _mock_discord_message(
         "flags": type("Flags", (), {"voice": False})(),
     })()
     return msg
+
+
+def _control_msg(content: str, **kwargs) -> "InboundMessage":
+    """Build an InboundMessage suitable for control command tests."""
+    from kiln.daemon.adapters.discord import InboundMessage
+    defaults = dict(
+        sender_id="111",
+        sender_display_name="Kira",
+        channel_id="7777",
+        content=content,
+        is_dm=False,
+        message_id="99999",
+    )
+    defaults.update(kwargs)
+    return InboundMessage(**defaults)
+
+
+def _make_control_adapter(**kwargs):
+    """Build an adapter wired for control command tests.
+
+    Returns (adapter, mock_management) for easy assertion access.
+    """
+    adapter = _make_adapter(channels={"control": "7777"}, **kwargs)
+    return adapter, adapter._daemon.management
+
+
+# ---------------------------------------------------------------------------
+# Slice D3a: Control commands
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestControlCommands:
+    """Tests for the control command parser and individual command handlers."""
+
+    # --- Parser / dispatch ---
+
+    async def test_unknown_command(self):
+        adapter, mgmt = _make_control_adapter()
+        # Patch _control_respond to capture output
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("frobnicate"), "Kira", "full",
+        )
+        assert len(responses) == 1
+        assert "Unknown command" in responses[0]
+        assert "frobnicate" in responses[0]
+
+    async def test_empty_message_ignored(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("   "), "Kira", "full",
+        )
+        assert len(responses) == 0
+
+    async def test_trust_denial(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("help"), "Stranger", "known",
+        )
+        # Should be silently denied — no response, no management call
+        assert len(responses) == 0
+        assert len(mgmt.calls) == 0
+
+    async def test_command_error_caught(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        # Make management raise
+        async def explode(*a, **kw):
+            raise RuntimeError("boom")
+        mgmt.stop_session = explode
+
+        await adapter._handle_control_message(
+            _control_msg("kill beth-test-1"), "Kira", "full",
+        )
+        assert len(responses) == 1
+        assert "boom" in responses[0]
+
+    # --- help ---
+
+    async def test_help(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("help"), "Kira", "full",
+        )
+        assert len(responses) == 1
+        text = responses[0]
+        for cmd in ("spawn", "kill", "interrupt", "resume", "show", "mode", "help"):
+            assert cmd in text
+
+    # --- mode ---
+
+    async def test_mode_success(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("set_session_mode", ActionResult(True, "beth-test: safe -> yolo"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("mode beth-test yolo"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0] == ("set_session_mode", {
+            "session_id": "beth-test", "mode": "yolo", "requested_by": "Kira",
+        })
+        assert "\u2705" in responses[0]
+
+    async def test_mode_failure(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("set_session_mode", ActionResult(False, "Invalid mode"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("mode beth-test badmode"), "Kira", "full",
+        )
+        assert "\u274c" in responses[0]
+
+    async def test_mode_missing_args(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("mode beth-test"), "Kira", "full",
+        )
+        assert "Usage" in responses[0]
+        assert len(mgmt.calls) == 0
+
+    async def test_mode_trusted_rejected(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("mode beth-test trusted"), "Kira", "full",
+        )
+        assert "TUI-only" in responses[0]
+        assert len(mgmt.calls) == 0
+
+    # --- spawn ---
+
+    async def test_spawn_success(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("spawn_session", ActionResult(True, "Session launched"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        # Mock agent registry
+        adapter._get_known_agents = lambda: {"beth", "dalet"}
+        await adapter._handle_control_message(
+            _control_msg("spawn beth do some research"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0] == ("spawn_session", {
+            "agent": "beth", "prompt": "do some research",
+            "mode": None, "requested_by": "Kira",
+        })
+        assert "\u2705" in responses[0]
+
+    async def test_spawn_no_instructions(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        adapter._get_known_agents = lambda: {"beth"}
+        await adapter._handle_control_message(
+            _control_msg("spawn beth"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0][1]["agent"] == "beth"
+        assert mgmt.calls[0][1]["prompt"] is None
+
+    async def test_spawn_unknown_agent(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        adapter._get_known_agents = lambda: {"beth", "dalet"}
+        await adapter._handle_control_message(
+            _control_msg("spawn hackerman"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 0
+        assert "Unknown agent" in responses[0]
+        assert "hackerman" in responses[0]
+        assert "beth" in responses[0]  # lists known agents
+
+    async def test_spawn_missing_agent(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("spawn"), "Kira", "full",
+        )
+        assert "Usage" in responses[0]
+        assert len(mgmt.calls) == 0
+
+    async def test_spawn_case_insensitive_agent(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        adapter._get_known_agents = lambda: {"beth"}
+        await adapter._handle_control_message(
+            _control_msg("spawn Beth"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0][1]["agent"] == "beth"
+
+    # --- resume ---
+
+    async def test_resume_success(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("resume_session", ActionResult(True, "Resumed beth-old-fox"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("resume beth-old-fox"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0] == ("resume_session", {
+            "agent": "beth", "session_id": "beth-old-fox", "requested_by": "Kira",
+        })
+        assert "\u2705" in responses[0]
+
+    async def test_resume_extracts_agent_from_id(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("resume dalet-quiet-drake"), "Kira", "full",
+        )
+        assert mgmt.calls[0][1]["agent"] == "dalet"
+        assert mgmt.calls[0][1]["session_id"] == "dalet-quiet-drake"
+
+    async def test_resume_missing_args(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("resume"), "Kira", "full",
+        )
+        assert "Usage" in responses[0]
+        assert len(mgmt.calls) == 0
+
+    async def test_resume_no_hyphen_in_id(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("resume badid"), "Kira", "full",
+        )
+        assert "Cannot determine agent" in responses[0]
+        assert len(mgmt.calls) == 0
+
+    # --- kill ---
+
+    async def test_kill_success(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("stop_session", ActionResult(True, "Killed beth-test"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("kill beth-test"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0] == ("stop_session", {
+            "session_id": "beth-test", "requested_by": "Kira",
+        })
+        assert "\u2705" in responses[0]
+
+    async def test_kill_failure(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("stop_session", ActionResult(False, "tmux session not found"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("kill beth-ghost"), "Kira", "full",
+        )
+        assert "\u274c" in responses[0]
+
+    async def test_kill_missing_args(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("kill"), "Kira", "full",
+        )
+        assert "Usage" in responses[0]
+
+    # --- interrupt ---
+
+    async def test_interrupt_success(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("interrupt_session", ActionResult(True, "Sent ESC to beth-test"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("interrupt beth-test"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0] == ("interrupt_session", {
+            "session_id": "beth-test", "requested_by": "Kira",
+        })
+
+    async def test_interrupt_missing_args(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("interrupt"), "Kira", "full",
+        )
+        assert "Usage" in responses[0]
+
+    # --- show ---
+
+    async def test_show_success(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("capture_session", ActionResult(
+            True, "$ echo hello\nhello",
+        ))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("show beth-test"), "Kira", "full",
+        )
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0][1]["session_id"] == "beth-test"
+        assert "```" in responses[0]
+        assert "beth-test" in responses[0]
+
+    async def test_show_empty_pane(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("capture_session", ActionResult(True, ""))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("show beth-test"), "Kira", "full",
+        )
+        assert "empty pane" in responses[0]
+
+    async def test_show_failure(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        mgmt.set_result("capture_session", ActionResult(False, "tmux not found"))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("show beth-test"), "Kira", "full",
+        )
+        assert "\u274c" in responses[0]
+
+    async def test_show_missing_args(self):
+        adapter, mgmt = _make_control_adapter()
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("show"), "Kira", "full",
+        )
+        assert "Usage" in responses[0]
+
+    async def test_show_truncates_long_output(self):
+        adapter, mgmt = _make_control_adapter()
+        from kiln.daemon.management import ActionResult
+        # Generate output that exceeds Discord limit
+        long_content = "x" * 3000
+        mgmt.set_result("capture_session", ActionResult(True, long_content))
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        await adapter._handle_control_message(
+            _control_msg("show beth-test"), "Kira", "full",
+        )
+        assert len(responses[0]) <= 2000
+
+    # --- Integration: control via handle_message ---
+
+    async def test_control_routed_through_handle_message(self):
+        """Control messages via handle_message should hit the command parser."""
+        adapter, mgmt = _make_control_adapter(
+            users={"111": {"name": "Kira", "max_trust": "full"}},
+            channel_access="open",
+        )
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+        adapter._get_known_agents = lambda: {"beth"}
+
+        result = await adapter.handle_message(_msg(
+            sender_id="111", channel_id="7777", content="spawn beth test",
+        ))
+        # Control messages return None (consumed)
+        assert result is None
+        assert len(mgmt.calls) == 1
+        assert mgmt.calls[0][0] == "spawn_session"
+
+    async def test_control_denied_non_full_trust(self):
+        """Non-full-trust users in control channel should be silently denied."""
+        adapter, mgmt = _make_control_adapter(
+            users={"222": {"name": "Stranger", "max_trust": "known"}},
+            channel_access="open",
+        )
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+
+        await adapter.handle_message(_msg(
+            sender_id="222", channel_id="7777", content="kill beth-test",
+        ))
+        assert len(responses) == 0
+        assert len(mgmt.calls) == 0
+
+
+async def _capture(responses: list, text: str):
+    """Async-compatible response capture for patched _control_respond."""
+    responses.append(text)
