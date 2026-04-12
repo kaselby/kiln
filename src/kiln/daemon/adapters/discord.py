@@ -11,13 +11,18 @@ durable delivery, routing, and coordination semantics.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+import discord
 
 from .. import protocol as proto
 from ..protocol import PlatformMessage, RequestContext
@@ -27,6 +32,33 @@ log = logging.getLogger(__name__)
 # Discord message length limit
 DISCORD_MAX_LENGTH = 2000
 SPLIT_MARGIN = 100  # room for (1/N) prefix
+
+
+# ---------------------------------------------------------------------------
+# Filename sanitization
+# ---------------------------------------------------------------------------
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize an external filename to a safe local basename.
+
+    Strips path separators, replaces dangerous characters, and truncates
+    to a reasonable length. Returns 'attachment' if nothing usable remains.
+    """
+    # Strip any path components — only keep the basename
+    name = os.path.basename(name)
+    # Replace path-traversal and shell-dangerous characters
+    name = re.sub(r'[/\\<>:"|?*\x00-\x1f]', '_', name)
+    # Collapse runs of underscores/dots
+    name = re.sub(r'[_.]{2,}', '_', name)
+    name = name.strip('._ ')
+    # Truncate to 200 chars (preserving extension)
+    if len(name) > 200:
+        base, _, ext = name.rpartition('.')
+        if ext and len(ext) <= 10:
+            name = base[:200 - len(ext) - 1] + '.' + ext
+        else:
+            name = name[:200]
+    return name or "attachment"
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +293,91 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
+# ---------------------------------------------------------------------------
+# Discord client — thin extraction layer
+# ---------------------------------------------------------------------------
+
+class _DiscordClient(discord.Client):
+    """Thin discord.py client owned by the adapter.
+
+    Responsibilities are strictly limited to:
+    - Discord event extraction (on_message → InboundMessage)
+    - Readiness signaling (on_ready → ready event)
+    - Attachment download to local temp files
+
+    The client does NOT own routing, state, thread maps, or access policy.
+    Those belong to the adapter.
+    """
+
+    def __init__(self, adapter: DiscordAdapter, ready_event: asyncio.Event):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self._adapter = adapter
+        self._ready_event = ready_event
+
+    async def on_ready(self) -> None:
+        log.info("Discord client ready as %s (id: %s)", self.user, self.user.id)
+        self._ready_event.set()
+
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author == self.user:
+            return
+
+        content = message.content or ""
+        is_dm = isinstance(message.channel, discord.DMChannel)
+
+        if not content.strip() and not message.attachments:
+            return
+
+        # Download attachments
+        attachment_paths: list[str] = []
+        if message.attachments:
+            attachment_paths = await self._download_attachments(message.attachments)
+
+        inbound = InboundMessage(
+            sender_id=str(message.author.id),
+            sender_display_name=message.author.display_name,
+            channel_id=str(message.channel.id),
+            content=content,
+            is_dm=is_dm,
+            attachment_paths=attachment_paths,
+        )
+
+        try:
+            await self._adapter.handle_message(inbound)
+        except RoutingError:
+            # Routing invariant violation — this is a structural bug,
+            # not a transient failure. Let it propagate loudly.
+            log.error(
+                "Routing invariant violation for message from %s in %s",
+                message.author, message.channel,
+            )
+            raise
+        except Exception:
+            log.exception(
+                "Unexpected error handling message from %s in %s",
+                message.author, message.channel,
+            )
+
+    async def _download_attachments(
+        self, attachments: list[discord.Attachment],
+    ) -> list[str]:
+        download_dir = self._adapter._get_attachment_dir()
+        paths: list[str] = []
+        for att in attachments:
+            # Sanitize filename: strip path components, replace unsafe chars
+            safe_name = _sanitize_filename(att.filename)
+            dest = download_dir / f"{uuid.uuid4().hex[:8]}-{safe_name}"
+            try:
+                await att.save(dest)
+                paths.append(str(dest))
+                log.info("Downloaded attachment: %s (%d bytes)", dest.name, att.size)
+            except Exception:
+                log.exception("Failed to download attachment %s", att.filename)
+        return paths
+
+
 class DiscordAdapter:
     """Discord adapter for the Kiln daemon.
 
@@ -275,6 +392,11 @@ class DiscordAdapter:
         self._daemon: Any = None  # KilnDaemon, set on start()
         self._state_dir: Path | None = None
         self._event_handler = self._handle_event  # stable reference for add/remove
+
+        # Live Discord client (created on start, None until then)
+        self._client: _DiscordClient | None = None
+        self._client_task: asyncio.Task | None = None
+        self._ready_event: asyncio.Event | None = None
 
         # Adapter-local branch/channel thread mappings
         self._branch_threads: dict[str, int] = {}  # session_id -> discord thread_id
@@ -298,7 +420,12 @@ class DiscordAdapter:
         return "discord"
 
     async def start(self, daemon: Any) -> None:
-        """Start the adapter. Called by the daemon after server is running."""
+        """Start the adapter. Called by the daemon after server is running.
+
+        Creates and connects the Discord client, waiting for on_ready
+        before returning. Raises on login failure or timeout so the daemon
+        surfaces the error honestly instead of silently running a dead client.
+        """
         self._daemon = daemon
         self._state_dir = daemon.config.state_dir / "discord"
         self._state_dir.mkdir(parents=True, exist_ok=True)
@@ -314,13 +441,98 @@ class DiscordAdapter:
         }
         self._rebuild_reverse_indexes()
 
-        # Subscribe to daemon events
+        # Resolve bot token and start Discord client (before registering
+        # event handler — if client startup fails, we don't want a half-started
+        # adapter wired into daemon events)
+        token = self._resolve_token()
+        if token:
+            try:
+                await self._start_client(token)
+            except Exception:
+                self._daemon = None
+                raise
+
+        # Subscribe to daemon events only after successful startup
         daemon.events.add_handler(self._event_handler)
 
         log.info("Discord adapter started (state: %s)", self._state_dir)
 
+    async def _start_client(self, token: str, timeout: float = 30.0) -> None:
+        """Create, connect, and wait for the Discord client to be ready."""
+        self._ready_event = asyncio.Event()
+        self._client = _DiscordClient(self, self._ready_event)
+
+        # Launch client.start() as a background task
+        self._client_task = asyncio.create_task(
+            self._client.start(token), name="discord-client",
+        )
+
+        # Wait for on_ready or failure — whichever comes first
+        ready_waiter = asyncio.create_task(self._ready_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                [self._client_task, ready_waiter],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except Exception:
+            ready_waiter.cancel()
+            await self._cleanup_client()
+            raise
+        finally:
+            # Always clean up the ready waiter if it's still pending
+            if not ready_waiter.done():
+                ready_waiter.cancel()
+
+        # If client_task finished first, it crashed during login
+        if self._client_task.done():
+            exc = self._client_task.exception()
+            await self._cleanup_client()
+            if exc:
+                raise RuntimeError(f"Discord client failed to connect: {exc}") from exc
+            raise RuntimeError("Discord client exited unexpectedly during startup")
+
+        # If neither finished, we timed out
+        if not self._ready_event.is_set():
+            await self._cleanup_client()
+            raise RuntimeError(
+                f"Discord client did not become ready within {timeout}s"
+            )
+
+        log.info("Discord client connected and ready")
+
+    def _resolve_token(self) -> str | None:
+        """Resolve bot token from config.
+
+        Checks token_file first (path to a file containing the token),
+        then falls back to an inline token value. Returns None if
+        no token is configured (adapter runs without a live client).
+        """
+        # Primary: read from file
+        token_file = self._raw_config.get("token_file")
+        if token_file:
+            path = Path(token_file).expanduser()
+            if path.exists():
+                token = path.read_text().strip()
+                if token:
+                    return token
+                log.warning("Token file %s is empty", path)
+            else:
+                log.warning("Token file %s does not exist", path)
+
+        # Fallback: inline token (for tests/dev)
+        token = self._raw_config.get("token")
+        if token:
+            return token
+
+        log.info("No Discord bot token configured — running without live client")
+        return None
+
     async def stop(self) -> None:
         """Stop the adapter and clean up."""
+        # Stop Discord client
+        await self._cleanup_client()
+
         if self._daemon:
             self._daemon.events.remove_handler(self._event_handler)
 
@@ -331,6 +543,20 @@ class DiscordAdapter:
 
         self._daemon = None
         log.info("Discord adapter stopped")
+
+    async def _cleanup_client(self) -> None:
+        """Close the Discord client and cancel its task."""
+        if self._client and not self._client.is_closed():
+            await self._client.close()
+        if self._client_task and not self._client_task.done():
+            self._client_task.cancel()
+            try:
+                await self._client_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._client = None
+        self._client_task = None
+        self._ready_event = None
 
     async def send_user_message(
         self,
@@ -840,23 +1066,31 @@ class DiscordAdapter:
             _save_json(self._state_dir / "channel-threads.json", self._channel_threads)
 
     # ------------------------------------------------------------------
-    # Discord API stubs — thin async boundary for actual Discord calls
+    # Discord API methods — thin async boundary for actual Discord calls
     #
     # These are the only methods that need a live discord.py client.
     # Everything above is logic/routing that can be tested without one.
-    # Wired to the real Discord client in a later slice.
     # ------------------------------------------------------------------
 
-    async def _discord_post_to_surface(self, surface_id: str, content: str) -> None:
-        """Post a message to a Discord surface (channel or thread).
+    def _get_attachment_dir(self) -> Path:
+        """Return (and create) the directory for downloaded attachments."""
+        if self._state_dir:
+            d = self._state_dir / "attachments"
+        else:
+            d = Path("/tmp/kiln-discord-attachments")
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
-        Args:
-            surface_id: Discord channel/thread ID as string.
-            content: Pre-formatted message text (already split if needed).
-        """
-        # Wired to discord.py client in Slice D
-        log.debug("_discord_post_to_surface(%s, %d chars) — not yet wired",
-                   surface_id, len(content))
+    async def _discord_post_to_surface(self, surface_id: str, content: str) -> None:
+        """Post a message to a Discord surface (channel or thread)."""
+        if not self._client:
+            log.warning("_discord_post_to_surface called without live client")
+            return
+        channel = self._client.get_channel(int(surface_id))
+        if not channel:
+            log.warning("Discord channel %s not found in cache", surface_id)
+            return
+        await channel.send(content)
 
     async def _discord_create_thread(
         self, channel_id: str, name: str, initial_message: str = "",
@@ -865,14 +1099,31 @@ class DiscordAdapter:
 
         Returns the thread ID, or None if creation failed.
         """
-        # Wired to discord.py client in Slice D
-        log.debug("_discord_create_thread(%s, %s) — not yet wired", channel_id, name)
-        return None
+        if not self._client:
+            log.warning("_discord_create_thread called without live client")
+            return None
+        channel = self._client.get_channel(int(channel_id))
+        if not channel:
+            log.warning("Discord channel %s not found in cache", channel_id)
+            return None
+        thread = await channel.create_thread(
+            name=name,
+            type=discord.ChannelType.public_thread,
+        )
+        if initial_message:
+            await thread.send(initial_message)
+        return thread.id
 
     async def _discord_archive_thread(self, thread_id: int) -> None:
         """Archive a Discord thread."""
-        # Wired to discord.py client in Slice D
-        log.debug("_discord_archive_thread(%d) — not yet wired", thread_id)
+        if not self._client:
+            log.warning("_discord_archive_thread called without live client")
+            return
+        thread = self._client.get_channel(thread_id)
+        if not thread:
+            log.warning("Discord thread %d not found in cache", thread_id)
+            return
+        await thread.edit(archived=True)
 
     # ------------------------------------------------------------------
     # Platform op stubs (Slice B-D)

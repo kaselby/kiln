@@ -2301,3 +2301,385 @@ class TestHandleMessage:
         )
         await adapter.handle_message(_msg(channel_id="8001", sender_id="111"))
         assert adapter._daemon.published[0]["sender"] == "Kira"
+
+
+# ---------------------------------------------------------------------------
+# Slice D1: Token resolution
+# ---------------------------------------------------------------------------
+
+class TestTokenResolution:
+    """Tests for _resolve_token — token_file primary, inline fallback."""
+
+    def test_token_from_file(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        token_file = tmp_path / "bot-token"
+        token_file.write_text("my-secret-token\n")
+
+        adapter = DiscordAdapter({"token_file": str(token_file)})
+        assert adapter._resolve_token() == "my-secret-token"
+
+    def test_token_inline_fallback(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        adapter = DiscordAdapter({"token": "inline-token"})
+        assert adapter._resolve_token() == "inline-token"
+
+    def test_token_file_takes_precedence(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        token_file = tmp_path / "bot-token"
+        token_file.write_text("file-token\n")
+
+        adapter = DiscordAdapter({
+            "token_file": str(token_file),
+            "token": "inline-token",
+        })
+        assert adapter._resolve_token() == "file-token"
+
+    def test_no_token_returns_none(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        adapter = DiscordAdapter({})
+        assert adapter._resolve_token() is None
+
+    def test_empty_token_file_falls_back_to_inline(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        token_file = tmp_path / "bot-token"
+        token_file.write_text("")
+
+        adapter = DiscordAdapter({
+            "token_file": str(token_file),
+            "token": "inline-token",
+        })
+        assert adapter._resolve_token() == "inline-token"
+
+    def test_missing_token_file_falls_back_to_inline(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        adapter = DiscordAdapter({
+            "token_file": "/nonexistent/path/token",
+            "token": "inline-token",
+        })
+        assert adapter._resolve_token() == "inline-token"
+
+
+# ---------------------------------------------------------------------------
+# Slice D1: Discord API method safety
+# ---------------------------------------------------------------------------
+
+class TestDiscordAPIMethods:
+    """Tests for Discord API methods without a live client."""
+
+    @pytest.mark.asyncio
+    async def test_post_to_surface_without_client(self):
+        """API methods should not crash when no client is connected."""
+        adapter = _make_adapter(channel_access="open")
+        # Should log a warning, not raise
+        await adapter._discord_post_to_surface("12345", "test message")
+
+    @pytest.mark.asyncio
+    async def test_create_thread_without_client(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._discord_create_thread("12345", "test-thread")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_archive_thread_without_client(self):
+        adapter = _make_adapter(channel_access="open")
+        # Should not raise
+        await adapter._discord_archive_thread(12345)
+
+    def test_attachment_dir_with_state_dir(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter({})
+        adapter._state_dir = tmp_path / "discord"
+        adapter._state_dir.mkdir()
+        d = adapter._get_attachment_dir()
+        assert d == tmp_path / "discord" / "attachments"
+        assert d.exists()
+
+    def test_attachment_dir_without_state_dir(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter({})
+        d = adapter._get_attachment_dir()
+        assert "kiln-discord-attachments" in str(d)
+        assert d.exists()
+
+
+# ---------------------------------------------------------------------------
+# Slice D1: Client extraction (on_message → InboundMessage)
+# ---------------------------------------------------------------------------
+
+class TestClientExtraction:
+    """Tests for _DiscordClient.on_message extraction into InboundMessage."""
+
+    @pytest.mark.asyncio
+    async def test_on_message_extracts_inbound_message(self):
+        """on_message should extract Discord fields into InboundMessage."""
+        from kiln.daemon.adapters.discord import DiscordAdapter, InboundMessage
+
+        adapter = _make_adapter(
+            branch_threads={"beth-test": 5555},
+            channel_access="open",
+        )
+
+        # Create a mock discord.Message
+        msg = _mock_discord_message(
+            author_id=111, author_name="TestUser",
+            channel_id=5555, content="hello world",
+            is_dm=False,
+        )
+
+        from kiln.daemon.adapters.discord import _DiscordClient
+        client = _DiscordClient(adapter, asyncio.Event())
+        # Patch user so the bot-self check works
+        client._connection = type("FakeConn", (), {"user": _mock_discord_user(999, "BotUser")})()
+
+        await client.on_message(msg)
+
+        # Message should have been routed through handle_message → branch delivery
+        assert len(adapter._daemon.delivered) == 1
+        session_id, pm = adapter._daemon.delivered[0]
+        assert session_id == "beth-test"
+        assert pm.content == "hello world"
+        assert pm.sender_platform_id == "111"
+
+    @pytest.mark.asyncio
+    async def test_on_message_skips_own_messages(self):
+        """on_message should skip messages from the bot itself."""
+        adapter = _make_adapter(channel_access="open")
+
+        from kiln.daemon.adapters.discord import _DiscordClient
+        client = _DiscordClient(adapter, asyncio.Event())
+        bot_user = _mock_discord_user(999, "BotUser")
+        client._connection = type("FakeConn", (), {"user": bot_user})()
+
+        msg = _mock_discord_message(
+            author_id=999, author_name="BotUser",
+            channel_id=1234, content="echo",
+        )
+        # Make author == self.user
+        msg.author = bot_user
+
+        await client.on_message(msg)
+        assert len(adapter._daemon.delivered) == 0
+
+    @pytest.mark.asyncio
+    async def test_on_message_skips_empty_messages(self):
+        """on_message should skip messages with no content and no attachments."""
+        adapter = _make_adapter(channel_access="open")
+
+        from kiln.daemon.adapters.discord import _DiscordClient
+        client = _DiscordClient(adapter, asyncio.Event())
+        client._connection = type("FakeConn", (), {"user": _mock_discord_user(999, "Bot")})()
+
+        msg = _mock_discord_message(
+            author_id=111, author_name="User",
+            channel_id=1234, content="   ",
+        )
+
+        await client.on_message(msg)
+        assert len(adapter._daemon.delivered) == 0
+
+    @pytest.mark.asyncio
+    async def test_on_message_dm_detection(self):
+        """on_message should detect DMs and set is_dm correctly."""
+        adapter = _make_adapter(
+            dm_access="open",
+            users={"111": {"name": "Kira", "max_trust": "full"}},
+        )
+        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+
+        from kiln.daemon.adapters.discord import _DiscordClient
+        client = _DiscordClient(adapter, asyncio.Event())
+        client._connection = type("FakeConn", (), {"user": _mock_discord_user(999, "Bot")})()
+
+        msg = _mock_discord_message(
+            author_id=111, author_name="Kira",
+            channel_id=7777, content="hey beth",
+            is_dm=True,
+        )
+
+        await client.on_message(msg)
+        assert len(adapter._daemon.surface_delivered) == 1
+        ref, pm = adapter._daemon.surface_delivered[0]
+        assert ref == "discord:user:111"
+        assert pm.content == "hey beth"
+
+
+# ---------------------------------------------------------------------------
+# Slice D1: Startup rollback
+# ---------------------------------------------------------------------------
+
+class TestStartupRollback:
+    """Tests for adapter startup failure rollback."""
+
+    @pytest.mark.asyncio
+    async def test_failed_start_clears_daemon_ref(self, tmp_path):
+        """If client startup fails, adapter should not keep daemon ref."""
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        from unittest.mock import AsyncMock, patch
+
+        adapter = DiscordAdapter({"token": "bad-token"})
+        mock_daemon = _MockDaemon()
+        mock_daemon.config = type("C", (), {"state_dir": tmp_path})()
+        mock_daemon.events = type("E", (), {
+            "add_handler": lambda self, h: None,
+            "remove_handler": lambda self, h: None,
+        })()
+
+        # Patch _start_client to simulate login failure
+        with patch.object(adapter, "_start_client", side_effect=RuntimeError("Login failed")):
+            with pytest.raises(RuntimeError, match="Login failed"):
+                await adapter.start(mock_daemon)
+
+        # Adapter should have rolled back
+        assert adapter._daemon is None
+
+    @pytest.mark.asyncio
+    async def test_failed_start_does_not_register_event_handler(self, tmp_path):
+        """If client startup fails, event handler should not be registered."""
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        from unittest.mock import patch
+
+        adapter = DiscordAdapter({"token": "bad-token"})
+        handlers_registered = []
+        mock_daemon = _MockDaemon()
+        mock_daemon.config = type("C", (), {"state_dir": tmp_path})()
+        mock_daemon.events = type("E", (), {
+            "add_handler": lambda self, h: handlers_registered.append(h),
+            "remove_handler": lambda self, h: None,
+        })()
+
+        with patch.object(adapter, "_start_client", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                await adapter.start(mock_daemon)
+
+        assert len(handlers_registered) == 0
+
+
+# ---------------------------------------------------------------------------
+# Slice D1: RoutingError propagation
+# ---------------------------------------------------------------------------
+
+class TestRoutingErrorPropagation:
+    """RoutingError should not be swallowed by the client."""
+
+    @pytest.mark.asyncio
+    async def test_routing_error_propagates_from_on_message(self):
+        from kiln.daemon.adapters.discord import (
+            _DiscordClient, DiscordAdapter, RoutingError,
+        )
+        from unittest.mock import AsyncMock
+
+        adapter = _make_adapter(channel_access="open")
+        adapter.handle_message = AsyncMock(side_effect=RoutingError("overlap"))
+
+        client = _DiscordClient(adapter, asyncio.Event())
+        client._connection = type("FakeConn", (), {
+            "user": _mock_discord_user(999, "Bot"),
+        })()
+
+        msg = _mock_discord_message(
+            author_id=111, author_name="User",
+            channel_id=1234, content="hello",
+        )
+
+        with pytest.raises(RoutingError):
+            await client.on_message(msg)
+
+
+# ---------------------------------------------------------------------------
+# Slice D1: Filename sanitization
+# ---------------------------------------------------------------------------
+
+class TestSanitizeFilename:
+    """Tests for _sanitize_filename."""
+
+    def test_normal_filename(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        assert _sanitize_filename("photo.png") == "photo.png"
+
+    def test_strips_path_traversal(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        result = _sanitize_filename("../../etc/passwd")
+        assert "/" not in result
+        assert ".." not in result
+
+    def test_strips_backslash_paths(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        result = _sanitize_filename("C:\\Users\\evil\\payload.exe")
+        assert "\\" not in result
+        assert "payload.exe" in result
+
+    def test_replaces_shell_dangerous_chars(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        result = _sanitize_filename('file<>:"|?*.txt')
+        assert "<" not in result
+        assert ">" not in result
+        assert ":" not in result
+
+    def test_empty_becomes_attachment(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        assert _sanitize_filename("") == "attachment"
+
+    def test_dots_only_becomes_attachment(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        assert _sanitize_filename("...") == "attachment"
+
+    def test_long_filename_truncated(self):
+        from kiln.daemon.adapters.discord import _sanitize_filename
+        long_name = "a" * 300 + ".png"
+        result = _sanitize_filename(long_name)
+        assert len(result) <= 200
+
+
+# Mock helpers for discord.py objects
+
+def _mock_discord_user(user_id: int, name: str):
+    """Create a minimal mock discord.User-like object."""
+    user = type("MockUser", (), {
+        "id": user_id,
+        "name": name,
+        "display_name": name,
+        "__eq__": lambda self, other: getattr(other, "id", None) == self.id,
+    })()
+    return user
+
+
+def _mock_discord_message(
+    *,
+    author_id: int,
+    author_name: str,
+    channel_id: int,
+    content: str,
+    is_dm: bool = False,
+    attachments: list | None = None,
+):
+    """Create a minimal mock discord.Message-like object."""
+    import discord as _discord
+
+    author = _mock_discord_user(author_id, author_name)
+
+    if is_dm:
+        channel = type("MockDMChannel", (_discord.DMChannel,), {
+            "id": channel_id,
+            "__init__": lambda self, **kw: None,
+        })()
+        channel.id = channel_id
+    else:
+        channel = type("MockChannel", (), {
+            "id": channel_id,
+            "name": f"channel-{channel_id}",
+        })()
+
+    msg = type("MockMessage", (), {
+        "author": author,
+        "channel": channel,
+        "content": content,
+        "attachments": attachments or [],
+        "flags": type("Flags", (), {"voice": False})(),
+    })()
+    return msg
