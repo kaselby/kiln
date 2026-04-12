@@ -570,7 +570,7 @@ def _map_thinking_level(effort: str) -> dict[str, Any] | None:
         "low": {"effort": "low", "summary": "auto"},
         "medium": {"effort": "medium", "summary": "auto"},
         "high": {"effort": "high", "summary": "auto"},
-        "max": {"effort": "high", "summary": "auto"},
+        "max": {"effort": "xhigh", "summary": "auto"},
     }
     return mapping.get(effort)
 
