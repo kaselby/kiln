@@ -131,6 +131,280 @@ def format_outbound(sender: str, body: str, summary: str = "") -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Status embed colors and constants
+# ---------------------------------------------------------------------------
+
+COLOR_ACTIVE = 0x2ECC71   # green — session has context data
+COLOR_IDLE = 0x95A5A6     # gray — session present, no context data
+COLOR_CONCLAVE = 0x9B59B6 # purple — conclave group
+
+STATUS_REFRESH_INTERVAL = 60  # seconds between periodic refreshes
+STATUS_REFRESH_DEBOUNCE = 5   # minimum seconds between event-triggered refreshes
+USAGE_CACHE_TTL = 600         # 10 min cache for subscription usage data
+
+# Max context tokens — used by old CC JSONL context% calculation.
+# This is a Beth/Claude-specific assumption; other backends may differ.
+MAX_CONTEXT_TOKENS = 200_000
+
+
+# ---------------------------------------------------------------------------
+# Status/presence — pure formatting functions
+# ---------------------------------------------------------------------------
+
+def _format_uptime(started_at: str) -> str:
+    """Format a connected_at ISO timestamp as relative uptime."""
+    from datetime import datetime, timezone
+    try:
+        start = datetime.fromisoformat(started_at)
+        if start.tzinfo is None:
+            delta = datetime.now() - start
+        else:
+            delta = datetime.now(timezone.utc) - start
+        hours, remainder = divmod(int(delta.total_seconds()), 3600)
+        minutes = remainder // 60
+        if hours > 0:
+            return f"{hours}h{minutes:02d}m"
+        return f"{minutes}m"
+    except (ValueError, TypeError):
+        return "?"
+
+
+def _format_context(usage: tuple[int, int] | None) -> str:
+    """Format (used, total) token pair as percentage string."""
+    if usage is None:
+        return "?"
+    used, total = usage
+    if total <= 0:
+        return "?"
+    return f"{int(used / total * 100)}%"
+
+
+def _format_usage_reset(resets_at: str | None) -> str:
+    """Format an ISO reset timestamp as relative time."""
+    from datetime import datetime, timezone
+    if not resets_at:
+        return ""
+    try:
+        reset = datetime.fromisoformat(resets_at)
+        total_seconds = int((reset - datetime.now(timezone.utc)).total_seconds())
+        if total_seconds <= 0:
+            return "resetting"
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        if hours > 24:
+            days = hours // 24
+            return f"resets {days}d {hours % 24}h"
+        elif hours > 0:
+            return f"resets {hours}h {minutes}m"
+        return f"resets {minutes}m"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_codex_reset(reset_at: int | None) -> str:
+    """Format a unix timestamp as relative time string."""
+    from datetime import datetime, timezone
+    if not reset_at:
+        return ""
+    try:
+        total_seconds = int(reset_at - datetime.now(timezone.utc).timestamp())
+        if total_seconds <= 0:
+            return "resetting"
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes = remainder // 60
+        if hours > 24:
+            days = hours // 24
+            return f"resets {days}d {hours % 24}h"
+        elif hours > 0:
+            return f"resets {hours}h {minutes}m"
+        return f"resets {minutes}m"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_usage_lines(data: dict) -> list[str]:
+    """Format subscription usage as Discord-friendly lines (one per provider)."""
+    lines = []
+
+    # Anthropic
+    anthropic = data.get("anthropic", data if "five_hour" in data else {})
+    parts = []
+    for key, label in [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_sonnet", "Sonnet")]:
+        limit = anthropic.get(key)
+        if not limit or limit.get("utilization") is None:
+            continue
+        util = limit["utilization"]
+        reset = _format_usage_reset(limit.get("resets_at"))
+        part = f"**{label}:** {util:.0f}%"
+        if reset:
+            part += f" ({reset})"
+        parts.append(part)
+    if parts:
+        lines.append("\U0001f4ca Anthropic: " + " \u00b7 ".join(parts))
+
+    # OpenAI/Codex
+    openai_data = data.get("openai", {})
+    rate_limit = openai_data.get("rate_limit", {})
+    parts = []
+    for window_key, label in [("primary_window", "5h"), ("secondary_window", "7d")]:
+        window = rate_limit.get(window_key)
+        if not window:
+            continue
+        used = window.get("used_percent", 0)
+        reset_at = window.get("reset_at")
+        reset = _format_codex_reset(reset_at)
+        part = f"**{label}:** {used}%"
+        if reset:
+            part += f" ({reset})"
+        parts.append(part)
+    if parts:
+        lines.append("\U0001f4ca OpenAI: " + " \u00b7 ".join(parts))
+
+    return lines
+
+
+def _build_presence_text(agents: list[dict], canonical_id: str | None = None) -> str:
+    """Build bot activity text from agent data.
+
+    Shows agent count and canonical (or most recent) agent's context%.
+    """
+    if not agents:
+        return "No agents running"
+    count = len(agents)
+    canonical = next((a for a in agents if a["id"] == canonical_id), None) if canonical_id else None
+    target = canonical or agents[-1]
+    name = target["id"].removeprefix(f"{target['id'].split('-')[0]}-")
+    ctx = target.get("context", "?")
+    text = f"{count} agent{'s' if count != 1 else ''} | {name} {ctx}"
+    return text[:128]
+
+
+def _build_agent_embed(agent: dict, canonical_id: str | None) -> discord.Embed:
+    """Build a single-agent status embed."""
+    context_pct = agent.get("context_pct")
+    color = COLOR_ACTIVE if context_pct is not None else COLOR_IDLE
+    is_canonical = agent["id"] == canonical_id
+
+    title = f"\U0001f7e2 {agent['id']}"
+    if is_canonical:
+        title += " \u2b50"
+
+    embed = discord.Embed(title=title, color=color)
+
+    meta = [
+        f"**Uptime:** {agent['uptime']}",
+        f"**Context:** {agent.get('context', '?')}",
+    ]
+    mode = agent.get("mode")
+    if mode and mode != "supervised":
+        meta.append(f"**Mode:** {mode}")
+    if is_canonical:
+        meta.append("\u2b50 **canonical**")
+    if agent.get("inbox", 0) > 0:
+        meta.append(f"**Inbox:** {agent['inbox']}")
+    embed.description = " \u00b7 ".join(meta)
+
+    plan = agent.get("plan")
+    if plan:
+        tasks = plan.get("tasks", [])
+        done = sum(1 for t in tasks if t.get("status") == "done")
+        in_progress = sum(1 for t in tasks if t.get("status") == "in_progress")
+        total = len(tasks)
+        goal = plan.get("goal", "?")
+        if len(goal) > 60:
+            goal = goal[:59] + "\u2026"
+        progress = f"{goal} ({done}/{total}"
+        if in_progress:
+            progress += f", {in_progress} active"
+        progress += ")"
+        embed.add_field(name="Plan", value=progress, inline=False)
+
+    return embed
+
+
+def _build_conclave_embed(
+    name: str, members: list[dict], canonical_id: str | None,
+) -> discord.Embed:
+    """Build a single embed for a conclave group."""
+    embed = discord.Embed(
+        title=f"\U0001f52e {name}",
+        color=COLOR_CONCLAVE,
+    )
+    lines = []
+    for agent in members:
+        is_fac = agent.get("_role") == "facilitator"
+        is_can = agent["id"] == canonical_id
+        prefix = "\u2605" if is_fac else "\u2003"
+        label = f"{prefix} **{agent['id']}**"
+        if is_fac:
+            label += " (facilitator)"
+        if is_can:
+            label += " \u2b50"
+        meta = f"up {agent['uptime']} \u00b7 ctx {agent.get('context', '?')}"
+        if agent.get("inbox", 0) > 0:
+            meta += f" \u00b7 {agent['inbox']} msg"
+        lines.append(f"{label}\n\u2003 {meta}")
+
+    embed.description = "\n".join(lines)
+
+    # Show facilitator's plan (or first plan found)
+    for agent in members:
+        plan = agent.get("plan")
+        if plan:
+            tasks = plan.get("tasks", [])
+            done = sum(1 for t in tasks if t.get("status") == "done")
+            total = len(tasks)
+            goal = plan.get("goal", "?")
+            if len(goal) > 60:
+                goal = goal[:59] + "\u2026"
+            embed.add_field(name="Plan", value=f"{goal} ({done}/{total})", inline=False)
+            break
+
+    return embed
+
+
+def _build_status_embeds(
+    agents: list[dict],
+    canonical_id: str | None = None,
+    membership: dict[str, dict] | None = None,
+) -> list[discord.Embed]:
+    """Build the full set of status embeds from agent data.
+
+    Partitions agents into standalone and conclave groups.
+    Returns a list of embeds (max 10 for Discord's per-message limit).
+    """
+    from datetime import datetime, timezone
+
+    if not agents:
+        return [discord.Embed(
+            title="No agents running",
+            color=COLOR_IDLE,
+            timestamp=datetime.now(timezone.utc),
+        )]
+
+    membership = membership or {}
+
+    standalone = []
+    conclaves: dict[str, list[dict]] = {}
+    for agent in agents:
+        m = membership.get(agent["id"])
+        if m:
+            agent_with_role = {**agent, "_role": m["role"]}
+            conclaves.setdefault(m["conclave"], []).append(agent_with_role)
+        else:
+            standalone.append(agent)
+
+    embeds = []
+    for agent in standalone:
+        embeds.append(_build_agent_embed(agent, canonical_id))
+    for cname, members in sorted(conclaves.items()):
+        members.sort(key=lambda a: (0 if a.get("_role") == "facilitator" else 1, a["id"]))
+        embeds.append(_build_conclave_embed(cname, members, canonical_id))
+
+    return embeds[:10]
+
+
+# ---------------------------------------------------------------------------
 # Inbound message types (adapter-local — not wire protocol)
 # ---------------------------------------------------------------------------
 
@@ -245,6 +519,7 @@ class DiscordAdapterConfig:
     credentials_dir: str = ""      # path to credentials dir (for voice service)
     voice_default: str = ""        # default TTS voice name
     voice_instructions: str = ""   # default TTS voice instructions
+    usage_command: str = ""        # command to fetch usage JSON (e.g. "/path/to/usage --json")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DiscordAdapterConfig:
@@ -463,6 +738,13 @@ class DiscordAdapter:
         self._thread_to_session: dict[int, str] = {}  # thread_id -> session_id
         self._thread_to_channel: dict[int, str] = {}  # thread_id -> channel_name
 
+        # Status display state (D3c)
+        self._status_refresh_task: asyncio.Task | None = None
+        self._status_refresh_signal: asyncio.Event | None = None
+        self._status_message_id: int | None = None
+        self._usage_cache: dict | None = None
+        self._usage_cache_time: float = 0.0
+
     def _rebuild_reverse_indexes(self) -> None:
         """Rebuild reverse lookup dicts from forward mappings."""
         self._thread_to_session = {v: k for k, v in self._branch_threads.items()}
@@ -511,6 +793,10 @@ class DiscordAdapter:
 
         # Subscribe to daemon events only after successful startup
         daemon.events.add_handler(self._event_handler)
+
+        # Load persisted status message ID and start status loop
+        self._status_message_id = self._load_status_message_id()
+        await self._start_status_loop()
 
         log.info("Discord adapter started (state: %s)", self._state_dir)
 
@@ -587,6 +873,9 @@ class DiscordAdapter:
 
     async def stop(self) -> None:
         """Stop the adapter and clean up."""
+        # Stop status refresh loop
+        await self._stop_status_loop()
+
         # Stop Discord client
         await self._cleanup_client()
 
@@ -817,6 +1106,9 @@ class DiscordAdapter:
         if not session_id:
             return
 
+        # Status refresh on any session connect, regardless of branch thread outcome
+        self._signal_status_refresh()
+
         # Check if this session already has a branch thread (e.g. from resume)
         if session_id in self._branch_threads:
             log.debug(
@@ -854,6 +1146,9 @@ class DiscordAdapter:
         if not session_id:
             return
 
+        # Status refresh on any session disconnect, regardless of branch thread
+        self._signal_status_refresh()
+
         thread_id = self._branch_threads.get(session_id)
         if not thread_id:
             return
@@ -865,12 +1160,9 @@ class DiscordAdapter:
             log.exception("Failed to archive branch thread for %s", session_id)
 
     async def _on_session_mode_changed(self, event: proto.Message) -> None:
-        """A session's mode was changed.
-
-        Update the branch thread or status display.
-        """
-        # Slice C2: update branch thread name/topic, status embed
+        """A session's mode was changed. Refresh status display."""
         log.debug("Session mode changed: %s", event.data)
+        self._signal_status_refresh()
 
     # --- Channel lifecycle (channel threads) ---
 
@@ -966,6 +1258,429 @@ class DiscordAdapter:
         proto.EVT_BRIDGE_BOUND: "_on_bridge_bound",
         proto.EVT_BRIDGE_UNBOUND: "_on_bridge_unbound",
     }
+
+    # ------------------------------------------------------------------
+    # Status display + presence (D3c)
+    # ------------------------------------------------------------------
+
+    def _signal_status_refresh(self) -> None:
+        """Signal the status refresh loop to wake up.
+
+        Safe to call from any event handler or command handler.
+        The refresh loop debounces rapid signals.
+        """
+        if self._status_refresh_signal is not None:
+            self._status_refresh_signal.set()
+
+    async def _start_status_loop(self) -> None:
+        """Start the status refresh background task.
+
+        Called during start() after the client is ready. Only starts
+        if a #status channel is configured.
+        """
+        status_channel_id = self._discord_config.channels.get("status")
+        if not status_channel_id:
+            log.info("No #status channel configured — status display disabled")
+            return
+
+        self._status_refresh_signal = asyncio.Event()
+        self._status_refresh_signal.set()  # Trigger immediate first refresh
+        self._status_refresh_task = asyncio.create_task(
+            self._status_refresh_loop(status_channel_id),
+        )
+
+    async def _stop_status_loop(self) -> None:
+        """Cancel the status refresh task. Called during stop()."""
+        if self._status_refresh_task and not self._status_refresh_task.done():
+            self._status_refresh_task.cancel()
+            try:
+                await self._status_refresh_task
+            except asyncio.CancelledError:
+                pass
+        self._status_refresh_task = None
+        self._status_refresh_signal = None
+
+    async def _status_refresh_loop(self, status_channel_id: str) -> None:
+        """Unified status refresh loop.
+
+        Wakes on either:
+        - periodic timer (STATUS_REFRESH_INTERVAL)
+        - event signal (_status_refresh_signal) with debounce
+
+        Each wake collects data and updates both the status embed and
+        bot presence text.
+        """
+        import time as _time
+        last_refresh = 0.0
+
+        while True:
+            # Wait for either timer or signal
+            try:
+                await asyncio.wait_for(
+                    self._status_refresh_signal.wait(),
+                    timeout=STATUS_REFRESH_INTERVAL,
+                )
+                # Signal received — clear it
+                self._status_refresh_signal.clear()
+            except asyncio.TimeoutError:
+                pass  # Periodic wake
+
+            # Debounce: skip if we refreshed very recently
+            now = _time.monotonic()
+            if now - last_refresh < STATUS_REFRESH_DEBOUNCE:
+                continue
+            last_refresh = now
+
+            try:
+                await self._do_status_refresh(status_channel_id)
+            except Exception:
+                log.exception("Status refresh failed")
+
+    async def _do_status_refresh(self, status_channel_id: str) -> None:
+        """Perform a single status refresh cycle.
+
+        Collects data from daemon state and filesystem, builds embeds,
+        and updates both the status message and bot presence.
+        """
+        agents = self._collect_daemon_status()
+        self._enrich_with_home_decorators(agents)
+
+        # Resolve canonical — check each unique agent home
+        canonical_id = None
+        seen_homes: set[str] = set()
+        for a in agents:
+            home = a.get("agent_home", "")
+            if home and home not in seen_homes:
+                seen_homes.add(home)
+                cid = self._read_canonical(Path(home))
+                if cid:
+                    canonical_id = cid
+                    break
+
+        membership = self._get_conclave_membership()
+        embeds = _build_status_embeds(agents, canonical_id=canonical_id, membership=membership)
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/Toronto")).strftime("%I:%M:%S %p EST")
+        content = f"**Agent Status** \u2014 last updated {now}"
+
+        usage_data = await self._collect_usage_data()
+        if usage_data:
+            for line in _format_usage_lines(usage_data):
+                content += f"\n{line}"
+
+        # Update status message (edit-or-create)
+        await self._update_status_message(status_channel_id, content, embeds)
+
+        # Update bot presence
+        presence_text = _build_presence_text(agents, canonical_id=canonical_id)
+        await self._update_presence(presence_text)
+
+    def _collect_daemon_status(self) -> list[dict]:
+        """Collect session data from daemon presence registry.
+
+        Returns a list of agent dicts with daemon-truth fields only.
+        Home decorators are added separately by _enrich_with_home_decorators.
+        """
+        sessions = self._daemon.state.presence.all_sessions()
+        agents = []
+        for s in sessions:
+            agents.append({
+                "id": s.session_id,
+                "agent_name": s.agent_name,
+                "agent_home": s.agent_home,
+                "uptime": _format_uptime(s.connected_at.isoformat()),
+            })
+        agents.sort(key=lambda a: a["id"])
+        return agents
+
+    def _read_canonical(self, agent_home: Path) -> str | None:
+        """Read canonical session ID from agent home. Soft-fail."""
+        if not agent_home:
+            return None
+        path = Path(agent_home) / "state" / "canonical"
+        try:
+            text = path.read_text().strip()
+            return text or None
+        except OSError:
+            return None
+
+    def _enrich_with_home_decorators(self, agents: list[dict]) -> None:
+        """Add filesystem-derived decorator fields to agent dicts.
+
+        Reads from agent home directories. All reads are soft-fail:
+        missing files or errors produce graceful defaults, never exceptions.
+
+        This is presentation-only — no side effects, no repair behavior.
+        """
+        for agent in agents:
+            home = Path(agent.get("agent_home", ""))
+            session_id = agent["id"]
+
+            # Mode — from session config YAML
+            agent["mode"] = self._read_session_mode(home, session_id)
+
+            # Context% ��� from CC conversation JSONL
+            usage = self._read_context_usage(home, session_id)
+            agent["context"] = _format_context(usage)
+            agent["context_pct"] = int(usage[0] / usage[1] * 100) if usage else None
+
+            # Plan — from plans directory
+            agent["plan"] = self._read_plan(home, session_id)
+
+            # Inbox count
+            agent["inbox"] = self._count_inbox(home, session_id)
+
+    @staticmethod
+    def _read_session_mode(agent_home: Path, session_id: str) -> str:
+        """Read session mode from live session-config YAML. Soft-fail."""
+        if not agent_home:
+            return ""
+        config_path = agent_home / "state" / f"session-config-{session_id}.yml"
+        if not config_path.exists():
+            return ""
+        try:
+            import yaml
+            data = yaml.safe_load(config_path.read_text()) or {}
+            return data.get("mode", "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _read_context_usage(agent_home: Path, session_id: str) -> tuple[int, int] | None:
+        """Read context token usage from CC conversation JSONL. Soft-fail."""
+        if not agent_home:
+            return None
+
+        # Look up session UUID from session registry
+        registry_path = agent_home / "logs" / "session-registry.json"
+        if not registry_path.exists():
+            return None
+        try:
+            registry = json.loads(registry_path.read_text())
+            entry = registry.get(session_id, {})
+            session_uuid = entry.get("session_uuid")
+            if not session_uuid:
+                return None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        # Find JSONL file
+        claude_projects = Path.home() / ".claude" / "projects"
+        encoded_cwd = str(Path(agent_home).resolve()).replace("/", "-").replace(".", "-")
+        jsonl_path = claude_projects / encoded_cwd / f"{session_uuid}.jsonl"
+        if not jsonl_path.exists():
+            return None
+
+        try:
+            tail_size = 32 * 1024
+            with open(jsonl_path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - tail_size))
+                tail = f.read().decode("utf-8", errors="replace")
+
+            last_usage = None
+            for line in tail.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "assistant":
+                    usage = obj.get("message", {}).get("usage", {})
+                    if usage:
+                        last_usage = usage
+
+            if not last_usage:
+                return None
+
+            total = (
+                last_usage.get("input_tokens", 0)
+                + last_usage.get("cache_read_input_tokens", 0)
+                + last_usage.get("cache_creation_input_tokens", 0)
+            )
+            return (total, MAX_CONTEXT_TOKENS)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _read_plan(agent_home: Path, session_id: str) -> dict | None:
+        """Read session plan from plans directory. Soft-fail."""
+        if not agent_home:
+            return None
+        path = agent_home / "plans" / f"{session_id}.yml"
+        if not path.exists():
+            return None
+        try:
+            import yaml
+            return yaml.safe_load(path.read_text())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _count_inbox(agent_home: Path, session_id: str) -> int:
+        """Count unread inbox messages for a session. Soft-fail."""
+        if not agent_home:
+            return 0
+        inbox = Path(agent_home) / "inbox" / session_id
+        if not inbox.exists():
+            return 0
+        count = 0
+        try:
+            for f in inbox.iterdir():
+                if f.suffix == ".md" and not f.with_suffix(".read").exists():
+                    count += 1
+        except OSError:
+            pass
+        return count
+
+    def _get_conclave_membership(self) -> dict[str, dict]:
+        """Parse conclave briefings for display grouping. Soft-fail.
+
+        Returns {session_id: {"conclave": name, "role": role}}.
+        Reads from all known agent homes with connected sessions.
+        """
+        import re
+        pattern = re.compile(r"\*\*(Facilitator|Collaborator):\*\*\s+(\S+)")
+        membership: dict[str, dict] = {}
+
+        seen_homes: set[str] = set()
+        for s in self._daemon.state.presence.all_sessions():
+            if s.agent_home in seen_homes:
+                continue
+            seen_homes.add(s.agent_home)
+
+            conclaves_dir = Path(s.agent_home) / "conclaves"
+            if not conclaves_dir.exists():
+                continue
+
+            for briefing in conclaves_dir.glob("*/briefing.md"):
+                name = briefing.parent.name
+                try:
+                    text = briefing.read_text()
+                except OSError:
+                    continue
+                in_members = False
+                for line in text.splitlines():
+                    if line.strip() == "## Members":
+                        in_members = True
+                        continue
+                    if in_members:
+                        if line.startswith("## "):
+                            break
+                        m = pattern.search(line)
+                        if m:
+                            membership[m.group(2)] = {
+                                "conclave": name, "role": m.group(1).lower(),
+                            }
+        return membership
+
+    async def _collect_usage_data(self) -> dict | None:
+        """Fetch subscription usage data, cached.
+
+        Uses the kiln.util.usage library for direct API access.
+        Soft-fail: returns cached data or None on error.
+        """
+        import time as _time
+        now = _time.monotonic()
+        if self._usage_cache and (now - self._usage_cache_time) < USAGE_CACHE_TTL:
+            return self._usage_cache
+
+        try:
+            from ...util.usage import get_subscription_usage_async
+            data = await get_subscription_usage_async()
+            if data:
+                self._usage_cache = data
+                self._usage_cache_time = now
+                return data
+        except Exception:
+            log.debug("Usage data fetch failed, using cache")
+        return self._usage_cache
+
+    async def _update_status_message(
+        self, channel_id: str, content: str, embeds: list[discord.Embed],
+    ) -> None:
+        """Edit-or-create the status message in the status channel.
+
+        Persists the message ID so we edit the same message across restarts.
+        """
+        if not self._client:
+            return
+
+        channel = self._client.get_channel(int(channel_id))
+        if not channel:
+            try:
+                channel = await self._client.fetch_channel(int(channel_id))
+            except discord.NotFound:
+                log.warning("Status channel %s not found", channel_id)
+                return
+
+        # Try editing existing message
+        if self._status_message_id:
+            try:
+                msg = await channel.fetch_message(self._status_message_id)
+                await msg.edit(content=content, embeds=embeds)
+                return
+            except discord.NotFound:
+                self._status_message_id = None
+            except discord.Forbidden:
+                log.error("Cannot edit status message — check permissions")
+                return
+
+        # Create new message
+        msg = await channel.send(content=content, embeds=embeds)
+        self._status_message_id = msg.id
+        self._persist_status_message_id()
+
+        try:
+            await msg.pin()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    def _persist_status_message_id(self) -> None:
+        """Save the status message ID to disk for persistence across restarts."""
+        if not self._state_dir:
+            return
+        path = self._state_dir / "status-message-id"
+        try:
+            path.write_text(str(self._status_message_id or ""))
+        except OSError:
+            log.debug("Failed to persist status message ID")
+
+    def _load_status_message_id(self) -> int | None:
+        """Load the persisted status message ID from disk."""
+        if not self._state_dir:
+            return None
+        path = self._state_dir / "status-message-id"
+        if not path.exists():
+            return None
+        try:
+            text = path.read_text().strip()
+            return int(text) if text else None
+        except (ValueError, OSError):
+            return None
+
+    async def _update_presence(self, text: str) -> None:
+        """Update bot presence/activity text."""
+        if not self._client:
+            return
+        try:
+            activity = discord.Activity(
+                type=discord.ActivityType.watching,
+                name=text,
+            )
+            await asyncio.wait_for(
+                self._client.change_presence(activity=activity),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            log.warning("Presence update timed out")
+        except Exception:
+            log.exception("Presence update error")
 
     # ------------------------------------------------------------------
     # Inbound message handling (Discord → daemon)
@@ -1250,6 +1965,9 @@ class DiscordAdapter:
         )
         icon = "\u2705" if result.success else "\u274c"
         await self._control_respond(msg, f"{icon} {result.message}")
+
+        if result.success:
+            self._signal_status_refresh()
 
     async def _cmd_spawn(
         self, msg: InboundMessage, instructions: str, sender_name: str,

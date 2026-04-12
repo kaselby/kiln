@@ -3625,3 +3625,667 @@ class TestControlCommands:
 async def _capture(responses: list, text: str):
     """Async-compatible response capture for patched _control_respond."""
     responses.append(text)
+
+
+# ---------------------------------------------------------------------------
+# D3c — Status embeds + presence
+# ---------------------------------------------------------------------------
+
+class TestFormatUptime:
+    def test_minutes_only(self):
+        from kiln.daemon.adapters.discord import _format_uptime
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=42)).isoformat()
+        assert _format_uptime(ts) == "42m"
+
+    def test_hours_and_minutes(self):
+        from kiln.daemon.adapters.discord import _format_uptime
+        from datetime import datetime, timezone, timedelta
+        ts = (datetime.now(timezone.utc) - timedelta(hours=3, minutes=7)).isoformat()
+        assert _format_uptime(ts) == "3h07m"
+
+    def test_invalid_timestamp(self):
+        from kiln.daemon.adapters.discord import _format_uptime
+        assert _format_uptime("not-a-date") == "?"
+
+    def test_empty(self):
+        from kiln.daemon.adapters.discord import _format_uptime
+        assert _format_uptime("") == "?"
+
+
+class TestFormatContext:
+    def test_normal(self):
+        from kiln.daemon.adapters.discord import _format_context
+        assert _format_context((100_000, 200_000)) == "50%"
+
+    def test_none(self):
+        from kiln.daemon.adapters.discord import _format_context
+        assert _format_context(None) == "?"
+
+    def test_zero_total(self):
+        from kiln.daemon.adapters.discord import _format_context
+        assert _format_context((0, 0)) == "?"
+
+
+class TestBuildPresenceText:
+    def test_no_agents(self):
+        from kiln.daemon.adapters.discord import _build_presence_text
+        assert _build_presence_text([]) == "No agents running"
+
+    def test_single_agent(self):
+        from kiln.daemon.adapters.discord import _build_presence_text
+        agents = [{"id": "beth-cool-fox", "context": "42%"}]
+        text = _build_presence_text(agents)
+        assert "1 agent" in text
+        assert "cool-fox" in text
+        assert "42%" in text
+
+    def test_multiple_agents_uses_last(self):
+        from kiln.daemon.adapters.discord import _build_presence_text
+        agents = [
+            {"id": "beth-aaa", "context": "10%"},
+            {"id": "beth-bbb", "context": "50%"},
+        ]
+        text = _build_presence_text(agents)
+        assert "2 agents" in text
+        assert "bbb" in text
+
+    def test_canonical_preferred(self):
+        from kiln.daemon.adapters.discord import _build_presence_text
+        agents = [
+            {"id": "beth-aaa", "context": "10%"},
+            {"id": "beth-bbb", "context": "50%"},
+        ]
+        text = _build_presence_text(agents, canonical_id="beth-aaa")
+        assert "aaa" in text
+        assert "10%" in text
+
+    def test_truncated_at_128(self):
+        from kiln.daemon.adapters.discord import _build_presence_text
+        agents = [{"id": "beth-" + "x" * 200, "context": "1%"}]
+        assert len(_build_presence_text(agents)) <= 128
+
+
+class TestBuildAgentEmbed:
+    def test_basic_embed(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed, COLOR_ACTIVE
+        agent = {"id": "beth-fox", "uptime": "1h30m", "context": "45%", "context_pct": 45, "inbox": 0}
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert "beth-fox" in embed.title
+        assert embed.color.value == COLOR_ACTIVE
+        assert "45%" in embed.description
+
+    def test_canonical_star(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed
+        agent = {"id": "beth-fox", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0}
+        embed = _build_agent_embed(agent, canonical_id="beth-fox")
+        assert "\u2b50" in embed.title
+
+    def test_no_canonical_no_star(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed
+        agent = {"id": "beth-fox", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0}
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert "\u2b50" not in embed.title
+
+    def test_mode_shown_when_not_supervised(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed
+        agent = {"id": "beth-fox", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0, "mode": "yolo"}
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert "yolo" in embed.description
+
+    def test_mode_hidden_when_supervised(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed
+        agent = {"id": "beth-fox", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0, "mode": "supervised"}
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert "supervised" not in embed.description
+
+    def test_plan_shown(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed
+        agent = {
+            "id": "beth-fox", "uptime": "1h", "context": "?",
+            "context_pct": None, "inbox": 0,
+            "plan": {"goal": "Test goal", "tasks": [
+                {"status": "done"}, {"status": "in_progress"}, {"status": "pending"},
+            ]},
+        }
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert len(embed.fields) == 1
+        assert "Test goal" in embed.fields[0].value
+        assert "1/3" in embed.fields[0].value
+
+    def test_inbox_shown_when_nonzero(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed
+        agent = {"id": "beth-fox", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 3}
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert "3" in embed.description
+
+    def test_idle_color_when_no_context(self):
+        from kiln.daemon.adapters.discord import _build_agent_embed, COLOR_IDLE
+        agent = {"id": "beth-fox", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0}
+        embed = _build_agent_embed(agent, canonical_id=None)
+        assert embed.color.value == COLOR_IDLE
+
+
+class TestBuildStatusEmbeds:
+    def test_no_agents(self):
+        from kiln.daemon.adapters.discord import _build_status_embeds
+        embeds = _build_status_embeds([])
+        assert len(embeds) == 1
+        assert "No agents" in embeds[0].title
+
+    def test_standalone_agents(self):
+        from kiln.daemon.adapters.discord import _build_status_embeds
+        agents = [
+            {"id": "beth-aaa", "uptime": "1h", "context": "30%", "context_pct": 30, "inbox": 0},
+            {"id": "beth-bbb", "uptime": "2h", "context": "60%", "context_pct": 60, "inbox": 0},
+        ]
+        embeds = _build_status_embeds(agents)
+        assert len(embeds) == 2
+
+    def test_conclave_grouping(self):
+        from kiln.daemon.adapters.discord import _build_status_embeds, COLOR_CONCLAVE
+        agents = [
+            {"id": "beth-standalone", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0},
+            {"id": "beth-fac", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0},
+            {"id": "beth-collab", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0},
+        ]
+        membership = {
+            "beth-fac": {"conclave": "test-conclave", "role": "facilitator"},
+            "beth-collab": {"conclave": "test-conclave", "role": "collaborator"},
+        }
+        embeds = _build_status_embeds(agents, membership=membership)
+        # 1 standalone + 1 conclave group
+        assert len(embeds) == 2
+        conclave_embed = [e for e in embeds if e.color.value == COLOR_CONCLAVE]
+        assert len(conclave_embed) == 1
+        assert "test-conclave" in conclave_embed[0].title
+
+    def test_max_10_embeds(self):
+        from kiln.daemon.adapters.discord import _build_status_embeds
+        agents = [
+            {"id": f"beth-agent-{i}", "uptime": "1h", "context": "?", "context_pct": None, "inbox": 0}
+            for i in range(15)
+        ]
+        embeds = _build_status_embeds(agents)
+        assert len(embeds) <= 10
+
+
+class TestFormatUsageLines:
+    def test_anthropic_only(self):
+        from kiln.daemon.adapters.discord import _format_usage_lines
+        data = {"anthropic": {"five_hour": {"utilization": 42.5, "resets_at": None}}}
+        lines = _format_usage_lines(data)
+        assert len(lines) == 1
+        assert "Anthropic" in lines[0]
+        assert "42%" in lines[0]
+
+    def test_both_providers(self):
+        from kiln.daemon.adapters.discord import _format_usage_lines
+        data = {
+            "anthropic": {"five_hour": {"utilization": 30.0}},
+            "openai": {"rate_limit": {"primary_window": {"used_percent": 10}}},
+        }
+        lines = _format_usage_lines(data)
+        assert len(lines) == 2
+
+    def test_empty(self):
+        from kiln.daemon.adapters.discord import _format_usage_lines
+        assert _format_usage_lines({}) == []
+
+
+class TestCollectDaemonStatus:
+    def test_collects_from_presence(self):
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+        # Register sessions in mock daemon
+        s1 = SessionRecord(session_id="beth-fox", agent_name="beth", agent_home="/home/beth", pid=1)
+        s2 = SessionRecord(session_id="dalet-owl", agent_name="dalet", agent_home="/home/dalet", pid=2)
+        adapter._daemon.state.presence.register(s1)
+        adapter._daemon.state.presence.register(s2)
+
+        agents = adapter._collect_daemon_status()
+        assert len(agents) == 2
+        ids = [a["id"] for a in agents]
+        assert "beth-fox" in ids
+        assert "dalet-owl" in ids
+        # Should be sorted
+        assert agents[0]["id"] < agents[1]["id"]
+
+    def test_empty_registry(self):
+        adapter = _make_adapter(channel_access="open")
+        agents = adapter._collect_daemon_status()
+        assert agents == []
+
+
+class TestHomeDecorators:
+    def test_read_plan(self, tmp_path):
+        import yaml
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        plans_dir = tmp_path / "plans"
+        plans_dir.mkdir()
+        plan_data = {"goal": "test", "tasks": [{"status": "done"}]}
+        (plans_dir / "beth-fox.yml").write_text(yaml.dump(plan_data))
+
+        result = DiscordAdapter._read_plan(tmp_path, "beth-fox")
+        assert result["goal"] == "test"
+
+    def test_read_plan_missing(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        assert DiscordAdapter._read_plan(tmp_path, "beth-ghost") is None
+
+    def test_count_inbox(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        inbox = tmp_path / "inbox" / "beth-fox"
+        inbox.mkdir(parents=True)
+        (inbox / "msg1.md").write_text("hi")
+        (inbox / "msg2.md").write_text("there")
+        (inbox / "msg2.read").write_text("")  # read marker
+        (inbox / "msg3.md").write_text("unread")
+
+        assert DiscordAdapter._count_inbox(tmp_path, "beth-fox") == 2
+
+    def test_count_inbox_missing(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        assert DiscordAdapter._count_inbox(tmp_path, "beth-ghost") == 0
+
+    def test_read_session_mode(self, tmp_path):
+        import yaml
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        state_dir = tmp_path / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "session-config-beth-fox.yml").write_text(yaml.dump({"mode": "yolo"}))
+
+        assert DiscordAdapter._read_session_mode(tmp_path, "beth-fox") == "yolo"
+
+    def test_read_session_mode_missing(self, tmp_path):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        assert DiscordAdapter._read_session_mode(tmp_path, "beth-ghost") == ""
+
+    def test_read_canonical(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / "canonical").write_text("beth-fox\n")
+        assert adapter._read_canonical(tmp_path) == "beth-fox"
+
+    def test_read_canonical_missing(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        assert adapter._read_canonical(tmp_path) is None
+
+
+class TestStatusSignal:
+    def test_signal_sets_event(self):
+        adapter = _make_adapter(channel_access="open")
+        adapter._status_refresh_signal = asyncio.Event()
+        assert not adapter._status_refresh_signal.is_set()
+        adapter._signal_status_refresh()
+        assert adapter._status_refresh_signal.is_set()
+
+    def test_signal_noop_when_no_event(self):
+        adapter = _make_adapter(channel_access="open")
+        adapter._status_refresh_signal = None
+        # Should not raise
+        adapter._signal_status_refresh()
+
+    @pytest.mark.asyncio
+    async def test_cmd_mode_triggers_refresh(self):
+        adapter = _make_adapter(channel_access="open")
+        adapter._status_refresh_signal = asyncio.Event()
+
+        responses = []
+        adapter._control_respond = lambda msg, text: _capture(responses, text)
+
+        msg = _msg(content="mode beth-fox yolo", channel_id="999")
+        await adapter._cmd_mode(msg, ["beth-fox", "yolo"], "TestUser")
+
+        # Should have signalled
+        assert adapter._status_refresh_signal.is_set()
+
+    @pytest.mark.asyncio
+    async def test_session_connected_triggers_refresh(self):
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open", channels={"branches": "8888"})
+        adapter._status_refresh_signal = asyncio.Event()
+
+        # Patch discord thread creation to avoid needing live client
+        async def _noop_create(*a, **k):
+            return None
+        adapter._discord_create_thread = _noop_create
+
+        event = proto.event(proto.EVT_SESSION_CONNECTED, session_id="beth-fox", agent_name="beth")
+        await adapter._on_session_connected(event)
+
+        assert adapter._status_refresh_signal.is_set()
+
+    @pytest.mark.asyncio
+    async def test_session_connected_triggers_refresh_without_branches(self):
+        """Refresh fires even when #branches is not configured."""
+        adapter = _make_adapter(channel_access="open")  # no channels config
+        adapter._status_refresh_signal = asyncio.Event()
+
+        event = proto.event(proto.EVT_SESSION_CONNECTED, session_id="beth-fox", agent_name="beth")
+        await adapter._on_session_connected(event)
+
+        assert adapter._status_refresh_signal.is_set()
+
+    @pytest.mark.asyncio
+    async def test_session_disconnected_triggers_refresh_without_thread(self):
+        """Refresh fires even when session has no branch thread."""
+        adapter = _make_adapter(channel_access="open")
+        adapter._status_refresh_signal = asyncio.Event()
+        # No branch thread for this session
+
+        event = proto.event(proto.EVT_SESSION_DISCONNECTED, session_id="beth-fox")
+        await adapter._on_session_disconnected(event)
+
+        assert adapter._status_refresh_signal.is_set()
+
+    @pytest.mark.asyncio
+    async def test_session_disconnected_triggers_refresh(self):
+        adapter = _make_adapter(channel_access="open")
+        adapter._status_refresh_signal = asyncio.Event()
+        adapter._branch_threads["beth-fox"] = 12345
+
+        async def _noop_archive(*a):
+            pass
+        adapter._discord_archive_thread = _noop_archive
+
+        event = proto.event(proto.EVT_SESSION_DISCONNECTED, session_id="beth-fox")
+        await adapter._on_session_disconnected(event)
+
+        assert adapter._status_refresh_signal.is_set()
+
+
+class TestStatusMessagePersistence:
+    def test_persist_and_load(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        adapter._state_dir = tmp_path
+        adapter._status_message_id = 123456789
+
+        adapter._persist_status_message_id()
+        loaded = adapter._load_status_message_id()
+        assert loaded == 123456789
+
+    def test_load_missing(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        adapter._state_dir = tmp_path
+        assert adapter._load_status_message_id() is None
+
+    def test_load_empty(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        adapter._state_dir = tmp_path
+        (tmp_path / "status-message-id").write_text("")
+        assert adapter._load_status_message_id() is None
+
+    def test_load_invalid(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        adapter._state_dir = tmp_path
+        (tmp_path / "status-message-id").write_text("not-a-number")
+        assert adapter._load_status_message_id() is None
+
+
+class TestEnrichWithHomeDecorators:
+    """Integration test for _enrich_with_home_decorators — all reads together."""
+
+    def test_enriches_all_fields(self, tmp_path):
+        import yaml
+        adapter = _make_adapter(channel_access="open")
+
+        # Set up agent home structure
+        (tmp_path / "state").mkdir(parents=True)
+        (tmp_path / "state" / "session-config-beth-fox.yml").write_text(
+            yaml.dump({"mode": "yolo"})
+        )
+        (tmp_path / "plans").mkdir()
+        (tmp_path / "plans" / "beth-fox.yml").write_text(
+            yaml.dump({"goal": "test", "tasks": [{"status": "done"}]})
+        )
+        inbox = tmp_path / "inbox" / "beth-fox"
+        inbox.mkdir(parents=True)
+        (inbox / "msg1.md").write_text("hi")
+
+        agents = [{"id": "beth-fox", "agent_name": "beth", "agent_home": str(tmp_path)}]
+        adapter._enrich_with_home_decorators(agents)
+
+        a = agents[0]
+        assert a["mode"] == "yolo"
+        assert a["plan"]["goal"] == "test"
+        assert a["inbox"] == 1
+        assert a["context"] == "?"  # No JSONL, so "?"
+        assert a["context_pct"] is None
+
+    def test_graceful_with_empty_home(self, tmp_path):
+        adapter = _make_adapter(channel_access="open")
+        agents = [{"id": "beth-fox", "agent_name": "beth", "agent_home": str(tmp_path)}]
+        adapter._enrich_with_home_decorators(agents)
+
+        a = agents[0]
+        assert a["mode"] == ""
+        assert a["plan"] is None
+        assert a["inbox"] == 0
+        assert a["context"] == "?"
+
+    def test_graceful_with_invalid_home(self):
+        adapter = _make_adapter(channel_access="open")
+        agents = [{"id": "beth-fox", "agent_name": "beth", "agent_home": "/nonexistent/path"}]
+        adapter._enrich_with_home_decorators(agents)
+
+        a = agents[0]
+        assert a["mode"] == ""
+        assert a["context"] == "?"
+
+
+class TestConclaveMembership:
+    def test_parses_briefing(self, tmp_path):
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+
+        # Create conclave briefing
+        briefing_dir = tmp_path / "conclaves" / "test-research"
+        briefing_dir.mkdir(parents=True)
+        (briefing_dir / "briefing.md").write_text(
+            "# Briefing\n\n## Members\n"
+            "- **Facilitator:** beth-lead\n"
+            "- **Collaborator:** beth-helper\n"
+            "\n## Goals\nDo stuff\n"
+        )
+
+        s = SessionRecord(session_id="beth-lead", agent_name="beth",
+                          agent_home=str(tmp_path), pid=1)
+        adapter._daemon.state.presence.register(s)
+
+        membership = adapter._get_conclave_membership()
+        assert "beth-lead" in membership
+        assert membership["beth-lead"]["role"] == "facilitator"
+        assert membership["beth-lead"]["conclave"] == "test-research"
+        assert "beth-helper" in membership
+        assert membership["beth-helper"]["role"] == "collaborator"
+
+    def test_empty_when_no_conclaves(self, tmp_path):
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+        s = SessionRecord(session_id="beth-fox", agent_name="beth",
+                          agent_home=str(tmp_path), pid=1)
+        adapter._daemon.state.presence.register(s)
+
+        assert adapter._get_conclave_membership() == {}
+
+    def test_deduplicates_homes(self, tmp_path):
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+
+        # Two sessions from same home
+        s1 = SessionRecord(session_id="beth-fox", agent_name="beth",
+                           agent_home=str(tmp_path), pid=1)
+        s2 = SessionRecord(session_id="beth-owl", agent_name="beth",
+                           agent_home=str(tmp_path), pid=2)
+        adapter._daemon.state.presence.register(s1)
+        adapter._daemon.state.presence.register(s2)
+
+        # Should not crash or double-count
+        membership = adapter._get_conclave_membership()
+        assert isinstance(membership, dict)
+
+
+class TestUsageCaching:
+    @pytest.mark.asyncio
+    async def test_returns_cache_when_fresh(self):
+        import time
+        adapter = _make_adapter(channel_access="open")
+        adapter._usage_cache = {"anthropic": {"five_hour": {"utilization": 50}}}
+        adapter._usage_cache_time = time.monotonic()  # just now
+
+        result = await adapter._collect_usage_data()
+        assert result == adapter._usage_cache
+
+    @pytest.mark.asyncio
+    async def test_returns_stale_cache_on_fetch_failure(self):
+        adapter = _make_adapter(channel_access="open")
+        adapter._usage_cache = {"anthropic": {"five_hour": {"utilization": 50}}}
+        adapter._usage_cache_time = 0  # expired
+
+        # The library import will work but the actual API calls will fail
+        # (no tokens configured). Should fall back to cache.
+        result = await adapter._collect_usage_data()
+        # Either returns fresh data (unlikely in test) or stale cache
+        assert result is not None
+
+
+class TestStatusRefreshLoop:
+    @pytest.mark.asyncio
+    async def test_start_noop_without_status_channel(self):
+        adapter = _make_adapter(channel_access="open")
+        # No "status" in channels config
+        await adapter._start_status_loop()
+        assert adapter._status_refresh_task is None
+        assert adapter._status_refresh_signal is None
+
+    @pytest.mark.asyncio
+    async def test_start_creates_task_with_status_channel(self):
+        adapter = _make_adapter(channel_access="open", channels={"status": "7777"})
+        await adapter._start_status_loop()
+        assert adapter._status_refresh_task is not None
+        assert adapter._status_refresh_signal is not None
+
+        # Clean up
+        await adapter._stop_status_loop()
+        assert adapter._status_refresh_task is None
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_running_task(self):
+        adapter = _make_adapter(channel_access="open", channels={"status": "7777"})
+        await adapter._start_status_loop()
+        task = adapter._status_refresh_task
+        assert not task.done()
+
+        await adapter._stop_status_loop()
+        assert task.done() or task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_stop_noop_when_no_task(self):
+        adapter = _make_adapter(channel_access="open")
+        # Should not raise
+        await adapter._stop_status_loop()
+
+
+class TestDoStatusRefresh:
+    @pytest.mark.asyncio
+    async def test_full_flow_mocked(self):
+        """Integration test: _do_status_refresh collects data and calls display methods."""
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+
+        s = SessionRecord(session_id="beth-fox", agent_name="beth",
+                          agent_home="/tmp/nonexistent", pid=1)
+        adapter._daemon.state.presence.register(s)
+
+        # Track calls to display methods
+        status_calls = []
+        presence_calls = []
+
+        async def mock_update_status(channel_id, content, embeds):
+            status_calls.append((channel_id, content, embeds))
+
+        async def mock_update_presence(text):
+            presence_calls.append(text)
+
+        async def mock_usage():
+            return None
+
+        adapter._update_status_message = mock_update_status
+        adapter._update_presence = mock_update_presence
+        adapter._collect_usage_data = mock_usage
+
+        await adapter._do_status_refresh("7777")
+
+        assert len(status_calls) == 1
+        channel_id, content, embeds = status_calls[0]
+        assert channel_id == "7777"
+        assert "Agent Status" in content
+        assert len(embeds) >= 1
+        assert "beth-fox" in embeds[0].title
+
+        assert len(presence_calls) == 1
+        assert "beth-fox" in presence_calls[0] or "1 agent" in presence_calls[0]
+
+    @pytest.mark.asyncio
+    async def test_with_usage_data(self):
+        """Verify usage data appears in the status content."""
+        adapter = _make_adapter(channel_access="open")
+
+        status_calls = []
+
+        async def mock_update_status(channel_id, content, embeds):
+            status_calls.append((channel_id, content, embeds))
+
+        async def mock_update_presence(text):
+            pass
+
+        async def mock_usage():
+            return {"anthropic": {"five_hour": {"utilization": 42.0}}}
+
+        adapter._update_status_message = mock_update_status
+        adapter._update_presence = mock_update_presence
+        adapter._collect_usage_data = mock_usage
+
+        await adapter._do_status_refresh("7777")
+
+        _, content, _ = status_calls[0]
+        assert "Anthropic" in content
+        assert "42%" in content
+
+    @pytest.mark.asyncio
+    async def test_with_canonical(self, tmp_path):
+        """Verify canonical ID is passed through to embeds."""
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+
+        # Set up canonical file
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        (state_dir / "canonical").write_text("beth-fox")
+
+        s = SessionRecord(session_id="beth-fox", agent_name="beth",
+                          agent_home=str(tmp_path), pid=1)
+        adapter._daemon.state.presence.register(s)
+
+        status_calls = []
+
+        async def mock_update_status(channel_id, content, embeds):
+            status_calls.append((channel_id, content, embeds))
+
+        async def mock_update_presence(text):
+            pass
+
+        async def mock_usage():
+            return None
+
+        adapter._update_status_message = mock_update_status
+        adapter._update_presence = mock_update_presence
+        adapter._collect_usage_data = mock_usage
+
+        await adapter._do_status_refresh("7777")
+
+        _, _, embeds = status_calls[0]
+        # The canonical agent's embed should have the star
+        assert "\u2b50" in embeds[0].title
