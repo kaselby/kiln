@@ -343,6 +343,13 @@ class _DiscordClient(discord.Client):
         if message.attachments:
             attachment_paths = await self._download_attachments(message.attachments)
 
+        # Voice memo transcription
+        if getattr(message.flags, "voice", False) and attachment_paths:
+            content = await self._transcribe_voice(
+                attachment_paths[0], content,
+                message.author.display_name,
+            )
+
         inbound = InboundMessage(
             sender_id=str(message.author.id),
             sender_display_name=message.author.display_name,
@@ -385,6 +392,47 @@ class _DiscordClient(discord.Client):
             except Exception:
                 log.exception("Failed to download attachment %s", att.filename)
         return paths
+
+    async def _transcribe_voice(
+        self, audio_path: str, existing_content: str, sender_name: str,
+    ) -> str:
+        """Transcribe a voice memo attachment using Whisper STT.
+
+        Returns augmented content with the transcript prepended. Falls
+        back gracefully if the voice service is unavailable or fails.
+        """
+        creds_dir = self._adapter._discord_config.credentials_dir
+        if not creds_dir:
+            return self._voice_fallback(audio_path, existing_content, "no credentials configured")
+
+        try:
+            from voice.openai import WhisperSTT
+        except ImportError:
+            return self._voice_fallback(audio_path, existing_content, "transcription unavailable")
+
+        log.info("Transcribing voice message from %s: %s", sender_name, audio_path)
+        try:
+            stt = WhisperSTT(Path(creds_dir).expanduser())
+            transcript = await stt.transcribe(Path(audio_path))
+        except Exception:
+            log.exception("Voice transcription failed for %s", audio_path)
+            return self._voice_fallback(audio_path, existing_content, "transcription failed")
+
+        if transcript:
+            prefix = f"[Voice message transcript \u2014 may contain errors]\n{transcript}"
+            if existing_content.strip():
+                return f"{prefix}\n\n{existing_content}"
+            return prefix
+
+        return self._voice_fallback(audio_path, existing_content, "transcription returned empty")
+
+    @staticmethod
+    def _voice_fallback(audio_path: str, existing_content: str, reason: str) -> str:
+        """Build fallback content when voice transcription fails."""
+        fallback = f"[Voice message received \u2014 {reason}. Audio saved at: {audio_path}]"
+        if existing_content.strip():
+            return f"{fallback}\n\n{existing_content}"
+        return fallback
 
 
 class DiscordAdapter:

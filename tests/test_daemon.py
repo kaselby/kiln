@@ -2664,6 +2664,193 @@ class TestPlatformOps:
 
 
 # ---------------------------------------------------------------------------
+# Voice receive (inbound transcription)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestVoiceReceive:
+    """Tests for inbound voice memo transcription in _DiscordClient."""
+
+    async def test_voice_fallback_no_credentials(self):
+        """Voice message without credentials_dir produces fallback text."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        adapter = _make_adapter(
+            branch_threads={"beth-test": 5555},
+            channel_access="open",
+        )
+        # No credentials_dir set
+        client = _DiscordClient(adapter, asyncio.Event())
+
+        result = await client._transcribe_voice("/tmp/audio.ogg", "", "Kira")
+        assert "Voice message received" in result
+        assert "no credentials" in result
+        assert "/tmp/audio.ogg" in result
+
+    async def test_voice_fallback_import_failure(self, monkeypatch):
+        """Voice message with import failure produces fallback text."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        import builtins
+        real_import = builtins.__import__
+
+        def fail_voice_import(name, *args, **kwargs):
+            if "voice" in name:
+                raise ImportError("no voice")
+            return real_import(name, *args, **kwargs)
+
+        adapter = _make_adapter(channel_access="open")
+        adapter._discord_config.credentials_dir = "/fake/creds"
+        client = _DiscordClient(adapter, asyncio.Event())
+
+        monkeypatch.setattr(builtins, "__import__", fail_voice_import)
+        result = await client._transcribe_voice("/tmp/audio.ogg", "", "Kira")
+        assert "Voice message received" in result
+        assert "unavailable" in result
+
+    async def test_voice_fallback_preserves_existing_content(self):
+        """Fallback text should preserve any existing message content."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        adapter = _make_adapter(channel_access="open")
+        client = _DiscordClient(adapter, asyncio.Event())
+
+        result = await client._transcribe_voice("/tmp/audio.ogg", "some text", "Kira")
+        assert "Voice message received" in result
+        assert "some text" in result
+
+    async def test_voice_successful_transcript(self):
+        """Successful transcription should prepend transcript to content."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        from unittest.mock import AsyncMock, patch
+
+        adapter = _make_adapter(channel_access="open")
+        adapter._discord_config.credentials_dir = "/fake/creds"
+        client = _DiscordClient(adapter, asyncio.Event())
+
+        mock_stt = AsyncMock()
+        mock_stt.transcribe = AsyncMock(return_value="hello world transcribed")
+
+        with patch("kiln.daemon.adapters.discord.WhisperSTT", return_value=mock_stt, create=True):
+            # We need to patch at import time — use a different approach
+            import sys
+            voice_mod = type(sys)("voice")
+            voice_openai = type(sys)("voice.openai")
+            mock_class = type("WhisperSTT", (), {
+                "__init__": lambda self, path: None,
+                "transcribe": AsyncMock(return_value="hello world transcribed"),
+            })
+            voice_openai.WhisperSTT = mock_class
+            sys.modules["voice"] = voice_mod
+            sys.modules["voice.openai"] = voice_openai
+            try:
+                result = await client._transcribe_voice("/tmp/audio.ogg", "", "Kira")
+                assert "Voice message transcript" in result
+                assert "hello world transcribed" in result
+            finally:
+                del sys.modules["voice"]
+                del sys.modules["voice.openai"]
+
+    async def test_voice_transcript_with_existing_content(self):
+        """Transcript + existing content should both appear."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        from unittest.mock import AsyncMock
+        import sys
+
+        adapter = _make_adapter(channel_access="open")
+        adapter._discord_config.credentials_dir = "/fake/creds"
+        client = _DiscordClient(adapter, asyncio.Event())
+
+        voice_mod = type(sys)("voice")
+        voice_openai = type(sys)("voice.openai")
+        mock_class = type("WhisperSTT", (), {
+            "__init__": lambda self, path: None,
+            "transcribe": AsyncMock(return_value="transcribed text"),
+        })
+        voice_openai.WhisperSTT = mock_class
+        sys.modules["voice"] = voice_mod
+        sys.modules["voice.openai"] = voice_openai
+        try:
+            result = await client._transcribe_voice("/tmp/audio.ogg", "original text", "Kira")
+            assert "transcribed text" in result
+            assert "original text" in result
+        finally:
+            del sys.modules["voice"]
+            del sys.modules["voice.openai"]
+
+    async def test_voice_flag_triggers_transcription(self):
+        """on_message with voice flag should attempt transcription."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        from unittest.mock import AsyncMock
+
+        adapter = _make_adapter(
+            branch_threads={"beth-test": 5555},
+            channel_access="open",
+        )
+        client = _DiscordClient(adapter, asyncio.Event())
+        client._connection = type("FakeConn", (), {
+            "user": _mock_discord_user(999, "Bot"),
+        })()
+
+        # Mock attachment with save method
+        mock_att = type("MockAttachment", (), {
+            "filename": "voice-message.ogg",
+            "size": 1234,
+            "save": AsyncMock(),
+        })()
+
+        msg = _mock_discord_message(
+            author_id=111, author_name="Kira",
+            channel_id=5555, content="",
+            attachments=[mock_att],
+            voice=True,
+        )
+
+        # Patch _transcribe_voice to verify it's called
+        client._transcribe_voice = AsyncMock(return_value="[Voice transcript]")
+
+        await client.on_message(msg)
+
+        client._transcribe_voice.assert_called_once()
+        # Should have routed with the transcribed content
+        assert len(adapter._daemon.delivered) == 1
+        _, pm = adapter._daemon.delivered[0]
+        assert pm.content == "[Voice transcript]"
+
+    async def test_non_voice_skips_transcription(self):
+        """Regular messages with attachments should NOT attempt transcription."""
+        from kiln.daemon.adapters.discord import _DiscordClient
+        from unittest.mock import AsyncMock
+
+        adapter = _make_adapter(
+            branch_threads={"beth-test": 5555},
+            channel_access="open",
+        )
+        client = _DiscordClient(adapter, asyncio.Event())
+        client._connection = type("FakeConn", (), {
+            "user": _mock_discord_user(999, "Bot"),
+        })()
+
+        mock_att = type("MockAttachment", (), {
+            "filename": "image.png",
+            "size": 5000,
+            "save": AsyncMock(),
+        })()
+
+        msg = _mock_discord_message(
+            author_id=111, author_name="Kira",
+            channel_id=5555, content="check this out",
+            attachments=[mock_att],
+            voice=False,
+        )
+
+        client._transcribe_voice = AsyncMock()
+        await client.on_message(msg)
+
+        client._transcribe_voice.assert_not_called()
+        assert len(adapter._daemon.delivered) == 1
+        _, pm = adapter._daemon.delivered[0]
+        assert pm.content == "check this out"
+
+
+# ---------------------------------------------------------------------------
 # Slice D3d: Voice send
 # ---------------------------------------------------------------------------
 
@@ -2978,6 +3165,7 @@ def _mock_discord_message(
     content: str,
     is_dm: bool = False,
     attachments: list | None = None,
+    voice: bool = False,
 ):
     """Create a minimal mock discord.Message-like object."""
     import discord as _discord
@@ -3002,7 +3190,7 @@ def _mock_discord_message(
         "channel": channel,
         "content": content,
         "attachments": attachments or [],
-        "flags": type("Flags", (), {"voice": False})(),
+        "flags": type("Flags", (), {"voice": voice})(),
     })()
     return msg
 
