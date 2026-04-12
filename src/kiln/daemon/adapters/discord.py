@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -241,6 +242,9 @@ class DiscordAdapterConfig:
     dm_access: AccessPolicy = field(default_factory=lambda: AccessPolicy(mode="allowlist"))
     default_agent: str = ""
     session_prefix: str = ""
+    credentials_dir: str = ""      # path to credentials dir (for voice service)
+    voice_default: str = ""        # default TTS voice name
+    voice_instructions: str = ""   # default TTS voice instructions
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DiscordAdapterConfig:
@@ -251,6 +255,9 @@ class DiscordAdapterConfig:
             users={str(k): v for k, v in data.get("users", {}).items()},
             default_agent=data.get("default_agent", ""),
             session_prefix=data.get("session_prefix", ""),
+            credentials_dir=data.get("credentials_dir", ""),
+            voice_default=data.get("voice_default", ""),
+            voice_instructions=data.get("voice_instructions", ""),
         )
 
         # If no session_prefix set, derive from default_agent
@@ -1648,7 +1655,55 @@ class DiscordAdapter:
     # ------------------------------------------------------------------
 
     async def _op_voice_send(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D3")
+        """Send a TTS voice message to a Discord channel.
+
+        Args:
+            target: channel name (#general), user (@name), or numeric ID
+            text: text to synthesize as speech
+            voice: TTS voice name (optional, falls back to config default)
+            instructions: TTS voice instructions (optional, falls back to config)
+        """
+        target = args.get("target", "")
+        text = args.get("text", "")
+        if not target or not text:
+            return {"ok": False, "error": "target and text are required"}
+
+        creds_dir = self._discord_config.credentials_dir
+        if not creds_dir:
+            return {"ok": False, "error": "Voice not configured (no credentials_dir)"}
+        creds_path = Path(creds_dir).expanduser()
+
+        try:
+            from voice.openai import generate_speech
+            from voice.discord import send_voice_message
+        except ImportError:
+            return {"ok": False, "error": "Voice service not available (import failed)"}
+
+        channel = await self._resolve_target(target)
+        if not channel:
+            return {"ok": False, "error": f"Could not resolve target: {target}"}
+
+        voice = args.get("voice") or self._discord_config.voice_default or None
+        instructions = args.get("instructions") or self._discord_config.voice_instructions or None
+
+        audio_path = Path(tempfile.mktemp(suffix=".ogg"))
+        try:
+            tts_kwargs: dict[str, Any] = {"agent_home": creds_path}
+            if voice:
+                tts_kwargs["voice"] = voice
+            if instructions:
+                tts_kwargs["instructions"] = instructions
+
+            result = await generate_speech(text, audio_path, **tts_kwargs)
+            if not result:
+                return {"ok": False, "error": "TTS generation failed"}
+
+            ok = await send_voice_message(
+                str(channel.id), audio_path, agent_home=creds_path,
+            )
+            return {"ok": ok}
+        finally:
+            audio_path.unlink(missing_ok=True)
 
     async def _op_security_challenge(self, args: dict, ctx: RequestContext | None) -> dict:
         raise NotImplementedError("Slice D3")

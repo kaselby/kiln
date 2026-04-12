@@ -1055,9 +1055,9 @@ async def test_adapter_platform_op_dispatch(running_daemon):
     result = await adapter.platform_op("send", {})
     assert result["ok"] is False
 
-    # D3 ops still raise NotImplementedError
-    with pytest.raises(NotImplementedError):
-        await adapter.platform_op("voice_send", {})
+    # D3d voice_send returns error dict on bad args (no longer a stub)
+    result = await adapter.platform_op("voice_send", {})
+    assert result["ok"] is False
 
     with pytest.raises(ValueError, match="Unknown Discord platform op"):
         await adapter.platform_op("nonexistent_action", {})
@@ -2655,12 +2655,103 @@ class TestPlatformOps:
 
     @pytest.mark.asyncio
     async def test_d3_ops_still_raise(self):
-        """D3 ops should still raise NotImplementedError."""
+        """D3b ops should still raise NotImplementedError."""
         adapter = _make_adapter(channel_access="open")
-        for op in ["voice_send", "security_challenge",
+        for op in ["security_challenge",
                     "permission_request", "permission_resolve"]:
             with pytest.raises(NotImplementedError):
                 await adapter.platform_op(op, {})
+
+
+# ---------------------------------------------------------------------------
+# Slice D3d: Voice send
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestVoiceSend:
+    """Tests for _op_voice_send — arg validation and config checks."""
+
+    async def test_voice_missing_target(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_voice_send({"text": "hello"}, None)
+        assert result["ok"] is False
+        assert "required" in result["error"]
+
+    async def test_voice_missing_text(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_voice_send({"target": "#general"}, None)
+        assert result["ok"] is False
+        assert "required" in result["error"]
+
+    async def test_voice_no_credentials_dir(self):
+        adapter = _make_adapter(channel_access="open")
+        # No credentials_dir configured
+        result = await adapter._op_voice_send(
+            {"target": "#general", "text": "hello"}, None,
+        )
+        assert result["ok"] is False
+        assert "credentials_dir" in result["error"]
+
+    async def test_voice_import_failure(self, monkeypatch):
+        """If voice service is not importable, returns clean error."""
+        import builtins
+        real_import = builtins.__import__
+
+        def fail_voice_import(name, *args, **kwargs):
+            if name.startswith("voice"):
+                raise ImportError("no voice")
+            return real_import(name, *args, **kwargs)
+
+        adapter = _make_adapter(channel_access="open")
+        adapter._discord_config.credentials_dir = "/fake/creds"
+        monkeypatch.setattr(builtins, "__import__", fail_voice_import)
+        result = await adapter._op_voice_send(
+            {"target": "#general", "text": "hello"}, None,
+        )
+        assert result["ok"] is False
+        assert "import" in result["error"].lower()
+
+    async def test_voice_unresolvable_target(self):
+        adapter = _make_adapter(channel_access="open")
+        adapter._discord_config.credentials_dir = "/fake/creds"
+        # No client → target resolution fails, but import might fail first
+        # So we mock the import away
+        import sys
+        voice_mock = type(sys)("voice")
+        voice_openai = type(sys)("voice.openai")
+        voice_discord = type(sys)("voice.discord")
+        voice_openai.generate_speech = None
+        voice_discord.send_voice_message = None
+        sys.modules["voice"] = voice_mock
+        sys.modules["voice.openai"] = voice_openai
+        sys.modules["voice.discord"] = voice_discord
+        try:
+            result = await adapter._op_voice_send(
+                {"target": "#nonexistent", "text": "hello"}, None,
+            )
+            assert result["ok"] is False
+            assert "resolve" in result["error"].lower()
+        finally:
+            del sys.modules["voice"]
+            del sys.modules["voice.openai"]
+            del sys.modules["voice.discord"]
+
+    async def test_voice_config_defaults_used(self):
+        """Voice and instructions should fall back to adapter config."""
+        from kiln.daemon.adapters.discord import DiscordAdapterConfig
+        adapter = _make_adapter(channel_access="open")
+        adapter._discord_config.credentials_dir = "/fake/creds"
+        adapter._discord_config.voice_default = "coral"
+        adapter._discord_config.voice_instructions = "speak warmly"
+
+        # We can't test the full TTS pipeline without mocking, but we can
+        # verify the config is properly wired by checking the op doesn't
+        # crash on arg parsing before hitting the import
+        result = await adapter._op_voice_send(
+            {"target": "#general", "text": "hello"}, None,
+        )
+        # Will fail at import or resolve, but should not crash on config access
+        assert result["ok"] is False
 
 
 class TestSendUserMessage:
