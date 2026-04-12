@@ -87,6 +87,19 @@ class PlatformAdapter(Protocol):
         """
         ...
 
+    def validate_surface_ref(self, surface_ref: str) -> str:
+        """Validate and canonicalize a surface reference.
+
+        Called by the daemon when a session subscribes to a surface
+        owned by this adapter. The adapter should verify the ref is
+        well-formed and return the canonical form. Raise ValueError
+        if the ref is invalid or unrecognized.
+
+        The daemon extracts the adapter_id from the ref prefix
+        (everything before the first ':') and routes here.
+        """
+        ...
+
     def supports(self, feature: str) -> bool:
         """Check whether this adapter supports a named feature.
 

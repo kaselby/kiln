@@ -21,6 +21,7 @@ from kiln.daemon.state import (
     DaemonState,
     PresenceRegistry,
     SessionRecord,
+    SurfaceSubscriptionRegistry,
 )
 
 
@@ -1085,3 +1086,883 @@ async def test_adapter_state_in_daemon_dir(running_daemon, daemon_config):
     assert str(adapter._state_dir).startswith(str(daemon_config.state_dir))
 
     await adapter.stop()
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Slice B — Surface subscription registry
+# ---------------------------------------------------------------------------
+
+
+class TestSurfaceSubscriptionRegistry:
+    def test_subscribe_and_query(self):
+        reg = SurfaceSubscriptionRegistry()
+        count = reg.subscribe("discord:user:123", "beth-a")
+        assert count == 1
+        count = reg.subscribe("discord:user:123", "beth-b")
+        assert count == 2
+        assert reg.subscribers("discord:user:123") == {"beth-a", "beth-b"}
+
+    def test_unsubscribe(self):
+        reg = SurfaceSubscriptionRegistry()
+        reg.subscribe("discord:user:123", "beth-a")
+        reg.subscribe("discord:user:123", "beth-b")
+        reg.unsubscribe("discord:user:123", "beth-a")
+        assert reg.subscribers("discord:user:123") == {"beth-b"}
+
+    def test_unsubscribe_cleans_empty(self):
+        reg = SurfaceSubscriptionRegistry()
+        reg.subscribe("discord:user:123", "beth-a")
+        reg.unsubscribe("discord:user:123", "beth-a")
+        assert "discord:user:123" not in reg.all_surfaces()
+
+    def test_unsubscribe_all(self):
+        reg = SurfaceSubscriptionRegistry()
+        reg.subscribe("discord:user:123", "beth-a")
+        reg.subscribe("discord:channel:456", "beth-a")
+        reg.subscribe("discord:channel:456", "beth-b")
+        departed = reg.unsubscribe_all("beth-a")
+        assert set(departed) == {"discord:user:123", "discord:channel:456"}
+        assert reg.subscribers("discord:user:123") == set()
+        assert reg.subscribers("discord:channel:456") == {"beth-b"}
+
+    def test_surfaces_for(self):
+        reg = SurfaceSubscriptionRegistry()
+        reg.subscribe("discord:user:123", "beth-a")
+        reg.subscribe("discord:channel:456", "beth-a")
+        reg.subscribe("slack:channel:789", "beth-a")
+        assert set(reg.surfaces_for("beth-a")) == {
+            "discord:user:123", "discord:channel:456", "slack:channel:789",
+        }
+
+    def test_surfaces_for_adapter_filter(self):
+        reg = SurfaceSubscriptionRegistry()
+        reg.subscribe("discord:user:123", "beth-a")
+        reg.subscribe("discord:channel:456", "beth-a")
+        reg.subscribe("slack:channel:789", "beth-a")
+        discord_only = reg.surfaces_for("beth-a", adapter_id="discord")
+        assert set(discord_only) == {"discord:user:123", "discord:channel:456"}
+        slack_only = reg.surfaces_for("beth-a", adapter_id="slack")
+        assert slack_only == ["slack:channel:789"]
+
+    def test_subscriber_count(self):
+        reg = SurfaceSubscriptionRegistry()
+        assert reg.subscriber_count("discord:user:123") == 0
+        reg.subscribe("discord:user:123", "beth-a")
+        reg.subscribe("discord:user:123", "beth-b")
+        assert reg.subscriber_count("discord:user:123") == 2
+
+    def test_idempotent_subscribe(self):
+        reg = SurfaceSubscriptionRegistry()
+        reg.subscribe("discord:user:123", "beth-a")
+        count = reg.subscribe("discord:user:123", "beth-a")
+        assert count == 1  # set deduplicates
+
+
+class TestSurfaceProtocol:
+    def test_subscribe_surface_round_trip(self):
+        msg = proto.subscribe_surface("discord:user:116377")
+        line = msg.to_line()
+        parsed = proto.Message.from_line(line)
+        assert parsed.type == proto.SUBSCRIBE_SURFACE
+        assert parsed.data["surface_ref"] == "discord:user:116377"
+
+    def test_unsubscribe_surface_round_trip(self):
+        msg = proto.unsubscribe_surface("discord:user:116377")
+        line = msg.to_line()
+        parsed = proto.Message.from_line(line)
+        assert parsed.type == proto.UNSUBSCRIBE_SURFACE
+        assert parsed.data["surface_ref"] == "discord:user:116377"
+
+    def test_list_surface_subscriptions_round_trip(self):
+        msg = proto.list_surface_subscriptions()
+        parsed = proto.Message.from_line(msg.to_line())
+        assert parsed.type == proto.LIST_SURFACE_SUBSCRIPTIONS
+        assert "adapter_id" not in parsed.data
+
+    def test_list_surface_subscriptions_with_adapter(self):
+        msg = proto.list_surface_subscriptions(adapter_id="discord")
+        parsed = proto.Message.from_line(msg.to_line())
+        assert parsed.data["adapter_id"] == "discord"
+
+    def test_surface_event_types(self):
+        evt_sub = proto.event(proto.EVT_SURFACE_SUBSCRIBED,
+                              surface_ref="discord:user:123", session_id="beth-a")
+        assert evt_sub.event_type == proto.EVT_SURFACE_SUBSCRIBED
+        assert evt_sub.data["surface_ref"] == "discord:user:123"
+
+        evt_unsub = proto.event(proto.EVT_SURFACE_UNSUBSCRIBED,
+                                surface_ref="discord:user:123", session_id="beth-a")
+        assert evt_unsub.event_type == proto.EVT_SURFACE_UNSUBSCRIBED
+
+
+# ---------------------------------------------------------------------------
+# Surface subscription client/server integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_surface_subscribe_and_list(running_daemon, make_client):
+    """Surface subscribe via client, verify daemon state and list query."""
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-surf-1", 9001)
+
+    count = await client.subscribe_surface("discord:user:116377")
+    assert count == 1
+
+    # Local cache
+    assert "discord:user:116377" in client.surface_subscriptions
+
+    # Daemon-side truth
+    assert "beth-surf-1" in running_daemon.state.surfaces.subscribers("discord:user:116377")
+
+    # List query
+    subs = await client.list_surface_subscriptions()
+    assert len(subs) == 1
+    assert subs[0]["surface_ref"] == "discord:user:116377"
+    assert subs[0]["subscriber_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_surface_unsubscribe(running_daemon, make_client):
+    """Surface unsubscribe removes from daemon and local cache."""
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-surf-2", 9002)
+
+    await client.subscribe_surface("discord:user:123")
+    await client.unsubscribe_surface("discord:user:123")
+
+    assert "discord:user:123" not in client.surface_subscriptions
+    assert "beth-surf-2" not in running_daemon.state.surfaces.subscribers("discord:user:123")
+
+
+@pytest.mark.asyncio
+async def test_surface_list_filtered_by_adapter(running_daemon, make_client):
+    """list_surface_subscriptions with adapter_id filters by prefix."""
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-surf-3", 9003)
+
+    await client.subscribe_surface("discord:user:111")
+    await client.subscribe_surface("discord:channel:222")
+    await client.subscribe_surface("slack:channel:333")
+
+    discord_subs = await client.list_surface_subscriptions(adapter_id="discord")
+    assert len(discord_subs) == 2
+    refs = {s["surface_ref"] for s in discord_subs}
+    assert refs == {"discord:user:111", "discord:channel:222"}
+
+    slack_subs = await client.list_surface_subscriptions(adapter_id="slack")
+    assert len(slack_subs) == 1
+    assert slack_subs[0]["surface_ref"] == "slack:channel:333"
+
+
+@pytest.mark.asyncio
+async def test_surface_cleanup_on_disconnect(running_daemon, make_client):
+    """Surface subscriptions cleaned up when session disconnects."""
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-surf-cleanup", 9004)
+
+    await client.subscribe_surface("discord:user:999")
+    assert "beth-surf-cleanup" in running_daemon.state.surfaces.subscribers("discord:user:999")
+
+    await client.deregister()
+    await asyncio.sleep(0.1)
+
+    assert "beth-surf-cleanup" not in running_daemon.state.surfaces.subscribers("discord:user:999")
+    assert "discord:user:999" not in running_daemon.state.surfaces.all_surfaces()
+
+
+@pytest.mark.asyncio
+async def test_surface_multiple_subscribers(running_daemon, make_client):
+    """Multiple sessions can subscribe to the same surface."""
+    c1 = make_client()
+    c2 = make_client()
+    await c1.connect(auto_start=False)
+    await c2.connect(auto_start=False)
+    await c1.register("beth", "beth-multi-1", 9010)
+    await c2.register("beth", "beth-multi-2", 9011)
+
+    count1 = await c1.subscribe_surface("discord:user:116377")
+    assert count1 == 1
+    count2 = await c2.subscribe_surface("discord:user:116377")
+    assert count2 == 2
+
+    subs = running_daemon.state.surfaces.subscribers("discord:user:116377")
+    assert subs == {"beth-multi-1", "beth-multi-2"}
+
+
+@pytest.mark.asyncio
+async def test_surface_subscribe_requires_registration(running_daemon, make_client):
+    """Surface operations before register return errors."""
+    client = make_client()
+    await client.connect(auto_start=False)
+
+    with pytest.raises(DaemonError):
+        await client.subscribe_surface("discord:user:123")
+
+
+@pytest.mark.asyncio
+async def test_deliver_to_surface_subscribers(running_daemon, make_client, daemon_config):
+    """deliver_to_surface_subscribers delivers to all subscribed sessions."""
+    c1 = make_client()
+    c2 = make_client()
+    await c1.connect(auto_start=False)
+    await c2.connect(auto_start=False)
+    await c1.register("beth", "beth-deliv-1", 9020)
+    await c2.register("beth", "beth-deliv-2", 9021)
+
+    await c1.subscribe_surface("discord:user:116377")
+    await c2.subscribe_surface("discord:user:116377")
+
+    msg = proto.PlatformMessage(
+        sender_name="kira",
+        sender_platform_id="116377",
+        platform="discord",
+        content="hey both of you",
+        trust="full",
+        channel_desc="dm",
+        channel_id="dm-116377",
+    )
+
+    delivered = await running_daemon.deliver_to_surface_subscribers(
+        "discord:user:116377", msg,
+    )
+    assert delivered == 2
+
+    # Verify both inboxes got the message
+    for session_id in ["beth-deliv-1", "beth-deliv-2"]:
+        inbox = daemon_config.agents_registry.parent / "beth" / "inbox" / session_id
+        msgs = list(inbox.glob("msg-*.md"))
+        assert len(msgs) == 1
+        content = msgs[0].read_text()
+        assert "hey both of you" in content
+        assert "trust: full" in content
+
+
+@pytest.mark.asyncio
+async def test_deliver_to_surface_no_subscribers(running_daemon):
+    """deliver_to_surface_subscribers with no subscribers returns 0."""
+    msg = proto.PlatformMessage(
+        sender_name="someone",
+        sender_platform_id="000",
+        platform="test",
+        content="hello?",
+    )
+    delivered = await running_daemon.deliver_to_surface_subscribers(
+        "test:orphan:surface", msg,
+    )
+    assert delivered == 0
+
+
+@pytest.mark.asyncio
+async def test_surface_in_get_status(running_daemon, make_client):
+    """get_status includes surface count."""
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-stat-surf", 9030)
+    await client.subscribe_surface("discord:user:123")
+
+    status = await client.get_status()
+    assert status["surfaces"] == 1
+    assert status["sessions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Surface ref validation via adapter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_surface_validation_rejects_malformed(running_daemon, make_client):
+    """Adapter validation rejects malformed surface refs."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+    running_daemon.adapters["discord"] = adapter
+
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-val-1", 9040)
+
+    # Missing type/id structure
+    with pytest.raises(DaemonError, match="Invalid surface ref"):
+        await client.subscribe_surface("discord:garbage")
+
+    # Unknown surface type
+    with pytest.raises(DaemonError, match="Unknown Discord surface type"):
+        await client.subscribe_surface("discord:bogus:123")
+
+    # Empty surface ID
+    with pytest.raises(DaemonError, match="Surface ID cannot be empty"):
+        await client.subscribe_surface("discord:user:")
+
+    await adapter.stop()
+    running_daemon.adapters.pop("discord", None)
+
+
+@pytest.mark.asyncio
+async def test_surface_validation_accepts_valid(running_daemon, make_client):
+    """Adapter validation accepts well-formed surface refs."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+    running_daemon.adapters["discord"] = adapter
+
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-val-2", 9041)
+
+    count = await client.subscribe_surface("discord:user:116377")
+    assert count == 1
+    count = await client.subscribe_surface("discord:channel:999888")
+    assert count == 1
+
+    subs = await client.list_surface_subscriptions()
+    refs = {s["surface_ref"] for s in subs}
+    assert refs == {"discord:user:116377", "discord:channel:999888"}
+
+    await adapter.stop()
+    running_daemon.adapters.pop("discord", None)
+
+
+@pytest.mark.asyncio
+async def test_surface_no_adapter_still_stores(running_daemon, make_client):
+    """Surface refs for unknown platforms are stored without validation.
+
+    When no adapter is registered for the platform prefix, the daemon
+    stores the ref as-is. This allows refs to be seeded before adapters
+    start, or for platforms without adapters.
+    """
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-val-3", 9042)
+
+    # No "slack" adapter registered — should succeed without validation
+    count = await client.subscribe_surface("slack:channel:12345")
+    assert count == 1
+    assert "slack:channel:12345" in client.surface_subscriptions
+
+
+@pytest.mark.asyncio
+async def test_surface_client_caches_canonical_ref(running_daemon, make_client):
+    """Client caches the daemon-confirmed canonical ref, not caller input.
+
+    This test verifies the echo-back path: subscribe_surface sends a ref,
+    the daemon acks with a (potentially canonicalized) surface_ref, and
+    the client stores THAT in its local cache. Currently identity, but
+    this test ensures the plumbing works when canonicalization becomes
+    non-trivial.
+    """
+    client = make_client()
+    await client.connect(auto_start=False)
+    await client.register("beth", "beth-canon-1", 9050)
+
+    await client.subscribe_surface("discord:user:116377")
+    # Client should have the ref from the daemon ack, not its own input
+    assert "discord:user:116377" in client.surface_subscriptions
+
+    await client.unsubscribe_surface("discord:user:116377")
+    assert "discord:user:116377" not in client.surface_subscriptions
+
+
+# ---------------------------------------------------------------------------
+# Slice C1 — Event routing skeleton
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adapter_event_routing(running_daemon):
+    """Events reach the correct handler methods."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock, patch
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    # Track which handlers are called
+    calls = []
+
+    async def track(name):
+        def handler(self, event):
+            calls.append((name, event.data.get("event_type")))
+        return handler
+
+    # Patch each handler to record calls
+    with patch.object(adapter, "_on_channel_message", side_effect=lambda e: calls.append(("channel_message", e.data.get("event_type")))), \
+         patch.object(adapter, "_on_session_connected", side_effect=lambda e: calls.append(("session_connected", e.data.get("event_type")))), \
+         patch.object(adapter, "_on_session_disconnected", side_effect=lambda e: calls.append(("session_disconnected", e.data.get("event_type")))):
+
+        # Emit events through the daemon event bus
+        await running_daemon.events.emit(proto.event(
+            proto.EVT_MESSAGE_CHANNEL,
+            channel="test", sender="beth-a", summary="hi", body="hello",
+        ))
+        await running_daemon.events.emit(proto.event(
+            proto.EVT_SESSION_CONNECTED,
+            session_id="beth-test-1", agent_name="beth",
+        ))
+        await running_daemon.events.emit(proto.event(
+            proto.EVT_SESSION_DISCONNECTED,
+            session_id="beth-test-1", agent_name="beth",
+        ))
+
+        # Give event bus tasks time to complete
+        await asyncio.sleep(0.1)
+
+    assert ("channel_message", proto.EVT_MESSAGE_CHANNEL) in calls
+    assert ("session_connected", proto.EVT_SESSION_CONNECTED) in calls
+    assert ("session_disconnected", proto.EVT_SESSION_DISCONNECTED) in calls
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_adapter_echo_prevention(running_daemon):
+    """Channel messages from Discord are not echoed back."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    # Directly call _on_channel_message with a discord-sourced event
+    # If echo prevention works, it should return without doing anything.
+    # We can't easily test "nothing happened" in a stub, but we CAN verify
+    # it doesn't raise and that future bridge rendering code won't fire.
+    discord_event = proto.event(
+        proto.EVT_MESSAGE_CHANNEL,
+        channel="test", sender="discord-kira",
+        summary="hi", body="hello", source="discord",
+    )
+    # Should return silently (echo prevention)
+    await adapter._on_channel_message(discord_event)
+
+    # Non-discord event should pass through (currently just logs)
+    agent_event = proto.event(
+        proto.EVT_MESSAGE_CHANNEL,
+        channel="test", sender="beth-a",
+        summary="hi", body="hello",
+    )
+    await adapter._on_channel_message(agent_event)
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_adapter_ignores_unknown_events(running_daemon):
+    """Unknown event types are silently ignored, not errored."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    # Emit an event the adapter doesn't handle
+    await running_daemon.events.emit(proto.event(
+        "some.future.event", key="value",
+    ))
+    await asyncio.sleep(0.05)
+
+    # No error, adapter still running
+    assert adapter._daemon is running_daemon
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_adapter_event_handler_table_completeness():
+    """Verify the event handler table maps known event types."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+
+    expected_events = {
+        proto.EVT_MESSAGE_CHANNEL,
+        proto.EVT_SESSION_CONNECTED,
+        proto.EVT_SESSION_DISCONNECTED,
+        proto.EVT_SESSION_MODE_CHANGED,
+        proto.EVT_CHANNEL_SUBSCRIBED,
+        proto.EVT_CHANNEL_UNSUBSCRIBED,
+        proto.EVT_BRIDGE_BOUND,
+        proto.EVT_BRIDGE_UNBOUND,
+    }
+    assert set(DiscordAdapter._EVENT_HANDLERS.keys()) == expected_events
+
+
+# ---------------------------------------------------------------------------
+# Slice C2 — Outbound rendering + thread lifecycle
+# ---------------------------------------------------------------------------
+
+
+class TestSplitMessage:
+    def test_short_message_unchanged(self):
+        from kiln.daemon.adapters.discord import split_message
+        assert split_message("hello") == ["hello"]
+
+    def test_long_message_splits_at_paragraph(self):
+        from kiln.daemon.adapters.discord import split_message
+        para1 = "A" * 1000
+        para2 = "B" * 1000
+        text = para1 + "\n\n" + para2
+        chunks = split_message(text, max_len=1200)
+        assert len(chunks) == 2
+        assert "(1/2)" in chunks[0]
+        assert "(2/2)" in chunks[1]
+
+    def test_preserves_code_blocks(self):
+        from kiln.daemon.adapters.discord import split_message
+        code = "```python\n" + "x = 1\n" * 200 + "```"
+        before = "Some text before.\n\n"
+        text = before + code
+        if len(text) > 1900:
+            chunks = split_message(text, max_len=1900)
+            # Should not split inside the code block
+            for chunk in chunks:
+                if "```python" in chunk:
+                    assert "```" in chunk[chunk.index("```python") + 3:]
+
+
+class TestFormatOutbound:
+    def test_basic_format(self):
+        from kiln.daemon.adapters.discord import format_outbound
+        result = format_outbound("beth-a", "Hello world")
+        assert result == "**beth-a:** Hello world"
+
+    def test_empty_body_uses_summary(self):
+        from kiln.daemon.adapters.discord import format_outbound
+        result = format_outbound("beth-a", "", summary="Brief")
+        assert result == "**beth-a:** Brief"
+
+    def test_empty_returns_none(self):
+        from kiln.daemon.adapters.discord import format_outbound
+        assert format_outbound("beth-a", "", "") is None
+
+
+@pytest.mark.asyncio
+async def test_outbound_bridge_rendering(running_daemon, make_client):
+    """Channel message with a bridge triggers outbound formatting and post."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from kiln.daemon.state import BridgeRecord
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    # Register a bridge: channel "updates" → Discord thread "99999"
+    running_daemon.state.bridges.bind(BridgeRecord(
+        bridge_id="b1",
+        source_kind="channel",
+        source_name="updates",
+        adapter_id="discord",
+        platform_target="99999",
+    ))
+
+    # Mock the Discord API stub
+    adapter._discord_post_to_surface = AsyncMock()
+
+    # Simulate a channel message event
+    await adapter._on_channel_message(proto.event(
+        proto.EVT_MESSAGE_CHANNEL,
+        channel="updates", sender="beth-test-1",
+        summary="progress", body="Tests pass now",
+    ))
+
+    adapter._discord_post_to_surface.assert_called_once()
+    call_args = adapter._discord_post_to_surface.call_args
+    assert call_args[0][0] == "99999"  # surface_id
+    assert "**beth-test-1:**" in call_args[0][1]
+    assert "Tests pass now" in call_args[0][1]
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbound_no_bridge_no_post(running_daemon):
+    """Channel message without a bridge does not trigger a post."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+    adapter._discord_post_to_surface = AsyncMock()
+
+    await adapter._on_channel_message(proto.event(
+        proto.EVT_MESSAGE_CHANNEL,
+        channel="unbridged", sender="beth-a",
+        summary="hi", body="hello",
+    ))
+
+    adapter._discord_post_to_surface.assert_not_called()
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_outbound_echo_prevention_with_bridge(running_daemon):
+    """Discord-sourced messages are not echoed even when bridge exists."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from kiln.daemon.state import BridgeRecord
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    running_daemon.state.bridges.bind(BridgeRecord(
+        bridge_id="b1", source_kind="channel", source_name="chat",
+        adapter_id="discord", platform_target="88888",
+    ))
+
+    adapter._discord_post_to_surface = AsyncMock()
+
+    await adapter._on_channel_message(proto.event(
+        proto.EVT_MESSAGE_CHANNEL,
+        channel="chat", sender="discord-kira",
+        summary="hi", body="hello", source="discord",
+    ))
+
+    adapter._discord_post_to_surface.assert_not_called()
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_branch_thread_created_on_connect(running_daemon):
+    """Session connect creates a branch thread when #branches is configured."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter(config={"channels": {"branches": "123456"}})
+    await adapter.start(running_daemon)
+
+    adapter._discord_create_thread = AsyncMock(return_value=77777)
+
+    await adapter._on_session_connected(proto.event(
+        proto.EVT_SESSION_CONNECTED,
+        session_id="beth-test-1", agent_name="beth",
+    ))
+
+    adapter._discord_create_thread.assert_called_once_with(
+        "123456", "beth-test-1", "Session beth-test-1 (beth)",
+    )
+    assert adapter._branch_threads["beth-test-1"] == 77777
+    assert adapter._thread_to_session[77777] == "beth-test-1"
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_branch_thread_reused_on_reconnect(running_daemon):
+    """Existing branch thread is reused, not recreated."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter(config={"channels": {"branches": "123456"}})
+    await adapter.start(running_daemon)
+
+    # Pre-populate existing thread mapping
+    adapter._branch_threads["beth-test-1"] = 77777
+    adapter._rebuild_reverse_indexes()
+
+    adapter._discord_create_thread = AsyncMock()
+
+    await adapter._on_session_connected(proto.event(
+        proto.EVT_SESSION_CONNECTED,
+        session_id="beth-test-1", agent_name="beth",
+    ))
+
+    # Should NOT create a new thread
+    adapter._discord_create_thread.assert_not_called()
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_branch_thread_archived_on_disconnect(running_daemon):
+    """Session disconnect archives the branch thread."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    adapter._branch_threads["beth-test-1"] = 77777
+    adapter._discord_archive_thread = AsyncMock()
+
+    await adapter._on_session_disconnected(proto.event(
+        proto.EVT_SESSION_DISCONNECTED,
+        session_id="beth-test-1", agent_name="beth",
+    ))
+
+    adapter._discord_archive_thread.assert_called_once_with(77777)
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_branch_thread_no_branches_channel(running_daemon):
+    """No branch thread created when #branches isn't configured."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()  # no channels config
+    await adapter.start(running_daemon)
+
+    adapter._discord_create_thread = AsyncMock()
+
+    await adapter._on_session_connected(proto.event(
+        proto.EVT_SESSION_CONNECTED,
+        session_id="beth-test-1", agent_name="beth",
+    ))
+
+    adapter._discord_create_thread.assert_not_called()
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_channel_thread_created_on_bridge_bound(running_daemon):
+    """Bridge bound creates a channel thread when #channels is configured."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter(config={"channels": {"channels": "654321"}})
+    await adapter.start(running_daemon)
+
+    adapter._discord_create_thread = AsyncMock(return_value=88888)
+
+    await adapter._on_bridge_bound(proto.event(
+        proto.EVT_BRIDGE_BOUND,
+        adapter_id="discord", source_kind="channel",
+        source_name="updates", platform_target="654321",
+    ))
+
+    adapter._discord_create_thread.assert_called_once_with(
+        "654321", "updates", "Bridge: updates",
+    )
+    assert adapter._channel_threads["updates"] == 88888
+    assert adapter._thread_to_channel[88888] == "updates"
+
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_channel_thread_reused_on_rebind(running_daemon):
+    """Existing channel thread is not recreated on bridge rebind."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter(config={"channels": {"channels": "654321"}})
+    await adapter.start(running_daemon)
+
+    adapter._channel_threads["updates"] = 88888
+    adapter._rebuild_reverse_indexes()
+    adapter._discord_create_thread = AsyncMock()
+
+    await adapter._on_bridge_bound(proto.event(
+        proto.EVT_BRIDGE_BOUND,
+        adapter_id="discord", source_kind="channel",
+        source_name="updates", platform_target="654321",
+    ))
+
+    adapter._discord_create_thread.assert_not_called()
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_channel_thread_archived_on_bridge_unbound(running_daemon):
+    """Bridge unbound archives the channel thread."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()
+    await adapter.start(running_daemon)
+
+    adapter._channel_threads["updates"] = 88888
+    adapter._discord_archive_thread = AsyncMock()
+
+    await adapter._on_bridge_unbound(proto.event(
+        proto.EVT_BRIDGE_UNBOUND,
+        adapter_id="discord", source_kind="channel",
+        source_name="updates",
+    ))
+
+    adapter._discord_archive_thread.assert_called_once_with(88888)
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_channel_thread_ignores_non_discord_bridge(running_daemon):
+    """Bridge events for other adapters are ignored."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter(config={"channels": {"channels": "654321"}})
+    await adapter.start(running_daemon)
+    adapter._discord_create_thread = AsyncMock()
+
+    await adapter._on_bridge_bound(proto.event(
+        proto.EVT_BRIDGE_BOUND,
+        adapter_id="slack", source_kind="channel",
+        source_name="updates",
+    ))
+
+    adapter._discord_create_thread.assert_not_called()
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_channel_thread_no_channels_channel(running_daemon):
+    """No channel thread created when #channels isn't configured."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+    from unittest.mock import AsyncMock
+
+    adapter = DiscordAdapter()  # no channels config
+    await adapter.start(running_daemon)
+    adapter._discord_create_thread = AsyncMock()
+
+    await adapter._on_bridge_bound(proto.event(
+        proto.EVT_BRIDGE_BOUND,
+        adapter_id="discord", source_kind="channel",
+        source_name="updates",
+    ))
+
+    adapter._discord_create_thread.assert_not_called()
+    await adapter.stop()
+
+
+class TestDiscordValidateSurfaceRef:
+    """Unit tests for DiscordAdapter.validate_surface_ref."""
+
+    def test_valid_user(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        assert adapter.validate_surface_ref("discord:user:116377") == "discord:user:116377"
+
+    def test_valid_channel(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        assert adapter.validate_surface_ref("discord:channel:999") == "discord:channel:999"
+
+    def test_wrong_platform_prefix(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        with pytest.raises(ValueError, match="Invalid Discord surface ref"):
+            adapter.validate_surface_ref("slack:user:123")
+
+    def test_missing_parts(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        with pytest.raises(ValueError, match="Invalid Discord surface ref"):
+            adapter.validate_surface_ref("discord:user")
+
+    def test_unknown_type(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        with pytest.raises(ValueError, match="Unknown Discord surface type"):
+            adapter.validate_surface_ref("discord:guild:123")
+
+    def test_empty_id(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        with pytest.raises(ValueError, match="Surface ID cannot be empty"):
+            adapter.validate_surface_ref("discord:user:")

@@ -43,6 +43,7 @@ from .state import (
     DaemonState,
     PresenceRegistry,
     SessionRecord,
+    SurfaceSubscriptionRegistry,
 )
 
 log = logging.getLogger(__name__)
@@ -297,6 +298,9 @@ class ClientConnection:
             proto.SEND_DIRECT: self._handle_send_direct,
             proto.SEND_USER: self._handle_send_user,
             proto.LIST_SUBSCRIPTIONS: self._handle_list_subscriptions,
+            proto.SUBSCRIBE_SURFACE: self._handle_subscribe_surface,
+            proto.UNSUBSCRIBE_SURFACE: self._handle_unsubscribe_surface,
+            proto.LIST_SURFACE_SUBSCRIPTIONS: self._handle_list_surface_subscriptions,
             proto.LIST_SESSIONS: self._handle_list_sessions,
             proto.GET_STATUS: self._handle_get_status,
             proto.PLATFORM_OP: self._handle_platform_op,
@@ -521,6 +525,86 @@ class ClientConnection:
         channels = self.daemon.state.channels.channels_for(self.session_id)
         await self.send(proto.result(msg.ref, channels=channels))
 
+    async def _handle_subscribe_surface(self, msg: proto.Message) -> None:
+        surface_ref = msg.data.get("surface_ref", "")
+        if not surface_ref:
+            await self.send(proto.error(msg.ref, "subscribe_surface requires a surface_ref"))
+            return
+        if not self.session_id:
+            await self.send(proto.error(msg.ref, "must register before subscribing to surfaces"))
+            return
+
+        # Validate and canonicalize via the owning adapter
+        platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
+        adapter = self.daemon.adapters.get(platform) if platform else None
+        if adapter and hasattr(adapter, "validate_surface_ref"):
+            try:
+                surface_ref = adapter.validate_surface_ref(surface_ref)
+            except ValueError as e:
+                await self.send(proto.error(
+                    msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
+                ))
+                return
+
+        count = self.daemon.state.surfaces.subscribe(surface_ref, self.session_id)
+        await self.send(proto.ack(msg.ref, subscriber_count=count,
+                                  surface_ref=surface_ref))
+
+        await self.daemon.events.emit(proto.event(
+            proto.EVT_SURFACE_SUBSCRIBED,
+            surface_ref=surface_ref,
+            session_id=self.session_id,
+            subscriber_count=count,
+        ))
+
+    async def _handle_unsubscribe_surface(self, msg: proto.Message) -> None:
+        surface_ref = msg.data.get("surface_ref", "")
+        if not surface_ref:
+            await self.send(proto.error(msg.ref, "unsubscribe_surface requires a surface_ref"))
+            return
+        if not self.session_id:
+            await self.send(proto.error(msg.ref, "must register before unsubscribing from surfaces"))
+            return
+
+        # Canonicalize via adapter (same path as subscribe)
+        platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
+        adapter = self.daemon.adapters.get(platform) if platform else None
+        if adapter and hasattr(adapter, "validate_surface_ref"):
+            try:
+                surface_ref = adapter.validate_surface_ref(surface_ref)
+            except ValueError as e:
+                await self.send(proto.error(
+                    msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
+                ))
+                return
+
+        self.daemon.state.surfaces.unsubscribe(surface_ref, self.session_id)
+        await self.send(proto.ack(msg.ref, surface_ref=surface_ref))
+
+        await self.daemon.events.emit(proto.event(
+            proto.EVT_SURFACE_UNSUBSCRIBED,
+            surface_ref=surface_ref,
+            session_id=self.session_id,
+        ))
+
+    async def _handle_list_surface_subscriptions(self, msg: proto.Message) -> None:
+        if not self.session_id:
+            await self.send(proto.error(msg.ref, "must register first"))
+            return
+
+        adapter_id = msg.data.get("adapter_id")
+        surfaces = self.daemon.state.surfaces.surfaces_for(
+            self.session_id, adapter_id=adapter_id,
+        )
+        subscriptions = [
+            {
+                "surface_ref": ref,
+                "subscriber_count": self.daemon.state.surfaces.subscriber_count(ref),
+            }
+            for ref in surfaces
+        ]
+        await self.send(proto.result(msg.ref, subscriptions=subscriptions))
+
     async def _handle_list_sessions(self, msg: proto.Message) -> None:
         agent_filter = msg.data.get("agent")
         sessions = self.daemon.management.list_sessions(agent=agent_filter)
@@ -530,6 +614,7 @@ class ClientConnection:
         status = {
             "sessions": len(self.daemon.state.presence),
             "channels": len(self.daemon.state.channels.all_channels()),
+            "surfaces": len(self.daemon.state.surfaces.all_surfaces()),
             "bridges": len(self.daemon.state.bridges.all_bridges()),
             "adapters": list(self.daemon.adapters.keys()),
             "lockdown": self.daemon.config.lockdown_file.exists(),
@@ -583,6 +668,15 @@ class ClientConnection:
                 await self.daemon.events.emit(proto.event(
                     proto.EVT_CHANNEL_UNSUBSCRIBED,
                     channel=channel,
+                    session_id=self.session_id,
+                ))
+
+            # Remove from all surface subscriptions
+            departed_surfaces = self.daemon.state.surfaces.unsubscribe_all(self.session_id)
+            for surface_ref in departed_surfaces:
+                await self.daemon.events.emit(proto.event(
+                    proto.EVT_SURFACE_UNSUBSCRIBED,
+                    surface_ref=surface_ref,
                     session_id=self.session_id,
                 ))
 
@@ -741,6 +835,32 @@ class KilnDaemon:
         ))
 
         return path
+
+    async def deliver_to_surface_subscribers(
+        self,
+        surface_ref: str,
+        msg: PlatformMessage,
+    ) -> int:
+        """Deliver a platform message to all sessions subscribed to a surface.
+
+        Called by adapters when an inbound message arrives on a subscribed
+        surface. Looks up subscribers in the surface registry and delivers
+        to each via ``deliver_platform_message``.
+
+        Returns number of successful deliveries.
+        """
+        subscribers = self.state.surfaces.subscribers(surface_ref)
+        if not subscribers:
+            log.debug("No subscribers for surface %s", surface_ref)
+            return 0
+
+        delivered = 0
+        for session_id in subscribers:
+            path = await self.deliver_platform_message(session_id, msg)
+            if path is not None:
+                delivered += 1
+
+        return delivered
 
     # ------------------------------------------------------------------
     # Server lifecycle

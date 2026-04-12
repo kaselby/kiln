@@ -32,6 +32,9 @@ SEND_USER = "send_user"
 LIST_SUBSCRIPTIONS = "list_subscriptions"
 LIST_SESSIONS = "list_sessions"
 GET_STATUS = "get_status"
+SUBSCRIBE_SURFACE = "subscribe_surface"
+UNSUBSCRIBE_SURFACE = "unsubscribe_surface"
+LIST_SURFACE_SUBSCRIPTIONS = "list_surface_subscriptions"
 PLATFORM_OP = "platform_op"
 MGMT = "mgmt"
 
@@ -60,6 +63,8 @@ EVT_SESSION_DISCONNECTED = "session.disconnected"
 EVT_SESSION_STARTED = "session.started"
 EVT_SESSION_STOPPED = "session.stopped"
 EVT_SESSION_MODE_CHANGED = "session.mode_changed"
+EVT_SURFACE_SUBSCRIBED = "surface.subscribed"
+EVT_SURFACE_UNSUBSCRIBED = "surface.unsubscribed"
 EVT_BRIDGE_BOUND = "bridge.bound"
 EVT_BRIDGE_UNBOUND = "bridge.unbound"
 EVT_STATUS_UPDATED = "status.updated"
@@ -247,6 +252,32 @@ def platform_op(platform: str, action: str,
         "action": action,
         "args": args or {},
     })
+
+
+def subscribe_surface(surface_ref: str) -> Message:
+    """Subscribe to an adapter-defined surface (e.g. Discord DM, channel)."""
+    return Message(SUBSCRIBE_SURFACE, make_ref(), {
+        "surface_ref": surface_ref,
+    })
+
+
+def unsubscribe_surface(surface_ref: str) -> Message:
+    """Unsubscribe from an adapter-defined surface."""
+    return Message(UNSUBSCRIBE_SURFACE, make_ref(), {
+        "surface_ref": surface_ref,
+    })
+
+
+def list_surface_subscriptions(adapter_id: str | None = None) -> Message:
+    """Query this session's surface subscriptions.
+
+    If adapter_id is given, only return subscriptions for that adapter
+    (matched by surface_ref prefix before the first ':').
+    """
+    data: dict[str, Any] = {}
+    if adapter_id is not None:
+        data["adapter_id"] = adapter_id
+    return Message(LIST_SURFACE_SUBSCRIPTIONS, make_ref(), data)
 
 
 def mgmt(action: str, args: dict[str, Any] | None = None) -> Message:

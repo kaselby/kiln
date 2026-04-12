@@ -9,7 +9,7 @@ Modules:
     kiln.daemon.protocol    — wire message types and serialization
     kiln.daemon.config      — daemon configuration
     kiln.daemon.client      — agent-side daemon client
-    kiln.daemon.state       — in-memory registries (presence, channels, bridges)
+    kiln.daemon.state       — in-memory registries (presence, channels, surfaces, bridges)
     kiln.daemon.server      — Unix socket server and event bus
     kiln.daemon.management  — session lifecycle actions
 """

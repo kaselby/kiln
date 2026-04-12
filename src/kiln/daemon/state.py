@@ -140,6 +140,80 @@ class ChannelRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Surface subscriptions
+# ---------------------------------------------------------------------------
+
+class SurfaceSubscriptionRegistry:
+    """Tracks adapter-defined surface subscriptions.
+
+    Maps canonical surface refs (opaque strings like ``discord:user:116377...``)
+    to sets of subscribed session IDs. This is the daemon's many-to-many
+    ingress routing primitive for platform surfaces.
+
+    **Routing invariant:** Surface subscriptions, session bindings (one-to-one),
+    and bridges are distinct routing mechanisms. A given surface is expected to
+    participate in only one of them at a time. Overlapping configuration is
+    unsupported and should be treated as an invariant violation / adapter bug.
+    The daemon registry does not enforce this; enforcement belongs at the
+    adapter/configuration layer when routing constructs are created.
+
+    Session-scoped — cleaned up on disconnect via ``unsubscribe_all``.
+    """
+
+    def __init__(self) -> None:
+        self._surfaces: dict[str, set[str]] = {}  # surface_ref -> set of session_ids
+
+    def subscribe(self, surface_ref: str, session_id: str) -> int:
+        """Add a subscriber. Returns total subscriber count for this surface."""
+        if surface_ref not in self._surfaces:
+            self._surfaces[surface_ref] = set()
+        self._surfaces[surface_ref].add(session_id)
+        return len(self._surfaces[surface_ref])
+
+    def unsubscribe(self, surface_ref: str, session_id: str) -> None:
+        """Remove a subscriber. Cleans up empty surfaces."""
+        subs = self._surfaces.get(surface_ref)
+        if subs:
+            subs.discard(session_id)
+            if not subs:
+                del self._surfaces[surface_ref]
+
+    def unsubscribe_all(self, session_id: str) -> list[str]:
+        """Remove a session from all surfaces. Returns list of surfaces left."""
+        departed: list[str] = []
+        for ref in list(self._surfaces):
+            if session_id in self._surfaces[ref]:
+                self._surfaces[ref].discard(session_id)
+                departed.append(ref)
+                if not self._surfaces[ref]:
+                    del self._surfaces[ref]
+        return departed
+
+    def subscribers(self, surface_ref: str) -> set[str]:
+        """Get subscriber session_ids for a surface."""
+        return set(self._surfaces.get(surface_ref, set()))
+
+    def surfaces_for(self, session_id: str, adapter_id: str | None = None) -> list[str]:
+        """Get surfaces a session is subscribed to.
+
+        If adapter_id is given, filter to surfaces whose ref starts with
+        ``adapter_id:`` (the canonical prefix convention).
+        """
+        results = [ref for ref, subs in self._surfaces.items() if session_id in subs]
+        if adapter_id is not None:
+            prefix = f"{adapter_id}:"
+            results = [ref for ref in results if ref.startswith(prefix)]
+        return results
+
+    def all_surfaces(self) -> list[str]:
+        """List all surfaces with at least one subscriber."""
+        return list(self._surfaces.keys())
+
+    def subscriber_count(self, surface_ref: str) -> int:
+        return len(self._surfaces.get(surface_ref, set()))
+
+
+# ---------------------------------------------------------------------------
 # Bridge definitions
 # ---------------------------------------------------------------------------
 
@@ -204,4 +278,5 @@ class DaemonState:
     def __init__(self) -> None:
         self.presence = PresenceRegistry()
         self.channels = ChannelRegistry()
+        self.surfaces = SurfaceSubscriptionRegistry()
         self.bridges = BridgeRegistry()

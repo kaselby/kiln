@@ -13,13 +13,87 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import protocol as proto
 from ..protocol import PlatformMessage, RequestContext
 
 log = logging.getLogger(__name__)
+
+# Discord message length limit
+DISCORD_MAX_LENGTH = 2000
+SPLIT_MARGIN = 100  # room for (1/N) prefix
+
+
+# ---------------------------------------------------------------------------
+# Message formatting utilities
+# ---------------------------------------------------------------------------
+
+def split_message(text: str, max_len: int = DISCORD_MAX_LENGTH - SPLIT_MARGIN) -> list[str]:
+    """Split a long message into Discord-safe chunks.
+
+    Splits at paragraph boundaries, preserving code blocks.
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+
+        split_at = _find_split_point(remaining, max_len)
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+
+    if len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"({i+1}/{total})\n{chunk}" for i, chunk in enumerate(chunks)]
+
+    return chunks
+
+
+def _find_split_point(text: str, max_len: int) -> int:
+    """Find the best place to split text, respecting structure."""
+    # Don't split inside code blocks if possible
+    code_blocks = list(re.finditer(r"```.*?```", text[:max_len + 500], re.DOTALL))
+    for block in code_blocks:
+        if block.start() < max_len < block.end():
+            candidate = block.start()
+            if candidate > max_len // 2:
+                return candidate
+            break
+
+    search_region = text[:max_len]
+
+    # Try paragraph boundary
+    last_para = search_region.rfind("\n\n")
+    if last_para > max_len // 2:
+        return last_para + 1
+
+    # Try line boundary
+    last_line = search_region.rfind("\n")
+    if last_line > max_len // 2:
+        return last_line + 1
+
+    return max_len
+
+
+def format_outbound(sender: str, body: str, summary: str = "") -> str | None:
+    """Format a Kiln channel message for Discord display.
+
+    Returns None if there's nothing to display.
+    """
+    text = body or summary
+    if not text:
+        return None
+    return f"**{sender}:** {text}"
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +251,11 @@ class DiscordAdapter:
         self._thread_to_session: dict[int, str] = {}  # thread_id -> session_id
         self._thread_to_channel: dict[int, str] = {}  # thread_id -> channel_name
 
+    def _rebuild_reverse_indexes(self) -> None:
+        """Rebuild reverse lookup dicts from forward mappings."""
+        self._thread_to_session = {v: k for k, v in self._branch_threads.items()}
+        self._thread_to_channel = {v: k for k, v in self._channel_threads.items()}
+
     @property
     def adapter_id(self) -> str:
         return "discord"
@@ -264,6 +343,32 @@ class DiscordAdapter:
             raise ValueError(f"Unknown Discord platform op: '{action}'")
         return await handler(args, context)
 
+    def validate_surface_ref(self, surface_ref: str) -> str:
+        """Validate and canonicalize a Discord surface reference.
+
+        Accepted forms:
+            discord:user:<id>       — a user's DM surface
+            discord:channel:<id>    — a Discord channel/thread
+
+        Returns the canonical ref (unchanged if already canonical).
+        Raises ValueError for malformed or unrecognized refs.
+        """
+        parts = surface_ref.split(":", 2)
+        if len(parts) != 3 or parts[0] != "discord":
+            raise ValueError(
+                f"Invalid Discord surface ref: '{surface_ref}' "
+                f"(expected discord:<type>:<id>)"
+            )
+        surface_type, surface_id = parts[1], parts[2]
+        if surface_type not in ("user", "channel"):
+            raise ValueError(
+                f"Unknown Discord surface type: '{surface_type}' "
+                f"(expected 'user' or 'channel')"
+            )
+        if not surface_id:
+            raise ValueError("Surface ID cannot be empty")
+        return surface_ref  # already canonical
+
     def supports(self, feature: str) -> bool:
         return feature in {
             "send_message", "read_history", "voice",
@@ -275,17 +380,283 @@ class DiscordAdapter:
     # Event handling (daemon → adapter)
     # ------------------------------------------------------------------
 
-    async def _handle_event(self, event: Any) -> None:
-        """Handle daemon events for outbound rendering and lifecycle."""
-        etype = event.data.get("event_type") if hasattr(event, "data") else None
+    async def _handle_event(self, event: proto.Message) -> None:
+        """Route daemon events to the appropriate handler.
+
+        This is the adapter's main event intake. The daemon event bus
+        calls this for every event; the adapter classifies and routes
+        to specific handler methods. Each handler category corresponds
+        to a distinct concern — keep them separate.
+
+        Categories:
+            Channel outbound — Kiln channel messages rendered to Discord
+            Session lifecycle — branch thread create/archive
+            Channel lifecycle — channel thread create/archive
+            Bridge lifecycle — bridge-level bookkeeping
+            Status — status display updates
+        """
+        etype = event.data.get("event_type")
         if not etype:
             return
 
-        # Will be fully implemented in Slice C
-        # EVT_MESSAGE_CHANNEL → outbound bridge rendering
-        # EVT_SESSION_CONNECTED → branch thread creation
-        # EVT_SESSION_DISCONNECTED → branch thread archival
-        # EVT_CHANNEL_SUBSCRIBED → channel thread creation
+        handler_name = self._EVENT_HANDLERS.get(etype)
+        if handler_name:
+            handler = getattr(self, handler_name)
+            await handler(event)
+
+    # --- Channel outbound (Kiln channel → Discord) ---
+
+    async def _on_channel_message(self, event: proto.Message) -> None:
+        """A message was published to a Kiln channel.
+
+        If the channel has a bridge to Discord, format and send the
+        message to the bridged Discord surface. Skip messages that
+        originated from Discord (echo prevention).
+        """
+        # Echo prevention — don't send Discord-originated messages back
+        if event.data.get("source") == "discord":
+            return
+
+        channel = event.data.get("channel", "")
+        if not channel or not self._daemon:
+            return
+
+        # Look up bridge for this channel
+        bridges = self._daemon.state.bridges.by_source("channel", channel)
+        discord_bridges = [b for b in bridges if b.adapter_id == "discord"]
+        if not discord_bridges:
+            return
+
+        sender = event.data.get("sender", "unknown")
+        body = event.data.get("body", "")
+        summary = event.data.get("summary", "")
+
+        formatted = format_outbound(sender, body, summary)
+        if not formatted:
+            return
+
+        # Send to each bridged Discord surface
+        for bridge in discord_bridges:
+            chunks = split_message(formatted)
+            for chunk in chunks:
+                try:
+                    await self._discord_post_to_surface(
+                        bridge.platform_target, chunk,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to post to bridge target %s for channel '%s'",
+                        bridge.platform_target, channel,
+                    )
+
+    # --- Session lifecycle (branch threads) ---
+
+    async def _on_session_connected(self, event: proto.Message) -> None:
+        """A session registered with the daemon.
+
+        Create or reuse a branch thread in #branches for this session.
+        Branch threads are one-to-one session bindings (adapter-local state),
+        distinct from surface subscriptions and bridges.
+        """
+        session_id = event.data.get("session_id", "")
+        agent_name = event.data.get("agent_name", "")
+        if not session_id:
+            return
+
+        # Check if this session already has a branch thread (e.g. from resume)
+        if session_id in self._branch_threads:
+            log.debug(
+                "Session %s already has branch thread %d",
+                session_id, self._branch_threads[session_id],
+            )
+            return
+
+        # Create a new branch thread
+        branches_channel = self._discord_config.channels.get("branches")
+        if not branches_channel:
+            log.debug("No #branches channel configured, skipping branch thread for %s", session_id)
+            return
+
+        try:
+            thread_id = await self._discord_create_thread(
+                branches_channel, session_id,
+                f"Session {session_id} ({agent_name})",
+            )
+            if thread_id:
+                self._branch_threads[session_id] = thread_id
+                self._rebuild_reverse_indexes()
+                self._persist_state()
+                log.info("Created branch thread %d for %s", thread_id, session_id)
+        except Exception:
+            log.exception("Failed to create branch thread for %s", session_id)
+
+    async def _on_session_disconnected(self, event: proto.Message) -> None:
+        """A session disconnected from the daemon.
+
+        Archive the branch thread. The thread mapping is kept in
+        _branch_threads so the thread can be reused on resume.
+        """
+        session_id = event.data.get("session_id", "")
+        if not session_id:
+            return
+
+        thread_id = self._branch_threads.get(session_id)
+        if not thread_id:
+            return
+
+        try:
+            await self._discord_archive_thread(thread_id)
+            log.info("Archived branch thread %d for %s", thread_id, session_id)
+        except Exception:
+            log.exception("Failed to archive branch thread for %s", session_id)
+
+    async def _on_session_mode_changed(self, event: proto.Message) -> None:
+        """A session's mode was changed.
+
+        Update the branch thread or status display.
+        """
+        # Slice C2: update branch thread name/topic, status embed
+        log.debug("Session mode changed: %s", event.data)
+
+    # --- Channel lifecycle (channel threads) ---
+
+    async def _on_channel_subscribed(self, event: proto.Message) -> None:
+        """A session subscribed to a Kiln channel.
+
+        Channel thread lifecycle is tied to bridges (bridge_bound/unbound),
+        not individual subscriptions. This handler is a hook for future
+        status updates or notifications.
+        """
+        log.debug(
+            "Channel subscribed: %s by %s",
+            event.data.get("channel"), event.data.get("session_id"),
+        )
+
+    async def _on_channel_unsubscribed(self, event: proto.Message) -> None:
+        """A session unsubscribed from a Kiln channel."""
+        log.debug(
+            "Channel unsubscribed: %s by %s",
+            event.data.get("channel"), event.data.get("session_id"),
+        )
+
+    # --- Bridge lifecycle (channel threads) ---
+
+    async def _on_bridge_bound(self, event: proto.Message) -> None:
+        """A bridge was created between a Kiln source and Discord.
+
+        Creates a channel thread in #channels for the bridged Kiln channel.
+        Channel threads are keyed by Kiln channel name in _channel_threads.
+        """
+        adapter_id = event.data.get("adapter_id", "")
+        if adapter_id != "discord":
+            return
+
+        source_kind = event.data.get("source_kind", "")
+        source_name = event.data.get("source_name", "")
+        if source_kind != "channel" or not source_name:
+            return
+
+        # Check if thread already exists for this channel
+        if source_name in self._channel_threads:
+            log.debug("Channel thread already exists for '%s'", source_name)
+            return
+
+        channels_channel = self._discord_config.channels.get("channels")
+        if not channels_channel:
+            log.debug("No #channels channel configured, skipping thread for '%s'", source_name)
+            return
+
+        try:
+            thread_id = await self._discord_create_thread(
+                channels_channel, source_name,
+                f"Bridge: {source_name}",
+            )
+            if thread_id:
+                self._channel_threads[source_name] = thread_id
+                self._rebuild_reverse_indexes()
+                self._persist_state()
+                log.info("Created channel thread %d for bridge '%s'", thread_id, source_name)
+        except Exception:
+            log.exception("Failed to create channel thread for '%s'", source_name)
+
+    async def _on_bridge_unbound(self, event: proto.Message) -> None:
+        """A bridge was removed.
+
+        Archives the channel thread if one exists.
+        """
+        adapter_id = event.data.get("adapter_id", "")
+        if adapter_id != "discord":
+            return
+
+        source_name = event.data.get("source_name", "")
+        thread_id = self._channel_threads.get(source_name)
+        if not thread_id:
+            return
+
+        try:
+            await self._discord_archive_thread(thread_id)
+            log.info("Archived channel thread %d for bridge '%s'", thread_id, source_name)
+        except Exception:
+            log.exception("Failed to archive channel thread for '%s'", source_name)
+
+    # Event type → handler method name mapping.
+    # Uses method name strings so getattr(self, name) picks up instance
+    # overrides/patches, making event routing testable.
+    _EVENT_HANDLERS: dict[str, str] = {
+        proto.EVT_MESSAGE_CHANNEL: "_on_channel_message",
+        proto.EVT_SESSION_CONNECTED: "_on_session_connected",
+        proto.EVT_SESSION_DISCONNECTED: "_on_session_disconnected",
+        proto.EVT_SESSION_MODE_CHANGED: "_on_session_mode_changed",
+        proto.EVT_CHANNEL_SUBSCRIBED: "_on_channel_subscribed",
+        proto.EVT_CHANNEL_UNSUBSCRIBED: "_on_channel_unsubscribed",
+        proto.EVT_BRIDGE_BOUND: "_on_bridge_bound",
+        proto.EVT_BRIDGE_UNBOUND: "_on_bridge_unbound",
+    }
+
+    # ------------------------------------------------------------------
+    # State persistence helper
+    # ------------------------------------------------------------------
+
+    def _persist_state(self) -> None:
+        """Persist adapter state to disk (branch/channel thread mappings)."""
+        if self._state_dir:
+            _save_json(self._state_dir / "branch-threads.json", self._branch_threads)
+            _save_json(self._state_dir / "channel-threads.json", self._channel_threads)
+
+    # ------------------------------------------------------------------
+    # Discord API stubs — thin async boundary for actual Discord calls
+    #
+    # These are the only methods that need a live discord.py client.
+    # Everything above is logic/routing that can be tested without one.
+    # Wired to the real Discord client in a later slice.
+    # ------------------------------------------------------------------
+
+    async def _discord_post_to_surface(self, surface_id: str, content: str) -> None:
+        """Post a message to a Discord surface (channel or thread).
+
+        Args:
+            surface_id: Discord channel/thread ID as string.
+            content: Pre-formatted message text (already split if needed).
+        """
+        # Wired to discord.py client in Slice D
+        log.debug("_discord_post_to_surface(%s, %d chars) — not yet wired",
+                   surface_id, len(content))
+
+    async def _discord_create_thread(
+        self, channel_id: str, name: str, initial_message: str = "",
+    ) -> int | None:
+        """Create a thread in a Discord channel.
+
+        Returns the thread ID, or None if creation failed.
+        """
+        # Wired to discord.py client in Slice D
+        log.debug("_discord_create_thread(%s, %s) — not yet wired", channel_id, name)
+        return None
+
+    async def _discord_archive_thread(self, thread_id: int) -> None:
+        """Archive a Discord thread."""
+        # Wired to discord.py client in Slice D
+        log.debug("_discord_archive_thread(%d) — not yet wired", thread_id)
 
     # ------------------------------------------------------------------
     # Platform op stubs (Slice B-D)

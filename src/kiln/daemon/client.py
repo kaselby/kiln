@@ -68,9 +68,10 @@ class DaemonClient:
         self._writer: asyncio.StreamWriter | None = None
         self._connected = False
 
-        # Local subscription cache — updated on successful subscribe/unsubscribe.
+        # Local subscription caches — updated on successful subscribe/unsubscribe.
         # Sync-readable for harness snapshot without async roundtrip.
         self._subscriptions: set[str] = set()
+        self._surface_subscriptions: set[str] = set()
 
         # Pending response futures, keyed by ref
         self._pending: dict[str, asyncio.Future[proto.Message]] = {}
@@ -94,6 +95,11 @@ class DaemonClient:
     def subscriptions(self) -> list[str]:
         """Current channel subscriptions (sync local read)."""
         return sorted(self._subscriptions)
+
+    @property
+    def surface_subscriptions(self) -> list[str]:
+        """Current surface subscriptions (sync local read)."""
+        return sorted(self._surface_subscriptions)
 
     async def connect(self, auto_start: bool = True) -> None:
         """Connect to the daemon. Auto-starts if socket is missing.
@@ -181,6 +187,7 @@ class DaemonClient:
                 pass  # best-effort on shutdown
         await self.disconnect()
         self._subscriptions.clear()
+        self._surface_subscriptions.clear()
         log.info("Deregistered from daemon")
 
     # ----- Channel operations -----
@@ -219,6 +226,48 @@ class DaemonClient:
         msg = proto.send_user(to, summary, body)
         resp = await self._request(msg)
         return resp.data.get("message", "sent")
+
+    # ----- Surface subscriptions -----
+
+    async def subscribe_surface(self, surface_ref: str) -> int:
+        """Subscribe to an adapter-defined surface. Returns subscriber count.
+
+        The daemon may canonicalize the ref via the owning adapter.
+        The local cache stores the daemon-confirmed canonical ref,
+        not the caller-provided input.
+        """
+        msg = proto.subscribe_surface(surface_ref)
+        resp = await self._request(msg)
+        canonical = resp.data.get("surface_ref", surface_ref)
+        self._surface_subscriptions.add(canonical)
+        return resp.data.get("subscriber_count", 0)
+
+    async def unsubscribe_surface(self, surface_ref: str) -> None:
+        """Unsubscribe from an adapter-defined surface.
+
+        The daemon canonicalizes the ref before mutation, same as subscribe.
+        The local cache removes the daemon-confirmed canonical ref.
+        """
+        msg = proto.unsubscribe_surface(surface_ref)
+        resp = await self._request(msg)
+        canonical = resp.data.get("surface_ref", surface_ref)
+        self._surface_subscriptions.discard(canonical)
+
+    async def list_surface_subscriptions(
+        self, adapter_id: str | None = None,
+    ) -> list[dict]:
+        """Query this session's surface subscriptions from daemon.
+
+        If adapter_id is given, only returns subscriptions for that adapter.
+        Syncs local cache with daemon truth.
+        """
+        msg = proto.list_surface_subscriptions(adapter_id)
+        resp = await self._request(msg)
+        subs = resp.data.get("subscriptions", [])
+        # Sync local cache — if filtered by adapter, only update those
+        if adapter_id is None:
+            self._surface_subscriptions = {s["surface_ref"] for s in subs}
+        return subs
 
     # ----- Queries -----
 
