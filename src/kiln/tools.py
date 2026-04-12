@@ -647,17 +647,6 @@ def _read_text(
     limit: int | None = None,
 ) -> dict:
     """Read a text file in cat -n format."""
-    # Dedup: if the file hasn't changed since last read, return a stub
-    entry = file_state.get(normalized)
-    if entry is not None:
-        try:
-            current_mtime = os.path.getmtime(normalized)
-        except OSError:
-            current_mtime = -1
-        if current_mtime == entry["timestamp"]:
-            file_state.record_read(normalized, partial=False)
-            return _ok(f"File {file_path} has not changed since last read.")
-
     try:
         raw = Path(normalized).read_text(errors="replace")
     except OSError as e:
@@ -1116,9 +1105,7 @@ READ_DESC = (
     "with their outputs, combining code, text, and visualizations.\n"
     "- This tool can read PDF files (.pdf). PDF content is injected as a "
     "native document for full reading. Use the `pages` parameter to read "
-    "specific pages (e.g., '1-3', '5', '10-') to save context on large PDFs.\n"
-    "- Re-reading an unchanged file returns a short stub instead of the "
-    "full contents."
+    "specific pages (e.g., '1-3', '5', '10-') to save context on large PDFs."
 )
 READ_SCHEMA = {
     "type": "object",
