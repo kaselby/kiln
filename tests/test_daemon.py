@@ -1051,8 +1051,13 @@ async def test_adapter_platform_op_dispatch(running_daemon):
     adapter = DiscordAdapter()
     await adapter.start(running_daemon)
 
+    # D2 ops return error dicts on bad args instead of raising
+    result = await adapter.platform_op("send", {})
+    assert result["ok"] is False
+
+    # D3 ops still raise NotImplementedError
     with pytest.raises(NotImplementedError):
-        await adapter.platform_op("send", {})
+        await adapter.platform_op("voice_send", {})
 
     with pytest.raises(ValueError, match="Unknown Discord platform op"):
         await adapter.platform_op("nonexistent_action", {})
@@ -2507,6 +2512,182 @@ class TestClientExtraction:
         ref, pm = adapter._daemon.surface_delivered[0]
         assert ref == "discord:user:111"
         assert pm.content == "hey beth"
+
+
+# ---------------------------------------------------------------------------
+# Slice D2: Platform ops
+# ---------------------------------------------------------------------------
+
+class TestPlatformOps:
+    """Tests for D2 platform op handlers — arg validation and error paths."""
+
+    @pytest.mark.asyncio
+    async def test_op_send_missing_args(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_send({}, None)
+        assert result["ok"] is False
+        assert "required" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_op_send_missing_content(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_send({"target": "#general"}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_send_unresolvable_target(self):
+        adapter = _make_adapter(channel_access="open")
+        # No client, so any target fails to resolve
+        result = await adapter._op_send(
+            {"target": "#nonexistent", "content": "hello"}, None,
+        )
+        assert result["ok"] is False
+        assert "resolve" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_op_read_history_missing_target(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_read_history({}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_read_history_limit_capped(self):
+        adapter = _make_adapter(channel_access="open")
+        # Even with absurd limit, should not crash — just fail on resolve
+        result = await adapter._op_read_history(
+            {"target": "12345", "limit": 9999}, None,
+        )
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_branch_post_missing_args(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_branch_post({}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_branch_post_no_thread(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_branch_post(
+            {"session_id": "beth-nonexistent", "content": "hello"}, None,
+        )
+        assert result["ok"] is False
+        assert "No branch thread" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_op_thread_create_missing_args(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_thread_create({}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_thread_archive_missing_args(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_thread_archive({}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_list_channels_no_client(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_list_channels({}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_delete_missing_args(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_delete({}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_op_delete_needs_both_args(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_delete({"target": "#general"}, None)
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_d3_ops_still_raise(self):
+        """D3 ops should still raise NotImplementedError."""
+        adapter = _make_adapter(channel_access="open")
+        for op in ["voice_send", "security_challenge",
+                    "permission_request", "permission_resolve"]:
+            with pytest.raises(NotImplementedError):
+                await adapter.platform_op(op, {})
+
+
+class TestSendUserMessage:
+    """Tests for send_user_message."""
+
+    @pytest.mark.asyncio
+    async def test_empty_body_raises(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter({})
+        adapter._daemon = _MockDaemon()
+        with pytest.raises(ValueError, match="empty"):
+            await adapter.send_user_message("kira", "", "")
+
+    @pytest.mark.asyncio
+    async def test_no_client_raises(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter({})
+        adapter._daemon = _MockDaemon()
+        with pytest.raises(ValueError, match="client"):
+            await adapter.send_user_message("kira", "hi", "hello")
+
+    @pytest.mark.asyncio
+    async def test_no_platform_id_raises(self):
+        """User exists in daemon config but has no discord platform ID."""
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        from kiln.daemon.config import UserConfig
+        adapter = DiscordAdapter({})
+        adapter._daemon = _MockDaemon()
+        adapter._daemon.config = type("C", (), {
+            "users": {"kira": UserConfig(name="kira", platforms={})},
+        })()
+        adapter._client = True  # fake "connected"
+        with pytest.raises(ValueError, match="platform ID"):
+            await adapter.send_user_message("kira", "hi", "hello")
+
+    def test_resolve_user_platform_id_found(self):
+        """Should look up Discord ID from daemon config, not adapter trust map."""
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        from kiln.daemon.config import UserConfig
+        adapter = DiscordAdapter({})
+        adapter._daemon = type("D", (), {
+            "config": type("C", (), {
+                "users": {"kira": UserConfig(
+                    name="kira",
+                    platforms={"discord": "123456"},
+                )},
+            })(),
+        })()
+        assert adapter._resolve_user_platform_id("kira") == "123456"
+
+    def test_resolve_user_platform_id_not_found(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter({})
+        adapter._daemon = type("D", (), {
+            "config": type("C", (), {"users": {}})(),
+        })()
+        assert adapter._resolve_user_platform_id("nobody") is None
+
+
+class TestResolveTarget:
+    """Tests for _resolve_target without a live client."""
+
+    @pytest.mark.asyncio
+    async def test_no_client_returns_none(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter({})
+        result = await adapter._resolve_target("#general")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_named_channel_from_config(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        # Even with a channel in config, no client means None
+        adapter = DiscordAdapter({"channels": {"general": "12345"}})
+        result = await adapter._resolve_target("#general")
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

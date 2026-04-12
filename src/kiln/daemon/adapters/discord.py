@@ -568,10 +568,48 @@ class DiscordAdapter:
         """Send a message to a Discord user.
 
         Routed here by the daemon when an agent calls send_user for a
-        user whose default platform is Discord.
+        user whose default platform is Discord. The daemon has already
+        resolved the user name to this adapter — we look up their
+        Discord ID from the daemon's user config, not the adapter's
+        inbound trust registry.
         """
-        # Will be implemented in Slice D (platform ops)
-        raise NotImplementedError("send_user_message not yet implemented")
+        text = body or summary
+        if not text:
+            raise ValueError("Cannot send empty message")
+
+        if not self._client:
+            raise ValueError("No Discord client connected")
+
+        # Resolve Discord user ID from daemon config
+        discord_id = self._resolve_user_platform_id(user)
+        if not discord_id:
+            raise ValueError(
+                f"No Discord platform ID for user '{user}' in daemon config"
+            )
+
+        try:
+            discord_user = await self._client.fetch_user(int(discord_id))
+            dm_channel = await discord_user.create_dm()
+        except (discord.NotFound, discord.HTTPException) as e:
+            raise ValueError(f"Could not open DM with Discord user {discord_id}: {e}")
+
+        chunks = split_message(text)
+        for chunk in chunks:
+            await dm_channel.send(chunk)
+        return f"Sent {len(chunks)} message(s) to {user}"
+
+    def _resolve_user_platform_id(self, user_name: str) -> str | None:
+        """Look up a daemon user's Discord ID from daemon config.
+
+        This is the outbound resolution path — uses the daemon's
+        external user registry, not the adapter's inbound trust map.
+        """
+        if not self._daemon:
+            return None
+        user_config = self._daemon.config.users.get(user_name)
+        if not user_config:
+            return None
+        return user_config.platforms.get("discord")
 
     async def platform_op(
         self,
@@ -1066,6 +1104,77 @@ class DiscordAdapter:
             _save_json(self._state_dir / "channel-threads.json", self._channel_threads)
 
     # ------------------------------------------------------------------
+    # Target resolution
+    # ------------------------------------------------------------------
+
+    async def _resolve_target(self, target: str) -> discord.abc.Messageable | None:
+        """Resolve a target string to a Discord messageable.
+
+        Accepted target forms:
+            #name       — named channel from config
+            @name       — user by name (from config users registry)
+            @12345      — user by Discord ID
+            12345       — channel/thread by Discord ID
+
+        Returns None if the target can't be resolved or no client.
+        """
+        if not self._client:
+            return None
+
+        # Named channel from config
+        clean = target.lstrip("#")
+        if clean != target and clean in self._discord_config.channels:
+            channel_id = int(self._discord_config.channels[clean])
+            ch = self._client.get_channel(channel_id)
+            if ch:
+                return ch
+            try:
+                return await self._client.fetch_channel(channel_id)
+            except discord.NotFound:
+                return None
+
+        # User target (@name or @id)
+        if target.startswith("@"):
+            user_ref = target[1:]
+            user_id: str | None = None
+            if user_ref.isdigit():
+                user_id = user_ref
+            else:
+                # Reverse lookup by name in users registry
+                for uid, entry in self._discord_config.users.items():
+                    if entry.get("name", "").lower() == user_ref.lower():
+                        user_id = uid
+                        break
+            if user_id:
+                try:
+                    user = await self._client.fetch_user(int(user_id))
+                    if user:
+                        return await user.create_dm()
+                except discord.NotFound:
+                    return None
+            return None
+
+        # Numeric channel/thread ID
+        if target.isdigit():
+            ch = self._client.get_channel(int(target))
+            if ch:
+                return ch
+            try:
+                return await self._client.fetch_channel(int(target))
+            except discord.NotFound:
+                return None
+
+        # Fall back to guild channel name match
+        if self._discord_config.guild_id:
+            guild = self._client.get_guild(int(self._discord_config.guild_id))
+            if guild:
+                for ch in guild.text_channels:
+                    if ch.name == clean:
+                        return ch
+
+        return None
+
+    # ------------------------------------------------------------------
     # Discord API methods — thin async boundary for actual Discord calls
     #
     # These are the only methods that need a live discord.py client.
@@ -1088,8 +1197,11 @@ class DiscordAdapter:
             return
         channel = self._client.get_channel(int(surface_id))
         if not channel:
-            log.warning("Discord channel %s not found in cache", surface_id)
-            return
+            try:
+                channel = await self._client.fetch_channel(int(surface_id))
+            except discord.NotFound:
+                log.warning("Discord channel %s not found", surface_id)
+                return
         await channel.send(content)
 
     async def _discord_create_thread(
@@ -1104,8 +1216,11 @@ class DiscordAdapter:
             return None
         channel = self._client.get_channel(int(channel_id))
         if not channel:
-            log.warning("Discord channel %s not found in cache", channel_id)
-            return None
+            try:
+                channel = await self._client.fetch_channel(int(channel_id))
+            except discord.NotFound:
+                log.warning("Discord channel %s not found", channel_id)
+                return None
         thread = await channel.create_thread(
             name=name,
             type=discord.ChannelType.public_thread,
@@ -1121,43 +1236,201 @@ class DiscordAdapter:
             return
         thread = self._client.get_channel(thread_id)
         if not thread:
-            log.warning("Discord thread %d not found in cache", thread_id)
-            return
+            try:
+                thread = await self._client.fetch_channel(thread_id)
+            except discord.NotFound:
+                log.warning("Discord thread %d not found", thread_id)
+                return
         await thread.edit(archived=True)
 
     # ------------------------------------------------------------------
-    # Platform op stubs (Slice B-D)
+    # Platform ops (D2)
     # ------------------------------------------------------------------
 
     async def _op_send(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """Send a message to a Discord target.
+
+        Args:
+            target: channel name (#general), user (@name), or numeric ID
+            content: message text
+            thread: optional thread name (find-or-create within target)
+        """
+        target = args.get("target", "")
+        content = args.get("content", "")
+        if not target or not content:
+            return {"ok": False, "error": "target and content are required"}
+
+        channel = await self._resolve_target(target)
+        if not channel:
+            return {"ok": False, "error": f"Could not resolve target: {target}"}
+
+        # Optional thread within channel
+        thread_name = args.get("thread")
+        if thread_name and hasattr(channel, "threads"):
+            thread = await self._find_or_create_thread(channel, thread_name)
+            if thread:
+                channel = thread
+
+        chunks = split_message(content)
+        sent_ids = []
+        for chunk in chunks:
+            msg = await channel.send(chunk)
+            sent_ids.append(str(msg.id))
+
+        return {"ok": True, "message_ids": sent_ids, "chunks": len(chunks)}
 
     async def _op_read_history(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """Read recent message history from a Discord target."""
+        target = args.get("target", "")
+        limit = min(int(args.get("limit", 20)), 100)
+        if not target:
+            return {"ok": False, "error": "target is required"}
+
+        channel = await self._resolve_target(target)
+        if not channel:
+            return {"ok": False, "error": f"Could not resolve target: {target}"}
+
+        messages = []
+        async for msg in channel.history(limit=limit):
+            messages.append({
+                "author": msg.author.name,
+                "author_id": str(msg.author.id),
+                "content": msg.content,
+                "timestamp": msg.created_at.isoformat(),
+                "id": str(msg.id),
+            })
+        messages.reverse()
+        return {"ok": True, "messages": messages}
 
     async def _op_branch_post(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """Post a message to a session's branch thread."""
+        session_id = args.get("session_id", "")
+        content = args.get("content", "")
+        if not session_id or not content:
+            return {"ok": False, "error": "session_id and content are required"}
+
+        thread_id = self._branch_threads.get(session_id)
+        if not thread_id:
+            return {"ok": False, "error": f"No branch thread for {session_id}"}
+
+        if not self._client:
+            return {"ok": False, "error": "No Discord client connected"}
+
+        thread = self._client.get_channel(thread_id)
+        if not thread:
+            try:
+                thread = await self._client.fetch_channel(thread_id)
+            except discord.NotFound:
+                return {"ok": False, "error": f"Branch thread {thread_id} not found"}
+
+        chunks = split_message(content)
+        for chunk in chunks:
+            await thread.send(chunk)
+        return {"ok": True}
 
     async def _op_thread_create(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """Create a thread in a Discord channel."""
+        channel_target = args.get("channel", "")
+        name = args.get("name", "")
+        if not channel_target or not name:
+            return {"ok": False, "error": "channel and name are required"}
+
+        channel = await self._resolve_target(channel_target)
+        if not channel or not hasattr(channel, "create_thread"):
+            return {"ok": False, "error": f"Cannot create thread in {channel_target}"}
+
+        thread = await channel.create_thread(
+            name=name, type=discord.ChannelType.public_thread,
+        )
+        message = args.get("message", "")
+        if message:
+            await thread.send(message)
+        return {"ok": True, "thread_id": str(thread.id), "name": name}
 
     async def _op_thread_archive(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """Archive a thread by name within a channel."""
+        channel_target = args.get("channel", "")
+        name = args.get("name", "")
+        if not channel_target or not name:
+            return {"ok": False, "error": "channel and name are required"}
+
+        channel = await self._resolve_target(channel_target)
+        if not channel or not hasattr(channel, "threads"):
+            return {"ok": False, "error": f"Cannot access threads in {channel_target}"}
+
+        for thread in channel.threads:
+            if thread.name == name:
+                await thread.edit(archived=True)
+                return {"ok": True}
+
+        return {"ok": False, "error": f"Thread '{name}' not found"}
 
     async def _op_list_channels(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """List text channels in the configured guild."""
+        if not self._client or not self._discord_config.guild_id:
+            return {"ok": False, "error": "No client or guild configured"}
 
-    async def _op_voice_send(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        guild = self._client.get_guild(int(self._discord_config.guild_id))
+        if not guild:
+            return {"ok": False, "error": "Guild not found in cache"}
+
+        channels = [
+            {
+                "name": ch.name,
+                "id": str(ch.id),
+                "category": ch.category.name if ch.category else None,
+            }
+            for ch in guild.text_channels
+        ]
+        return {"ok": True, "channels": channels}
 
     async def _op_delete(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        """Delete a message by ID in a target channel."""
+        target = args.get("target", "")
+        message_id = args.get("message_id", "")
+        if not target or not message_id:
+            return {"ok": False, "error": "target and message_id are required"}
+
+        channel = await self._resolve_target(target)
+        if not channel:
+            return {"ok": False, "error": f"Could not resolve target: {target}"}
+
+        try:
+            msg = await channel.fetch_message(int(message_id))
+            await msg.delete()
+            return {"ok": True}
+        except discord.NotFound:
+            return {"ok": False, "error": f"Message {message_id} not found"}
+        except discord.Forbidden:
+            return {"ok": False, "error": "Bot lacks permission to delete this message"}
+
+    async def _find_or_create_thread(
+        self, channel: Any, name: str,
+    ) -> Any | None:
+        """Find a thread by name in a channel, or create one."""
+        for thread in channel.threads:
+            if thread.name == name:
+                return thread
+        async for thread in channel.archived_threads():
+            if thread.name == name:
+                await thread.edit(archived=False)
+                return thread
+        return await channel.create_thread(
+            name=name, type=discord.ChannelType.public_thread,
+        )
+
+    # ------------------------------------------------------------------
+    # Platform op stubs (D3 — stateful/UX-heavy)
+    # ------------------------------------------------------------------
+
+    async def _op_voice_send(self, args: dict, ctx: RequestContext | None) -> dict:
+        raise NotImplementedError("Slice D3")
 
     async def _op_security_challenge(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        raise NotImplementedError("Slice D3")
 
     async def _op_permission_request(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        raise NotImplementedError("Slice D3")
 
     async def _op_permission_resolve(self, args: dict, ctx: RequestContext | None) -> dict:
-        raise NotImplementedError("Slice D")
+        raise NotImplementedError("Slice D3")
