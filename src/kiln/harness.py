@@ -8,7 +8,6 @@ Complex agents write their own harness that imports kiln's building
 blocks directly.
 """
 
-import fcntl
 import json
 import logging
 import os
@@ -24,6 +23,7 @@ log = logging.getLogger("kiln.harness")
 from claude_agent_sdk import HookMatcher
 
 from .backends.claude import ClaudeBackend
+from .daemon.client import DaemonClient, DaemonUnavailableError
 from .types import (
     Backend,
     BackendConfig,
@@ -213,6 +213,8 @@ class KilnHarness:
         self._permission_hook = None
         self._permission_callbacks = None
         self._initial_mode = PermissionMode(config.initial_mode) if config.initial_mode else PermissionMode.SUPERVISED
+        self._daemon_client: DaemonClient | None = None
+        self._desired_subscriptions: list[str] = []
         self._shell_cleanup = None
         self._get_shell_cwd = None
         self._stderr_log: Path | None = None
@@ -361,40 +363,21 @@ class KilnHarness:
             return None
 
     def _snapshot_channel_subscriptions(self) -> list[str]:
-        channels_path = self.config.home / "channels.json"
-        if not channels_path.exists():
-            return []
-        try:
-            with open(channels_path) as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                data = json.loads(f.read() or "{}")
-        except (OSError, json.JSONDecodeError):
-            return []
-        return [ch for ch, subs in data.items() if self.agent_id in subs]
+        if self._daemon_client and self._daemon_client.connected:
+            # Daemon is truth when connected — sync desired state
+            live = self._daemon_client.subscriptions
+            self._desired_subscriptions = list(live)
+            return live
+        # Disconnected — preserve desired subscriptions for reconnect
+        return list(self._desired_subscriptions)
 
-    def _restore_channel_subscriptions(self, subscriptions: list[str]) -> None:
+    async def _restore_channel_subscriptions(self, subscriptions: list[str]) -> None:
         if not subscriptions:
             return
-        channels_path = self.config.home / "channels.json"
-        try:
-            channels_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(channels_path, "a+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                try:
-                    channels = json.loads(f.read() or "{}")
-                except json.JSONDecodeError:
-                    channels = {}
-                for channel in subscriptions:
-                    subs = channels.get(channel, [])
-                    if self.agent_id not in subs:
-                        subs.append(self.agent_id)
-                    channels[channel] = subs
-                f.seek(0)
-                f.truncate()
-                f.write(json.dumps(channels, indent=2) + "\n")
-        except OSError:
-            pass
+        # Always record desired state, even if daemon is unavailable
+        self._desired_subscriptions = list(subscriptions)
+        if self._daemon_client and self._daemon_client.connected:
+            await self._daemon_client.restore_subscriptions(subscriptions)
 
     def _cleanup_stale_session_configs(self) -> None:
         """Remove session config files for sessions that are no longer running.
@@ -596,9 +579,9 @@ class KilnHarness:
         # Clean up stale session config files from dead sessions
         self._cleanup_stale_session_configs()
 
-        # Restore channel subscriptions from saved state
+        # Record desired subscriptions for async restore in start()
         if saved_state and saved_state.get("channel_subscriptions"):
-            self._restore_channel_subscriptions(saved_state["channel_subscriptions"])
+            self._desired_subscriptions = list(saved_state["channel_subscriptions"])
 
         # Build infrastructure hooks
         state_dir = self.config.home / "state"
@@ -703,6 +686,7 @@ class KilnHarness:
             session_control=self.session_control,
             plans_path=plans_path,
             supplemental=self._supplemental,
+            daemon_client=self._daemon_client,
         )
         mcp_servers = {"kiln": mcp_server}
 
@@ -876,6 +860,24 @@ class KilnHarness:
             except Exception:
                 log.exception("Startup command error: %s", cmd)
 
+    async def _connect_daemon(self) -> None:
+        """Connect to the Kiln daemon. Sets self._daemon_client on success, None on failure."""
+        client = DaemonClient()
+        try:
+            await client.connect()
+            await client.register(
+                agent=self.config.name,
+                session=self.agent_id,
+                pid=os.getpid(),
+            )
+            self._daemon_client = client
+        except DaemonUnavailableError:
+            log.warning("Daemon unavailable — running without live coordination")
+            self._daemon_client = None
+        except Exception:
+            log.warning("Daemon connection failed — running without live coordination", exc_info=True)
+            self._daemon_client = None
+
     async def start(self):
         """Start the agent session.
 
@@ -885,10 +887,18 @@ class KilnHarness:
         If no orientation, --prompt is the startup message on followup_queue.
         """
         self._run_startup_commands()
+
+        # Connect to daemon before building config so message tool has client
+        await self._connect_daemon()
+
         self._backend = self._select_backend()
         config = self._build_backend_config()
         await self._backend.start(config)
         self.register_session()
+
+        # Restore channel subscriptions from previous session (async, needs daemon)
+        if self._desired_subscriptions:
+            await self._restore_channel_subscriptions(self._desired_subscriptions)
 
         # Queue startup messages onto followup_queue (programmatic user turns).
         # steering_queue is for user-typed mid-turn input only.
@@ -934,13 +944,19 @@ class KilnHarness:
         return create_session_state_hook(
             self,
             interval=15,
-            channels_path=self.config.home / "channels.json",
             session_prefix=self.config.session_prefix,
         )
 
     def session_state_labels(self) -> list[str]:
         """Extra labels for the session state hook. Override in subclasses."""
-        return []
+        labels = []
+        if self._daemon_client and self._daemon_client.connected:
+            channels = self._daemon_client.subscriptions
+        else:
+            channels = self._desired_subscriptions
+        if channels:
+            labels.append(f"Channels: {', '.join(channels)}")
+        return labels
 
     def _build_orientation(self) -> str | None:
         """Build the startup orientation message.
@@ -1148,37 +1164,13 @@ class KilnHarness:
             return []
         return [self.config.cleanup.format(**self._template_vars())]
 
-    def _cleanup_channel_subscriptions(self) -> None:
-        """Remove this agent from all channel subscriptions on exit.
-
-        Returns early on corrupt JSON — can't safely assume empty when the
-        intent is removal (vs _restore which can safely start from {}).
-        """
-        channels_path = self.config.home / "channels.json"
-        if not channels_path.exists():
-            return
-        try:
-            with open(channels_path, "a+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                try:
-                    channels = json.loads(f.read() or "{}")
-                except json.JSONDecodeError:
-                    return
-                changed = False
-                for channel in list(channels):
-                    subs = channels[channel]
-                    if self.agent_id in subs:
-                        subs.remove(self.agent_id)
-                        changed = True
-                    if not subs:
-                        del channels[channel]
-                if changed:
-                    f.seek(0)
-                    f.truncate()
-                    f.write(json.dumps(channels, indent=2) + "\n")
-        except OSError:
-            pass  # Best-effort — don't block shutdown
+    async def _deregister_daemon(self) -> None:
+        """Deregister from the daemon on shutdown. Daemon cleans up subscriptions."""
+        if self._daemon_client and self._daemon_client.connected:
+            try:
+                await self._daemon_client.deregister()
+            except Exception:
+                log.debug("Daemon deregister failed — daemon may already be gone")
 
     def _snapshot_session_state(self) -> None:
         """Update the session state file with final config and channel subscriptions."""
@@ -1199,7 +1191,7 @@ class KilnHarness:
     async def stop(self):
         """Disconnect the agent session and clean up resources."""
         self._snapshot_session_state()
-        self._cleanup_channel_subscriptions()
+        await self._deregister_daemon()
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None

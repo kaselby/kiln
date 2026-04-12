@@ -1389,6 +1389,7 @@ def create_mcp_server(
     session_control: SessionControl | None = None,
     plans_path: Path | None = None,
     supplemental: SupplementalContent | None = None,
+    daemon_client=None,
 ):
     """Create the Kiln MCP server with standard agent runtime tools.
 
@@ -1417,9 +1418,6 @@ def create_mcp_server(
 
     # Resolve plans_path default
     _plans_path = plans_path or inbox_root.parent / "plans"
-
-    channels_path = inbox_root.parent / "channels.json"
-    channels_dir = inbox_root.parent / "channels"
 
     # --- Tool implementations (thin wrappers) ---
 
@@ -1481,70 +1479,62 @@ def create_mcp_server(
 
     @tool("message", MESSAGE_DESC, MESSAGE_SCHEMA)
     async def message_tool(args: dict) -> dict:
-        import fcntl
         action = args.get("action")
 
         if action == "subscribe":
             channel = args.get("channel")
             if not channel:
                 return _error("subscribe requires a channel name.")
-            channels_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(channels_path, "a+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                try:
-                    channels = json.loads(f.read() or "{}")
-                except json.JSONDecodeError:
-                    channels = {}
-                subs = channels.get(channel, [])
-                if agent_id in subs:
-                    return _ok(f"Already subscribed to channel '{channel}'.")
-                subs.append(agent_id)
-                channels[channel] = subs
-                f.seek(0)
-                f.truncate()
-                f.write(json.dumps(channels, indent=2) + "\n")
-            return _ok(f"Subscribed to channel '{channel}'. {len(subs)} subscriber(s).")
+            if not daemon_client or not daemon_client.connected:
+                return _error("Channel operations require the Kiln daemon.")
+            count = await daemon_client.subscribe(channel)
+            return _ok(f"Subscribed to channel '{channel}'. {count} subscriber(s).")
 
         elif action == "unsubscribe":
             channel = args.get("channel")
             if not channel:
                 return _error("unsubscribe requires a channel name.")
-            channels_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(channels_path, "a+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                try:
-                    channels = json.loads(f.read() or "{}")
-                except json.JSONDecodeError:
-                    channels = {}
-                subs = channels.get(channel, [])
-                if agent_id not in subs:
-                    return _ok(f"Not subscribed to channel '{channel}'.")
-                subs.remove(agent_id)
-                if subs:
-                    channels[channel] = subs
-                else:
-                    del channels[channel]
-                f.seek(0)
-                f.truncate()
-                f.write(json.dumps(channels, indent=2) + "\n")
+            if not daemon_client or not daemon_client.connected:
+                return _error("Channel operations require the Kiln daemon.")
+            await daemon_client.unsubscribe(channel)
             return _ok(f"Unsubscribed from channel '{channel}'.")
 
         elif action == "send":
-            result = do_send_message(
-                inbox_root, agent_id,
-                summary=args.get("summary", ""),
-                body=args.get("body", ""),
-                priority=args.get("priority", "normal"),
-                to=args.get("to"),
-                channel=args.get("channel"),
-                channels_path=channels_path,
-                channels_dir=channels_dir,
-            )
-            if "error" in result:
-                return _error(result["error"])
-            return _ok(result["result"])
+            to = args.get("to")
+            channel = args.get("channel")
+            summary = args.get("summary", "")
+            body = args.get("body", "")
+            priority = args.get("priority", "normal")
+
+            if not summary and not body:
+                return _error("send requires at least a summary or body.")
+
+            if channel:
+                # Channel broadcast — daemon required
+                if not daemon_client or not daemon_client.connected:
+                    return _error("Channel broadcast requires the Kiln daemon.")
+                count = await daemon_client.publish(channel, summary, body, priority)
+                return _ok(
+                    f"Message broadcast to channel '{channel}' "
+                    f"({count} recipient(s))."
+                )
+
+            elif to:
+                # Agent DM — daemon-first, filesystem fallback
+                if daemon_client and daemon_client.connected:
+                    msg = await daemon_client.send_direct(to, summary, body, priority)
+                    return _ok(msg)
+                else:
+                    result = do_send_message(
+                        inbox_root, agent_id,
+                        summary=summary, body=body, priority=priority, to=to,
+                    )
+                    if "error" in result:
+                        return _error(result["error"])
+                    return _ok(result["result"])
+
+            else:
+                return _error("send requires either 'to' (agent ID) or 'channel'.")
 
         else:
             return _error(f"Unknown action: {action}. Use send, subscribe, or unsubscribe.")

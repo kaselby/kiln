@@ -581,9 +581,6 @@ class KilnApp:
         # Set to True in _main() after start() if the session is a resume/continue.
         self._resume_indicator_pending: bool = False
 
-        # Channel view state: "agent" or "channel:<name>"
-        self._current_view: str = "agent"
-
         # Plan cache: (mtime, formatted_progress_string)
         self._plan_cache: tuple[float, str | None] = (0.0, None)
 
@@ -623,10 +620,8 @@ class KilnApp:
         )
 
     def _input_prefix(self, line_number: int, wrap_count: int) -> list[tuple[str, str]]:
-        """Prefix for input lines: '> ' on first line, '# ' in channel view, '  ' on continuations."""
+        """Prefix for input lines: '> ' on first line, '  ' on continuations."""
         if line_number == 0 and wrap_count == 0:
-            if self._in_channel_view:
-                return [("class:agent-msg", "# ")]
             return [("", "> ")]
         return [("", "  ")]
 
@@ -671,10 +666,6 @@ class KilnApp:
             if app_ref._app:
                 app_ref._app.invalidate()
 
-        @kb.add("c-o", filter=is_idle & ~is_permission_pending)
-        def handle_view_cycle(event):
-            app_ref._cycle_view(+1)
-
         @kb.add("enter", filter=is_idle & ~is_permission_pending)
         def handle_enter(event):
             text = app_ref._input_buffer.text.strip()
@@ -697,9 +688,6 @@ class KilnApp:
                     sc.skip_summary = True
                 event.app.exit()
                 return
-            if text == "/ch":
-                app_ref._cycle_view(+1)
-                return
             if text == "/plan":
                 app_ref._show_plan()
                 return
@@ -708,13 +696,6 @@ class KilnApp:
                 return
             if text == "/usage":
                 app_ref._show_usage()
-                return
-
-            # Channel view: send directly to the channel
-            if app_ref._in_channel_view:
-                ch_name = app_ref._current_view.split(":", 1)[1]
-                _tprint("<user>You \u2192 #{}</user>: {}", ch_name, text)
-                app_ref._send_to_channel(ch_name, text)
                 return
 
             # Lock out further submissions immediately
@@ -791,153 +772,6 @@ class KilnApp:
 
         return kb
 
-    # ---- Channel view helpers ----
-
-    def _subscribed_channels(self) -> list[str]:
-        """Return list of channels this agent is subscribed to."""
-        channels_path = self._harness.config.home / "channels.json"
-        if not channels_path.exists():
-            return []
-        try:
-            channels = json.loads(channels_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return []
-        return sorted(
-            name for name, subs in channels.items()
-            if self._harness.agent_id in subs
-        )
-
-    def _view_list(self) -> list[str]:
-        """Build the ordered list of views: agent + subscribed channels."""
-        views = ["agent"]
-        for ch in self._subscribed_channels():
-            views.append(f"channel:{ch}")
-        return views
-
-    def _cycle_view(self, direction: int) -> None:
-        """Cycle to the next (+1) or previous (-1) view."""
-        views = self._view_list()
-        if len(views) <= 1:
-            return
-        try:
-            idx = views.index(self._current_view)
-        except ValueError:
-            idx = 0
-        idx = (idx + direction) % len(views)
-        new_view = views[idx]
-        if new_view == self._current_view:
-            return
-        self._current_view = new_view
-        self._render_view_switch()
-        if self._app:
-            self._app.invalidate()
-
-    def _render_view_switch(self) -> None:
-        """Print header and content when switching views."""
-        if self._current_view == "agent":
-            _tprint("\n<dim>\u2500\u2500\u2500 Agent View \u2500\u2500\u2500</dim>\n")
-        elif self._current_view.startswith("channel:"):
-            ch_name = self._current_view.split(":", 1)[1]
-            _tprint("\n<dim>\u2500\u2500\u2500 Channel: </dim><agent-msg-b>{}</agent-msg-b><dim> \u2500\u2500\u2500</dim>", ch_name)
-            self._render_channel_history(ch_name)
-
-    def _render_channel_history(self, channel: str, max_lines: int = 30) -> None:
-        """Dump recent channel history to scrollback."""
-        history_file = self._harness.config.home / "channels" / channel / "history.jsonl"
-        if not history_file.exists():
-            _tprint("<dim>  (no history yet)</dim>\n")
-            return
-
-        lines = []
-        try:
-            text = history_file.read_text()
-            for line in text.strip().splitlines():
-                if line.strip():
-                    lines.append(json.loads(line))
-        except (json.JSONDecodeError, OSError):
-            _tprint("<dim>  (error reading history)</dim>\n")
-            return
-
-        recent = lines[-max_lines:]
-        if len(lines) > max_lines:
-            _tprint("<dim>  ... ({} earlier messages)</dim>", len(lines) - max_lines)
-
-        for entry in recent:
-            ts_raw = entry.get("ts", "")
-            sender = entry.get("from", "?")
-            body = entry.get("body", "")
-            summary = entry.get("summary", "")
-            try:
-                dt = datetime.fromisoformat(ts_raw)
-                ts_display = dt.astimezone().strftime("%H:%M")
-            except (ValueError, TypeError):
-                ts_display = "??:??"
-            display_text = body if body else summary
-            if len(display_text) > 300:
-                display_text = display_text[:300] + "..."
-            _tprint("<dim>{}</dim> <agent-msg-b>{}</agent-msg-b>: {}", ts_display, sender, display_text)
-
-        _tprint("")
-
-    def _send_to_channel(self, channel: str, text: str) -> None:
-        """Send a message from the TUI user directly to a channel."""
-        channels_path = self._harness.config.home / "channels.json"
-        if not channels_path.exists():
-            _tprint("<err>No channels configured.</err>")
-            return
-
-        try:
-            channels = json.loads(channels_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            _tprint("<err>Error reading channels.</err>")
-            return
-
-        subs = channels.get(channel, [])
-        agent_id = self._harness.agent_id
-        recipients = [s for s in subs if s != agent_id]
-
-        if not recipients:
-            _tprint("<err>No other subscribers on channel '{}'.</err>", channel)
-            return
-
-        inbox_root = self._harness.config.inbox_path
-        import uuid as _uuid
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        summary = text[:100] if len(text) > 100 else text
-
-        for recipient in recipients:
-            recipient_inbox = inbox_root / recipient
-            recipient_inbox.mkdir(parents=True, exist_ok=True)
-            msg_id = f"msg-{timestamp}-{_uuid.uuid4().hex[:6]}"
-            msg_path = recipient_inbox / f"{msg_id}.md"
-            content = (
-                f"---\n"
-                f"from: {agent_id}\n"
-                f"summary: \"{summary}\"\n"
-                f"priority: normal\n"
-                f"channel: {channel}\n"
-                f"timestamp: {datetime.now(timezone.utc).isoformat()}\n"
-                f"---\n\n"
-                f"{text}\n"
-            )
-            msg_path.write_text(content)
-
-        # Append to channel history
-        history_dir = self._harness.config.home / "channels" / channel
-        history_dir.mkdir(parents=True, exist_ok=True)
-        history_file = history_dir / "history.jsonl"
-        entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "from": agent_id,
-            "summary": summary,
-            "body": text,
-            "priority": "normal",
-        }
-        with open(history_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-
-        _tprint("<dim>Sent to {} ({} recipients)</dim>", channel, len(recipients))
-
     @property
     def _perm_mode(self) -> PermissionMode:
         # Trusted is a volatile TUI-only overlay — when set, it takes
@@ -957,10 +791,6 @@ class KilnApp:
             self._harness.permission_mode = value
         self._last_displayed_mode = value
 
-    @property
-    def _in_channel_view(self) -> bool:
-        return self._current_view.startswith("channel:")
-
     _MODE_STYLE = {
         PermissionMode.SAFE: "mode-safe",
         PermissionMode.SUPERVISED: "mode-supervised",
@@ -979,15 +809,6 @@ class KilnApp:
         mode_html = f"<{mode_style}>{self._perm_mode.value}</{mode_style}>"
 
         parts = [status, self._harness.agent_id, mode_html]
-
-        # Current view indicator
-        if self._in_channel_view:
-            ch_name = self._current_view.split(":", 1)[1]
-            parts.append(f"<agent-msg-b>#{ch_name}</agent-msg-b>")
-        else:
-            channels = self._subscribed_channels()
-            if channels:
-                parts.append(f"<dim>{len(channels)} ch</dim>")
 
         # Plan progress
         plan_progress = self._plan_progress()
