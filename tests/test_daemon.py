@@ -1966,3 +1966,338 @@ class TestDiscordValidateSurfaceRef:
         adapter = DiscordAdapter()
         with pytest.raises(ValueError, match="Surface ID cannot be empty"):
             adapter.validate_surface_ref("discord:user:")
+
+
+# ---------------------------------------------------------------------------
+# C3 — Inbound classification and routing
+# ---------------------------------------------------------------------------
+
+class _MockDaemon:
+    """Minimal daemon mock for adapter routing tests."""
+
+    def __init__(self):
+        from kiln.daemon.state import DaemonState
+        self.state = DaemonState()
+        self.delivered: list[tuple[str, proto.PlatformMessage]] = []
+        self.published: list[dict] = []
+        self.surface_delivered: list[tuple[str, proto.PlatformMessage]] = []
+
+    async def deliver_platform_message(self, recipient, msg):
+        self.delivered.append((recipient, msg))
+        return Path("/fake/inbox/msg.md")
+
+    async def publish_to_channel(self, channel, sender, summary, body,
+                                 priority="normal", source="", exclude_sender=True):
+        self.published.append({
+            "channel": channel, "sender": sender,
+            "summary": summary, "body": body, "source": source,
+        })
+        return 1
+
+    async def deliver_to_surface_subscribers(self, surface_ref, msg):
+        self.surface_delivered.append((surface_ref, msg))
+        return 1
+
+
+def _make_adapter(
+    *,
+    branch_threads=None,
+    channel_threads=None,
+    users=None,
+    channels=None,
+    dm_access="allowlist",
+    channel_access="open",
+):
+    """Build a DiscordAdapter wired to a mock daemon with pre-set state."""
+    from kiln.daemon.adapters.discord import DiscordAdapter
+
+    config = {}
+    if users:
+        config["users"] = users
+    if channels:
+        config["channels"] = channels
+    if dm_access:
+        config["dm_access"] = dm_access
+    if channel_access:
+        config["channel_access"] = channel_access
+
+    adapter = DiscordAdapter(config)
+    adapter._daemon = _MockDaemon()
+
+    if branch_threads:
+        adapter._branch_threads = dict(branch_threads)
+    if channel_threads:
+        adapter._channel_threads = dict(channel_threads)
+    adapter._rebuild_reverse_indexes()
+
+    return adapter
+
+
+def _msg(
+    *,
+    sender_id="111",
+    sender_display_name="TestUser",
+    channel_id="999",
+    content="hello",
+    is_dm=False,
+    attachment_paths=None,
+):
+    from kiln.daemon.adapters.discord import InboundMessage
+    return InboundMessage(
+        sender_id=sender_id,
+        sender_display_name=sender_display_name,
+        channel_id=channel_id,
+        content=content,
+        is_dm=is_dm,
+        attachment_paths=attachment_paths or [],
+    )
+
+
+class TestClassifyMessage:
+    """Unit tests for _classify_message — classification only, no delivery."""
+
+    def test_branch_thread(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter(branch_threads={"beth-test-1": 9001})
+        decision = adapter._classify_message(_msg(channel_id="9001"))
+        assert decision is not None
+        assert decision.bucket == RouteBucket.BRANCH
+        assert decision.session_id == "beth-test-1"
+
+    def test_bridge_thread(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter(channel_threads={"design-review": 8001})
+        decision = adapter._classify_message(_msg(channel_id="8001"))
+        assert decision is not None
+        assert decision.bucket == RouteBucket.BRIDGE
+        assert decision.channel_name == "design-review"
+
+    def test_surface_subscription_dm(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter()
+        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        decision = adapter._classify_message(_msg(is_dm=True, sender_id="111"))
+        assert decision is not None
+        assert decision.bucket == RouteBucket.SURFACE
+        assert decision.surface_ref == "discord:user:111"
+
+    def test_surface_subscription_channel(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter()
+        adapter._daemon.state.surfaces.subscribe("discord:channel:555", "beth-a")
+        decision = adapter._classify_message(_msg(channel_id="555"))
+        assert decision is not None
+        assert decision.bucket == RouteBucket.SURFACE
+        assert decision.surface_ref == "discord:channel:555"
+
+    def test_unrouted(self):
+        adapter = _make_adapter()
+        decision = adapter._classify_message(_msg(channel_id="777"))
+        assert decision is None
+
+    def test_invariant_violation_branch_and_surface(self):
+        from kiln.daemon.adapters.discord import RoutingError
+        adapter = _make_adapter(branch_threads={"beth-test-1": 9001})
+        # Also subscribe a surface for the same thread ID
+        adapter._daemon.state.surfaces.subscribe("discord:channel:9001", "beth-b")
+        with pytest.raises(RoutingError, match="invariant violation"):
+            adapter._classify_message(_msg(channel_id="9001"))
+
+    def test_invariant_violation_bridge_and_surface(self):
+        from kiln.daemon.adapters.discord import RoutingError
+        adapter = _make_adapter(channel_threads={"refactor": 8001})
+        adapter._daemon.state.surfaces.subscribe("discord:channel:8001", "beth-b")
+        with pytest.raises(RoutingError, match="invariant violation"):
+            adapter._classify_message(_msg(channel_id="8001"))
+
+    def test_invariant_violation_branch_and_bridge(self):
+        from kiln.daemon.adapters.discord import RoutingError
+        # Same thread ID in both maps — should never happen but must be caught
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+            channel_threads={"refactor": 9001},
+        )
+        with pytest.raises(RoutingError, match="invariant violation"):
+            adapter._classify_message(_msg(channel_id="9001"))
+
+    def test_non_numeric_channel_id(self):
+        """Non-numeric channel IDs don't match thread maps (int keys)."""
+        adapter = _make_adapter(branch_threads={"beth-test-1": 9001})
+        decision = adapter._classify_message(_msg(channel_id="not-a-number"))
+        assert decision is None
+
+    def test_surface_ref_dm(self):
+        adapter = _make_adapter()
+        msg = _msg(is_dm=True, sender_id="42")
+        assert adapter._build_surface_ref(msg) == "discord:user:42"
+
+    def test_surface_ref_channel(self):
+        adapter = _make_adapter()
+        msg = _msg(channel_id="555")
+        assert adapter._build_surface_ref(msg) == "discord:channel:555"
+
+
+class TestCheckAccess:
+
+    def test_channel_open_allows_anyone(self):
+        adapter = _make_adapter(channel_access="open")
+        assert adapter._check_access(_msg(sender_id="unknown_user")) is True
+
+    def test_dm_allowlist_blocks_unknown(self):
+        adapter = _make_adapter(
+            users={"111": {"name": "Kira", "trust": "full"}},
+            dm_access="allowlist",
+        )
+        assert adapter._check_access(_msg(is_dm=True, sender_id="999")) is False
+
+    def test_dm_allowlist_allows_known(self):
+        adapter = _make_adapter(
+            users={"111": {"name": "Kira", "trust": "full"}},
+            dm_access="allowlist",
+        )
+        assert adapter._check_access(_msg(is_dm=True, sender_id="111")) is True
+
+    def test_channel_allowlist(self):
+        adapter = _make_adapter(
+            users={"111": {"name": "Kira"}},
+            channel_access="allowlist",
+        )
+        assert adapter._check_access(_msg(sender_id="111")) is True
+        assert adapter._check_access(_msg(sender_id="999")) is False
+
+
+class TestControlChannel:
+
+    def test_is_control_channel(self):
+        adapter = _make_adapter(channels={"control": "7777"})
+        assert adapter._is_control_channel("7777") is True
+        assert adapter._is_control_channel("9999") is False
+
+    def test_no_control_configured(self):
+        adapter = _make_adapter()
+        assert adapter._is_control_channel("7777") is False
+
+
+@pytest.mark.asyncio
+class TestHandleMessage:
+    """Integration tests for handle_message — full routing pipeline."""
+
+    async def test_route_to_branch(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+            channel_access="open",
+        )
+        result = await adapter.handle_message(_msg(channel_id="9001"))
+        assert result is not None
+        assert result.bucket == RouteBucket.BRANCH
+        # Verify daemon received the delivery
+        daemon = adapter._daemon
+        assert len(daemon.delivered) == 1
+        assert daemon.delivered[0][0] == "beth-test-1"
+        assert daemon.delivered[0][1].platform == "discord"
+
+    async def test_route_to_bridge(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter(
+            channel_threads={"design-review": 8001},
+            channel_access="open",
+        )
+        result = await adapter.handle_message(
+            _msg(channel_id="8001", content="looks good"),
+        )
+        assert result is not None
+        assert result.bucket == RouteBucket.BRIDGE
+        daemon = adapter._daemon
+        assert len(daemon.published) == 1
+        assert daemon.published[0]["channel"] == "design-review"
+        assert daemon.published[0]["source"] == "discord"
+        assert daemon.published[0]["body"] == "looks good"
+
+    async def test_route_to_surface(self):
+        from kiln.daemon.adapters.discord import RouteBucket
+        adapter = _make_adapter(
+            users={"111": {"name": "Kira", "trust": "full"}},
+            dm_access="allowlist",
+        )
+        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        result = await adapter.handle_message(
+            _msg(is_dm=True, sender_id="111", content="hey beth"),
+        )
+        assert result is not None
+        assert result.bucket == RouteBucket.SURFACE
+        daemon = adapter._daemon
+        assert len(daemon.surface_delivered) == 1
+        assert daemon.surface_delivered[0][0] == "discord:user:111"
+        assert daemon.surface_delivered[0][1].content == "hey beth"
+        assert daemon.surface_delivered[0][1].trust == "full"
+
+    async def test_access_denied_returns_none(self):
+        adapter = _make_adapter(dm_access="allowlist", users={})
+        result = await adapter.handle_message(
+            _msg(is_dm=True, sender_id="999"),
+        )
+        assert result is None
+
+    async def test_unrouted_returns_none(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter.handle_message(_msg(channel_id="777"))
+        assert result is None
+
+    async def test_control_channel_intercepted(self):
+        adapter = _make_adapter(
+            channels={"control": "7777"},
+            channel_access="open",
+            users={"111": {"name": "Kira", "trust": "full"}},
+        )
+        result = await adapter.handle_message(
+            _msg(channel_id="7777", sender_id="111"),
+        )
+        # Control messages are consumed, not routed
+        assert result is None
+        daemon = adapter._daemon
+        assert len(daemon.delivered) == 0
+        assert len(daemon.published) == 0
+        assert len(daemon.surface_delivered) == 0
+
+    async def test_no_daemon_returns_none(self):
+        from kiln.daemon.adapters.discord import DiscordAdapter
+        adapter = DiscordAdapter()
+        result = await adapter.handle_message(_msg())
+        assert result is None
+
+    async def test_identity_resolution_in_platform_message(self):
+        """Verify the PlatformMessage carries resolved identity, not raw Discord data."""
+        adapter = _make_adapter(
+            users={"111": {"name": "Kira", "trust": "full"}},
+            dm_access="allowlist",
+        )
+        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        await adapter.handle_message(
+            _msg(is_dm=True, sender_id="111", sender_display_name="krylea94"),
+        )
+        pm = adapter._daemon.surface_delivered[0][1]
+        # Should use config name "Kira", not Discord display name
+        assert pm.sender_name == "Kira"
+        assert pm.sender_platform_id == "111"
+
+    async def test_attachment_paths_carried_through(self):
+        adapter = _make_adapter(
+            branch_threads={"beth-test-1": 9001},
+            channel_access="open",
+        )
+        await adapter.handle_message(
+            _msg(channel_id="9001", attachment_paths=["/tmp/photo.png"]),
+        )
+        pm = adapter._daemon.delivered[0][1]
+        assert pm.attachment_paths == ["/tmp/photo.png"]
+
+    async def test_bridge_uses_sender_name_not_id(self):
+        """Bridge publish should use resolved sender name."""
+        adapter = _make_adapter(
+            channel_threads={"chat": 8001},
+            channel_access="open",
+            users={"111": {"name": "Kira"}},
+        )
+        await adapter.handle_message(_msg(channel_id="8001", sender_id="111"))
+        assert adapter._daemon.published[0]["sender"] == "Kira"

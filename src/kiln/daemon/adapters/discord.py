@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,38 @@ class ControlResponse:
     success: bool
     message: str
     data: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Route classification
+# ---------------------------------------------------------------------------
+
+class RouteBucket(str, Enum):
+    """The three inbound delivery paths, plus control intercept."""
+
+    BRANCH = "branch"     # session-bound thread → one session
+    BRIDGE = "bridge"     # channel thread → Kiln channel
+    SURFACE = "surface"   # DMs / watched channels → N surface subscribers
+
+
+@dataclass
+class RouteDecision:
+    """Result of classifying an inbound message."""
+
+    bucket: RouteBucket
+    session_id: str = ""      # BRANCH: target session
+    channel_name: str = ""    # BRIDGE: target Kiln channel
+    surface_ref: str = ""     # SURFACE: canonical surface ref
+
+
+class RoutingError(Exception):
+    """Raised when an inbound message matches multiple route buckets.
+
+    This is an invariant violation — every message must classify to
+    exactly one bucket. Multiple matches indicate overlapping routing
+    configuration (e.g. a thread that's both a branch and has surface
+    subscribers).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +645,189 @@ class DiscordAdapter:
         proto.EVT_BRIDGE_BOUND: "_on_bridge_bound",
         proto.EVT_BRIDGE_UNBOUND: "_on_bridge_unbound",
     }
+
+    # ------------------------------------------------------------------
+    # Inbound message handling (Discord → daemon)
+    # ------------------------------------------------------------------
+
+    async def handle_message(self, msg: InboundMessage) -> RouteDecision | None:
+        """Main inbound message handler.
+
+        Called by the discord.py on_message callback after extracting
+        raw Discord data into an InboundMessage. This method owns the
+        full routing pipeline: access control, classification, delivery.
+
+        Returns the RouteDecision for observability/testing, or None
+        if the message was dropped (access denied, unrouted, or
+        consumed by a pre-routing intercept like control commands).
+        """
+        if not self._daemon:
+            log.warning("handle_message called before adapter started")
+            return None
+
+        # --- Access control ---
+        if not self._check_access(msg):
+            return None
+
+        # --- Identity resolution ---
+        sender_name, trust = self._discord_config.resolve_user(
+            msg.sender_id, msg.sender_display_name,
+        )
+
+        # --- Pre-routing intercepts ---
+        if self._is_control_channel(msg.channel_id):
+            await self._handle_control_message(msg, sender_name, trust)
+            return None
+
+        # --- Classify ---
+        decision = self._classify_message(msg)
+        if decision is None:
+            log.debug(
+                "Unrouted message from %s in channel %s",
+                msg.sender_id, msg.channel_id,
+            )
+            return None
+
+        # --- Deliver ---
+        if decision.bucket == RouteBucket.BRANCH:
+            platform_msg = self._build_platform_message(
+                msg, sender_name, trust,
+                channel_desc=f"branch:{decision.session_id}",
+            )
+            await self._daemon.deliver_platform_message(
+                decision.session_id, platform_msg,
+            )
+
+        elif decision.bucket == RouteBucket.BRIDGE:
+            await self._daemon.publish_to_channel(
+                decision.channel_name, sender_name,
+                "", msg.content, source="discord",
+            )
+
+        elif decision.bucket == RouteBucket.SURFACE:
+            platform_msg = self._build_platform_message(
+                msg, sender_name, trust,
+            )
+            await self._daemon.deliver_to_surface_subscribers(
+                decision.surface_ref, platform_msg,
+            )
+
+        log.info(
+            "Routed %s message from %s → %s",
+            decision.bucket.value, sender_name,
+            decision.session_id or decision.channel_name or decision.surface_ref,
+        )
+        return decision
+
+    def _classify_message(self, msg: InboundMessage) -> RouteDecision | None:
+        """Classify an inbound message to exactly one route bucket.
+
+        Returns None if no route matches (unrouted).
+        Raises RoutingError if multiple routes match.
+        """
+        matches: list[RouteDecision] = []
+        channel_int = int(msg.channel_id) if msg.channel_id.isdigit() else 0
+
+        # Branch thread → session-bound
+        session_id = self._thread_to_session.get(channel_int)
+        if session_id:
+            matches.append(RouteDecision(
+                bucket=RouteBucket.BRANCH,
+                session_id=session_id,
+            ))
+
+        # Channel thread → bridge
+        channel_name = self._thread_to_channel.get(channel_int)
+        if channel_name:
+            matches.append(RouteDecision(
+                bucket=RouteBucket.BRIDGE,
+                channel_name=channel_name,
+            ))
+
+        # Surface subscription
+        surface_ref = self._build_surface_ref(msg)
+        if self._daemon and self._daemon.state.surfaces.subscribers(surface_ref):
+            matches.append(RouteDecision(
+                bucket=RouteBucket.SURFACE,
+                surface_ref=surface_ref,
+            ))
+
+        if len(matches) > 1:
+            bucket_names = [m.bucket.value for m in matches]
+            raise RoutingError(
+                f"Message in channel {msg.channel_id} matched {len(matches)} "
+                f"route buckets: {bucket_names}. This is a routing invariant "
+                f"violation — check for overlapping thread mappings and "
+                f"surface subscriptions."
+            )
+
+        return matches[0] if matches else None
+
+    def _check_access(self, msg: InboundMessage) -> bool:
+        """Check if the sender is allowed to interact on this surface."""
+        policy = (
+            self._discord_config.dm_access if msg.is_dm
+            else self._discord_config.channel_access
+        )
+        if not policy.is_allowed(msg.sender_id):
+            log.debug(
+                "Blocked message from %s — access denied (%s)",
+                msg.sender_id, "dm" if msg.is_dm else "channel",
+            )
+            return False
+        return True
+
+    def _is_control_channel(self, channel_id: str) -> bool:
+        """Check if a channel ID is the configured control channel."""
+        control_id = self._discord_config.channels.get("control")
+        return bool(control_id and channel_id == control_id)
+
+    def _build_surface_ref(self, msg: InboundMessage) -> str:
+        """Build the canonical surface ref for routing lookups."""
+        if msg.is_dm:
+            return f"discord:user:{msg.sender_id}"
+        return f"discord:channel:{msg.channel_id}"
+
+    def _build_platform_message(
+        self,
+        msg: InboundMessage,
+        sender_name: str,
+        trust: str,
+        channel_desc: str = "",
+    ) -> PlatformMessage:
+        """Build a PlatformMessage for daemon delivery."""
+        if not channel_desc:
+            channel_desc = "dm" if msg.is_dm else f"channel:{msg.channel_id}"
+        return PlatformMessage(
+            sender_name=sender_name,
+            sender_platform_id=msg.sender_id,
+            platform="discord",
+            content=msg.content,
+            trust=trust,
+            channel_desc=channel_desc,
+            channel_id=msg.channel_id,
+            attachment_paths=msg.attachment_paths or None,
+        )
+
+    async def _handle_control_message(
+        self,
+        msg: InboundMessage,
+        sender_name: str,
+        trust: str,
+    ) -> None:
+        """Handle a message in the control channel.
+
+        Control commands require full trust. Parsing and execution
+        are wired in Slice D when the Discord client is available.
+        """
+        if trust != "full":
+            log.warning(
+                "Control command from %s (%s) denied — requires full trust",
+                sender_name, msg.sender_id,
+            )
+            return
+        # Stub — control command parsing is Slice D
+        log.debug("Control message from %s: %s", sender_name, msg.content[:100])
 
     # ------------------------------------------------------------------
     # State persistence helper
