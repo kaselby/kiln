@@ -540,7 +540,12 @@ class KilnApp:
         self._last_call_usage = {}  # per-API-call usage from message_delta events
         self._receiving = False
         self._interrupt_in_flight = False
+        self._active_turn_task: asyncio.Task | None = None
+        self._active_turn_generation: int = 0
         self._receive_task: asyncio.Task | None = None
+        self._interrupt_cancel_handle = None
+
+
         # Permission mode lives on the harness (session config file); TUI
         # provides a property alias.  Trusted mode is a volatile overlay —
         # it only exists in-memory and can only be set from the TUI.
@@ -700,11 +705,6 @@ class KilnApp:
                 app_ref._show_usage()
                 return
 
-            # Lock out further submissions immediately
-            app_ref._receiving = True
-            if app_ref._app:
-                app_ref._app.invalidate()
-
             # Collect pending images before sending
             images = list(app_ref._pending_images) if app_ref._pending_images else None
             app_ref._pending_images.clear()
@@ -715,9 +715,8 @@ class KilnApp:
                 label = ""
             _tprint("<user>You:</user> {}{}", text or "(image)", label)
 
-            app_ref._receive_task = asyncio.ensure_future(
-                app_ref._send_and_receive(text, images=images)
-            )
+            app_ref._start_turn(text, images=images)
+
 
         @kb.add("enter", filter=is_receiving & ~is_permission_pending)
         def handle_enter_receiving(event):
@@ -1061,7 +1060,8 @@ class KilnApp:
                         msg = self._steering_queue.pop(0)
                     if msg:
                         _tprint("<dim>...</dim>")
-                        self._receive_task = asyncio.ensure_future(self._send_and_receive(msg))
+                        self._start_turn(msg)
+
 
                 if self._followup_queue or self._steering_queue:
                     self._initial_task = asyncio.ensure_future(send_initial())
@@ -1187,14 +1187,58 @@ class KilnApp:
 
         _tprint("\n<dim>\u2500\u2500\u2500 Resuming \u2500\u2500\u2500\n</dim>")
 
-    async def _send_and_receive(
+    def _queue_next_message(self) -> tuple[str, str] | None:
+        """Return the next queued user turn, preferring typed steering input."""
+
+        if self._steering_queue:
+            return self._steering_queue.pop(0), "user"
+        if self._followup_queue:
+            return self._followup_queue.pop(0), "user"
+        return None
+
+    def _start_turn(
         self, text: str, source: str = "user",
         images: list[Path] | None = None,
+    ) -> asyncio.Task:
+        """Start a new turn task and make it the active dispatcher-owned turn."""
+        self._active_turn_generation += 1
+        generation = self._active_turn_generation
+        self._receiving = True
+        if self._app:
+            self._app.invalidate()
+        task = asyncio.ensure_future(self._send_and_receive(
+            text, generation, source=source, images=images,
+        ))
+
+        self._active_turn_task = task
+        self._receive_task = task
+        return task
+
+    def _maybe_start_next_turn(self) -> asyncio.Task | None:
+        """Dispatch the next queued turn iff the runtime is truly idle."""
+        if self._receiving or self._interrupt_in_flight or self._pending_permission:
+            return None
+        if self._active_turn_task and not self._active_turn_task.done():
+            return None
+        next_item = self._queue_next_message()
+        if not next_item:
+            return None
+        next_msg, source = next_item
+        _tprint("<user>You:</user> {}", next_msg)
+        return self._start_turn(next_msg, source=source)
+
+    async def _send_and_receive(
+        self, text: str, generation: int,
+        source: str = "user",
+        images: list[Path] | None = None,
     ) -> None:
+
+
         """Send a message and render the full response."""
         self._stream_chunks = []
         self._thinking_buffer = ""
         self._receiving = True
+
 
         try:
             # Inject timestamp + source header so the agent has time and source awareness
@@ -1242,44 +1286,47 @@ class KilnApp:
                 self._commit_stream()
                 self._commit_thinking()
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             _tprint("\n<err-b>Error:</err-b> {}", str(e))
         finally:
-            self._receiving = False
-            self._interrupt_in_flight = False
-            self._last_turn_source = source
-            self._last_auto_delivery = time.monotonic()
+            is_active_generation = generation == self._active_turn_generation
+            if is_active_generation:
+                self._receiving = False
+                self._interrupt_in_flight = False
+                if self._interrupt_cancel_handle is not None:
+                    self._interrupt_cancel_handle.cancel()
+                    self._interrupt_cancel_handle = None
+                self._last_turn_source = source
 
-            # Reset heartbeat backoff on real activity (not heartbeats themselves)
-            if source not in ("heartbeat", "idle-nudge"):
-                self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
-                self._last_real_activity = time.monotonic()
-                self._idle_nudge_sent = False
+                self._last_auto_delivery = time.monotonic()
 
-            # Check if the agent requested a session exit (exit_session tool)
-            sc = self._harness.session_control
-            if sc and sc.quit_requested and self._app:
-                if sc.continue_requested:
-                    self._harness.continue_requested = True
-                    self._harness.handoff_text = sc.handoff_text
-                self._app.exit()
-                return
+                # Reset heartbeat backoff on real activity (not heartbeats themselves)
+                if source not in ("heartbeat", "idle-nudge"):
+                    self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
+                    self._last_real_activity = time.monotonic()
+                    self._idle_nudge_sent = False
 
-            if self._app:
-                self._app.invalidate()
+                # Check if the agent requested a session exit (exit_session tool)
+                sc = self._harness.session_control
+                if sc and sc.quit_requested and self._app:
+                    if sc.continue_requested:
+                        self._harness.continue_requested = True
+                        self._harness.handoff_text = sc.handoff_text
+                    self._app.exit()
+                    return
 
-            # Send next queued message: steering first (user-typed), then followup
-            next_msg = None
-            if self._steering_queue:
-                next_msg = self._steering_queue.pop(0)
-            elif self._followup_queue:
-                next_msg = self._followup_queue.pop(0)
-            if next_msg:
-                _tprint("<user>You:</user> {}", next_msg)
-                self._receiving = True
+                if self._active_turn_task is asyncio.current_task():
+                    self._active_turn_task = None
+                if self._receive_task is asyncio.current_task():
+                    self._receive_task = None
+
                 if self._app:
                     self._app.invalidate()
-                self._receive_task = asyncio.ensure_future(self._send_and_receive(next_msg))
+
+                self._maybe_start_next_turn()
+
 
     async def _do_interrupt(self) -> None:
         """Interrupt the current response."""
@@ -1298,12 +1345,21 @@ class KilnApp:
         except Exception:
             pass
         loop = asyncio.get_event_loop()
-        loop.call_later(5.0, self._force_cancel_receive)
+        if self._interrupt_cancel_handle is not None:
+            self._interrupt_cancel_handle.cancel()
+        task_to_cancel = self._receive_task
+        self._interrupt_cancel_handle = loop.call_later(
+            5.0, self._force_cancel_receive, task_to_cancel,
+        )
 
-    def _force_cancel_receive(self) -> None:
-        """Safety net: cancel receive task if still running after interrupt timeout."""
-        if self._receive_task and not self._receive_task.done():
-            self._receive_task.cancel()
+
+    def _force_cancel_receive(self, task: asyncio.Task | None = None) -> None:
+        """Safety net: cancel the interrupted receive task after timeout."""
+        self._interrupt_cancel_handle = None
+        target = task or self._receive_task
+        if target and not target.done():
+            target.cancel()
+
 
     # ---- Idle message delivery ----
 
@@ -1394,13 +1450,11 @@ class KilnApp:
         else:
             cooldown = 1.0
 
-        self._receive_task = asyncio.ensure_future(self._send_and_receive(formatted, source="agent"))
-        self._receiving = True
-        if self._app:
-            self._app.invalidate()
+        task = self._start_turn(formatted, source="agent")
 
         try:
-            await self._receive_task
+            await task
+
         except Exception:
             marker.unlink(missing_ok=True)
             raise
@@ -1468,12 +1522,9 @@ class KilnApp:
                         f"</system-reminder>"
                     )
                     _tprint("\n<dim>\u23f0 Idle nudge ({} min inactive)</dim>", minutes)
-                    self._receive_task = asyncio.ensure_future(
-                        self._send_and_receive(msg, source="idle-nudge"))
-                    self._receiving = True
-                    if self._app:
-                        self._app.invalidate()
-                    await self._receive_task
+                    task = self._start_turn(msg, source="idle-nudge")
+                    await task
+
                     continue
 
             # --- Regular heartbeat ---
@@ -1502,11 +1553,9 @@ class KilnApp:
             minutes = int(elapsed / 60)
             _tprint("\n<dim>\u2764\ufe0f Heartbeat ({} idle)</dim>", f"{minutes}min")
 
-            self._receive_task = asyncio.ensure_future(self._send_and_receive(msg, source="heartbeat"))
-            self._receiving = True
-            if self._app:
-                self._app.invalidate()
-            await self._receive_task
+            task = self._start_turn(msg, source="heartbeat")
+            await task
+
 
             # Only increase backoff when not using override
             if self._heartbeat_override <= 0:
