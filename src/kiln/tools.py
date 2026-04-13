@@ -161,7 +161,7 @@ IMAGE_MAX_DIM        = 2000               # max width or height in pixels
 
 _tools_log = logging.getLogger("kiln.tools")
 
-MAX_LINES = 2000
+MAX_OUTPUT_CHARS = 45_000
 MAX_LINE_LEN = 2000
 
 
@@ -646,7 +646,19 @@ def _read_text(
     offset: int | None = None,
     limit: int | None = None,
 ) -> dict:
-    """Read a text file in cat -n format."""
+    """Read a text file in cat -n format with a character budget."""
+    # --- Validate offset/limit ---
+    if offset is not None:
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            return _error("offset must be a positive integer.")
+        if offset < 1:
+            return _error("offset must be >= 1 (line numbers start at 1).")
+    if limit is not None:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            return _error("limit must be a positive integer.")
+        if limit < 1:
+            return _error("limit must be >= 1.")
+
     try:
         raw = Path(normalized).read_text(errors="replace")
     except OSError as e:
@@ -668,9 +680,9 @@ def _read_text(
             "are empty.</system-reminder>"
         )
 
-    start = max(1, int(offset)) if offset is not None else 1
-    max_lines = int(limit) if limit is not None else MAX_LINES
-    partial = offset is not None or limit is not None
+    start = int(offset) if offset is not None else 1
+    max_lines = int(limit) if limit is not None else total_lines
+    explicit_limit = limit is not None
 
     if start > total_lines:
         file_state.record_read(normalized, partial=True)
@@ -680,13 +692,34 @@ def _read_text(
             f"{total_lines} lines.</system-reminder>"
         )
 
-    selected = lines[start - 1 : start - 1 + max_lines]
-
+    # Build output lines within the character budget.
     output_lines = []
-    for i, line in enumerate(selected, start=start):
+    char_count = 0
+    truncated_by_budget = False
+    end_line = min(start - 1 + max_lines, total_lines)
+
+    for i, line in enumerate(lines[start - 1 : end_line], start=start):
         if len(line) > MAX_LINE_LEN:
-            line = line[:MAX_LINE_LEN]
-        output_lines.append(f"{i:>6}\t{line}")
+            line = line[:MAX_LINE_LEN] + " [truncated]"
+        formatted = f"{i:>6}\t{line}"
+        if char_count + len(formatted) + 1 > MAX_OUTPUT_CHARS and output_lines:
+            truncated_by_budget = True
+            break
+        output_lines.append(formatted)
+        char_count += len(formatted) + 1  # +1 for newline
+
+    lines_shown = len(output_lines)
+    last_line_shown = start + lines_shown - 1
+    lines_remaining = total_lines - last_line_shown
+    partial = (start > 1) or (last_line_shown < total_lines) or explicit_limit
+
+    if truncated_by_budget or (last_line_shown < end_line):
+        output_lines.append(
+            f"\n--- Output truncated (character budget). "
+            f"Showed lines {start}-{last_line_shown} of {total_lines}. "
+            f"{lines_remaining} lines remaining. "
+            f"Use offset={last_line_shown + 1} to continue. ---"
+        )
 
     file_state.record_read(normalized, partial=partial)
     return _ok("\n".join(output_lines))
@@ -1092,12 +1125,15 @@ READ_DESC = (
     "reading all text files.\n\n"
     "Usage:\n"
     "- The file_path parameter must be an absolute path, not a relative path\n"
-    "- By default, it reads up to 2000 lines starting from the beginning "
-    "of the file\n"
-    "- You can optionally specify a line offset and limit (especially handy "
-    "for long files), but it's recommended to read the whole file by not "
-    "providing these parameters\n"
-    "- Any lines longer than 2000 characters will be truncated\n"
+    "- By default, it reads from the beginning of the file up to a character "
+    "budget (~45K chars). For large files, the output will be truncated with "
+    "a message showing how many lines remain and what offset to use to "
+    "continue reading.\n"
+    "- Use `offset` and `limit` to read specific sections of large files. "
+    "This is the recommended approach for files over a few hundred lines — "
+    "read the section you need rather than the entire file.\n"
+    "- Any lines longer than 2000 characters will be truncated (marked with "
+    "[truncated]).\n"
     "- Results are returned using cat -n format, with line numbers starting at 1\n"
     "- This tool can read images (PNG, JPG, GIF, WebP). Image content is "
     "presented visually.\n"
@@ -1115,17 +1151,19 @@ READ_SCHEMA = {
             "description": "The absolute path to the file to read",
         },
         "offset": {
-            "type": "number",
+            "type": "integer",
             "description": (
-                "The line number to start reading from. "
+                "The line number to start reading from (positive integer). "
                 "Only provide if the file is too large to read at once"
             ),
         },
         "limit": {
-            "type": "number",
+            "type": "integer",
             "description": (
-                "The number of lines to read. "
+                "The number of lines to read (positive integer). "
                 "Only provide if the file is too large to read at once."
+                " When the output is truncated, the truncation message "
+                "tells you exactly what offset to use to continue."
             ),
         },
         "pages": {
