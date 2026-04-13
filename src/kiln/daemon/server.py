@@ -908,6 +908,9 @@ class KilnDaemon:
         self.config.channels_dir.mkdir(parents=True, exist_ok=True)
         self.config.subscriptions_dir.mkdir(parents=True, exist_ok=True)
 
+        # Kill any existing daemon process before taking over
+        _kill_existing_daemon(self.config.pid_file)
+
         # Clean stale socket
         if self.config.socket_path.exists():
             self.config.socket_path.unlink()
@@ -1053,6 +1056,55 @@ class KilnDaemon:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _kill_existing_daemon(pid_file: Path) -> None:
+    """Kill any existing daemon process identified by the PID file.
+
+    Called at the top of start() to enforce single-instance. Without this,
+    restarting the daemon leaves the old process running with its own
+    reconcile loop and Discord client, causing duplicate branch threads
+    and other state divergence.
+    """
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return
+
+    if pid == os.getpid():
+        return
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        return
+    except PermissionError:
+        log.warning("Cannot signal existing daemon PID %d — permission denied", pid)
+        return
+
+    log.info("Killing existing daemon (PID %d)", pid)
+    os.kill(pid, signal.SIGTERM)
+
+    import time
+    for _ in range(50):  # 5 seconds
+        try:
+            os.kill(pid, 0)
+            time.sleep(0.1)
+        except ProcessLookupError:
+            log.info("Existing daemon (PID %d) terminated", pid)
+            pid_file.unlink(missing_ok=True)
+            return
+
+    log.warning("Daemon PID %d didn't exit after SIGTERM, sending SIGKILL", pid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    pid_file.unlink(missing_ok=True)
+
 
 def _setup_logging(log_file: Path | None = None) -> None:
     """Configure logging for the daemon process."""

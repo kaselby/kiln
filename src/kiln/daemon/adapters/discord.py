@@ -881,6 +881,7 @@ class DiscordAdapter:
 
         # Adapter-local branch/channel thread mappings
         self._branch_threads: dict[str, int] = {}  # session_id -> discord thread_id
+        self._branch_threads_pending: set[str] = set()  # in-flight thread creation
         self._channel_threads: dict[str, int] = {}  # channel_name -> discord thread_id
 
         # Reverse indexes (rebuilt on load/mutation)
@@ -1278,12 +1279,19 @@ class DiscordAdapter:
             )
             return
 
+        # Guard against async TOCTOU: multiple session_live events can
+        # arrive before the first _discord_create_thread completes.
+        if session_id in self._branch_threads_pending:
+            log.debug("Branch thread creation already in flight for %s", session_id)
+            return
+
         # Create a new branch thread
         branches_channel = self._discord_config.channels.get("branches")
         if not branches_channel:
             log.debug("No #branches channel configured, skipping branch thread for %s", session_id)
             return
 
+        self._branch_threads_pending.add(session_id)
         try:
             thread_id = await self._discord_create_thread(
                 branches_channel, session_id,
@@ -1296,6 +1304,8 @@ class DiscordAdapter:
                 log.info("Created branch thread %d for %s", thread_id, session_id)
         except Exception:
             log.exception("Failed to create branch thread for %s", session_id)
+        finally:
+            self._branch_threads_pending.discard(session_id)
 
     async def _on_session_gone(self, event: proto.Message) -> None:
         """A session is no longer live (pruned by tmux reconciliation).

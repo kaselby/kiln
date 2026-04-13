@@ -763,18 +763,18 @@ def cmd_daemon(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if subcmd == "start":
-        if SOCKET_PATH.exists():
-            # Check if actually running
-            if PID_FILE.exists():
-                try:
-                    pid = int(PID_FILE.read_text().strip())
-                    os.kill(pid, 0)
-                    print(f"Daemon already running (PID {pid})")
-                    return
-                except (ValueError, ProcessLookupError, PermissionError):
-                    # Stale — clean up and start fresh
-                    SOCKET_PATH.unlink(missing_ok=True)
-                    PID_FILE.unlink(missing_ok=True)
+        # Check PID file first — socket may be missing if another startup
+        # deleted it, but the old process could still be alive.
+        if PID_FILE.exists():
+            try:
+                pid = int(PID_FILE.read_text().strip())
+                os.kill(pid, 0)
+                print(f"Daemon already running (PID {pid})")
+                return
+            except (ValueError, ProcessLookupError, PermissionError):
+                # Stale — clean up and start fresh
+                PID_FILE.unlink(missing_ok=True)
+                SOCKET_PATH.unlink(missing_ok=True)
 
         DAEMON_DIR.mkdir(parents=True, exist_ok=True)
 
