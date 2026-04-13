@@ -60,11 +60,13 @@ from ..types import (
     ToolCallEvent,
     ToolResultEvent,
     TurnCompleteEvent,
+    Usage,
     UsageUpdateEvent,
 )
 
 from ..hooks import _resolve_live_trust, format_message_source, parse_message
 from ..state import write_presence
+
 from ..permissions import (
     PermissionMode,
     PermissionRequest,
@@ -1797,6 +1799,24 @@ class KilnApp:
                 elif updated:
                     _tprint("\n<hook>  \u26a1 hook:{} \u2192 (output replaced)</hook>", hook_name)
 
+    def _update_usage_state(self, usage: Usage, *, update_last_call: bool) -> None:
+        if update_last_call:
+            self._last_call_usage = {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_read_input_tokens": usage.cache_read_tokens or 0,
+                "cache_creation_input_tokens": usage.cache_write_tokens or 0,
+            }
+        self._context_tokens = (
+            usage.input_tokens
+            + (usage.cache_read_tokens or 0)
+            + (usage.cache_write_tokens or 0)
+        )
+        if self._harness.session_control:
+            self._harness.session_control.context_tokens = self._context_tokens
+        if self._app:
+            self._app.invalidate()
+
     def _handle_event(self, event: Event) -> None:
         """Route an incoming Kiln Event to the appropriate handler."""
         self._drain_ui_events()
@@ -1805,6 +1825,7 @@ class KilnApp:
             self._current_block_type = event.content_type
 
         elif isinstance(event, ContentBlockEndEvent):
+
             self._current_block_type = ""
 
         elif isinstance(event, ContentBlockDeltaEvent):
@@ -1848,37 +1869,18 @@ class KilnApp:
                 self._harness.session_id = event.session_id
                 self._harness.register_session()
             if event.usage:
-                self._last_call_usage = {
-                    "input_tokens": event.usage.input_tokens,
-                    "output_tokens": event.usage.output_tokens,
-                    "cache_read_input_tokens": event.usage.cache_read_tokens or 0,
-                    "cache_creation_input_tokens": event.usage.cache_write_tokens or 0,
-                }
-                self._context_tokens = (
-                    event.usage.input_tokens
-                    + (event.usage.cache_read_tokens or 0)
-                    + (event.usage.cache_write_tokens or 0)
-                )
-                if self._harness.session_control:
-                    self._harness.session_control.context_tokens = self._context_tokens
+                self._update_usage_state(event.usage, update_last_call=True)
             self._on_turn_complete_event(event)
 
         elif isinstance(event, UsageUpdateEvent):
             if event.usage:
-                self._context_tokens = (
-                    event.usage.input_tokens
-                    + (event.usage.cache_read_tokens or 0)
-                    + (event.usage.cache_write_tokens or 0)
-                )
-                if self._harness.session_control:
-                    self._harness.session_control.context_tokens = self._context_tokens
-                if self._app:
-                    self._app.invalidate()
+                self._update_usage_state(event.usage, update_last_call=False)
 
         elif isinstance(event, ErrorEvent):
             _tprint("\n<err-b>Error:</err-b> <err>{}</err>", event.message)
 
         elif isinstance(event, SystemMessageEvent):
+
             if event.subtype not in ("init",):
                 _tprint("<dim-i>System: {}</dim-i>", event.subtype)
 

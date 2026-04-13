@@ -23,6 +23,7 @@ from ..types import (
     ErrorEvent,
     Event,
     HookDispatcher,
+    Provider,
     TextContent,
     TextEvent,
     ThinkingEvent,
@@ -31,13 +32,13 @@ from ..types import (
     ToolResultEvent,
     TurnCompleteEvent,
     Usage,
-    Provider,
+    UsageUpdateEvent,
 )
 
 log = logging.getLogger("kiln.backends.custom")
 
-
 # ---------------------------------------------------------------------------
+
 # Conversation history types — internal to CustomBackend
 # ---------------------------------------------------------------------------
 
@@ -135,6 +136,7 @@ class CustomBackend:
             tool_calls: list[ToolCallEvent] = []
             assistant_turn = AssistantTurn()
             raw_output_collector: list[dict] = []
+            saw_usage_update = False
 
             try:
                 stream = self._provider.stream(
@@ -158,6 +160,8 @@ class CustomBackend:
                         assistant_turn.text += event.text
                     elif isinstance(event, ThinkingEvent):
                         assistant_turn.thinking_text += event.text
+                    elif isinstance(event, UsageUpdateEvent):
+                        saw_usage_update = True
                     elif isinstance(event, TurnCompleteEvent):
                         # Don't yield intermediate TurnCompleteEvents — the
                         # TUI expects exactly one per user turn. Accumulate
@@ -174,6 +178,7 @@ class CustomBackend:
             except Exception as e:
                 log.error("Provider stream error: %s", e)
                 yield ErrorEvent(
+
                     message=f"Provider error: {e}",
                     is_retryable=_is_retryable_error(e),
                 )
@@ -186,6 +191,19 @@ class CustomBackend:
             # Store assistant turn in history
             self._history.append(assistant_turn)
 
+            # Claude surfaces live usage updates mid-turn from streaming deltas.
+            # Custom providers may only report usage at provider-call boundaries,
+            # so synthesize a UsageUpdateEvent here when the model is about to
+            # hand control to tools and no live update has already been emitted.
+            if (
+                not self._interrupted
+                and tool_calls
+                and last_turn_complete
+                and last_turn_complete.usage
+                and not saw_usage_update
+            ):
+                yield UsageUpdateEvent(usage=last_turn_complete.usage)
+
             if self._interrupted or not tool_calls:
                 break
 
@@ -193,6 +211,7 @@ class CustomBackend:
             hook_stopped = False
             for tc in tool_calls:
                 if self._interrupted:
+
                     break
 
                 # Pre-tool hook (permission check)
