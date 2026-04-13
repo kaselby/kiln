@@ -583,10 +583,10 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
 
 
 def _resolve_live_trust(msg: dict, state_dir: Path | None) -> None:
-    """Override a gateway message's trust field with live trust state.
+    """Override a platform message's trust field with live trust state.
 
-    Modifies ``msg`` in place. Only applies to gateway messages (source is a
-    platform name, not "kiln"/"agent"). Agent and non-gateway messages are
+    Modifies ``msg`` in place. Only applies to platform messages (source is a
+    platform name, not "kiln"/"agent"). Agent and non-platform messages are
     left untouched.
 
     Extracts the platform from the message source and reads the corresponding

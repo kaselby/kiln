@@ -77,13 +77,13 @@ Every agent session runs inside a tmux session. The shell persists between tool 
 
 Four modes (`safe` → `supervised` → `yolo` → `trusted`), cycling via TUI keybinding or set at startup.
 
-**Guardrails** run on every Bash call regardless of mode. Two tiers: **block** (catastrophic ops — always denied) and **confirm** (destructive-but-legitimate — always prompts, even in yolo). When a prompt fires, it races the terminal TUI against the gateway (Discord) in parallel — first response wins, the other source is cleaned up.
+**Guardrails** run on every Bash call regardless of mode. Two tiers: **block** (catastrophic ops — always denied) and **confirm** (destructive-but-legitimate — always prompts, even in yolo). When a prompt fires, it races the terminal TUI against the daemon's remote adapter path (currently Discord) in parallel — first response wins, the other source is cleaned up.
 
 ### Services
 
-**Gateway** (`services/gateway/`) — Discord bridge. Bridges Kiln messaging channels to Discord threads bidirectionally. Handles remote permission approval via Approve/Reject button embeds — approve agent actions from your phone when the terminal isn't at hand.
+**Daemon** (`src/kiln/daemon/`) — local routing/control daemon plus platform adapters. Handles Kiln channel routing, Discord bridge behavior, remote permission approval, and platform operations over the local Unix socket RPC.
 
-**Voice** (`services/voice/`) — Whisper STT + OpenAI TTS. Used by the gateway for Discord voice messages.
+**Voice** (`services/voice/`) — Whisper STT + OpenAI TTS. Used by the daemon's Discord adapter for voice messages.
 
 ### Session Lifecycle
 

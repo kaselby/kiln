@@ -1,6 +1,6 @@
 """Agent state — presence tracking and trust state.
 
-Simple file-based state that multiple processes (TUI, gateway, tools) read and
+Simple file-based state that multiple processes (TUI, daemon, tools) read and
 write without coordination. Each writer owns its own file to avoid races.
 
 State files live in ``{agent_home}/state/``.
