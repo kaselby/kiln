@@ -1169,7 +1169,8 @@ class KilnHarness:
     # No daemon deregistration needed — tmux reconciliation handles cleanup.
 
     def _snapshot_session_state(self) -> None:
-        """Update the session state file with final config and channel subscriptions."""
+        """Update the session state file with final config, channels, and context."""
+
         path = self._session_state_path
         if not path.exists():
             return
@@ -1187,9 +1188,14 @@ class KilnHarness:
         except OSError:
             pass
 
+    def persist_live_session_state(self) -> None:
+        """Persist the current session state so external status surfaces can read it live."""
+        self._snapshot_session_state()
+
     async def stop(self):
         """Disconnect the agent session and clean up resources."""
         self._snapshot_session_state()
+
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None

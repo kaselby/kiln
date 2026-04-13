@@ -4125,7 +4125,35 @@ class TestEnrichWithHomeDecorators:
         assert usage == (85000, 200000)
 
 
+class TestLiveSessionStatePersistence:
+    def test_persist_live_session_state_writes_context_tokens(self, tmp_path):
+        import types
+        import yaml
+        from kiln.harness import KilnHarness
+        from kiln.tools import SessionControl
+
+        session_state_path = tmp_path / "logs" / "session-state" / "dalet-test.yml"
+        session_state_path.parent.mkdir(parents=True)
+        session_state_path.write_text(yaml.dump({"system_prompt": "test"}))
+
+        harness = KilnHarness.__new__(KilnHarness)
+        harness.config = types.SimpleNamespace(home=tmp_path)
+        harness.agent_id = "dalet-test"
+        harness.session_config = None
+        harness._desired_subscriptions = ["alpha"]
+        harness.session_control = SessionControl()
+        harness.session_control.context_tokens = 12345
+
+        harness.persist_live_session_state()
+
+        state = yaml.safe_load(session_state_path.read_text()) or {}
+        assert state["channel_subscriptions"] == ["alpha"]
+        assert state["context_tokens"] == 12345
+
+
+
 class TestConclaveMembership:
+
 
     def test_parses_briefing(self, tmp_path):
         from kiln.daemon.state import SessionRecord

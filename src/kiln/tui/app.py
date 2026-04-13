@@ -1635,8 +1635,12 @@ class KilnApp:
         )
         if self._harness.session_control:
             self._harness.session_control.context_tokens = self._context_tokens
+        persist = getattr(self._harness, "persist_live_session_state", None)
+        if persist:
+            persist()
         if self._app:
             self._app.invalidate()
+
 
     def _handle_event(self, event: Event) -> None:
         """Route an incoming Kiln Event to the appropriate handler."""
