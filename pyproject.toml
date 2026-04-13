@@ -8,11 +8,11 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk>=0.1.54",
-    "pyyaml>=6.0",
-    "prompt-toolkit>=3.0.52",
-    "markdown-it-py>=3.0",
-    "openai>=1.60",
+    "claude-agent-sdk~=0.1.54",
+    "pyyaml~=6.0.3",
+    "prompt-toolkit~=3.0.52",
+    "markdown-it-py~=4.0.0",
+    "openai~=2.31.0",
 ]
 
 [project.scripts]
@@ -20,11 +20,11 @@ kiln = "kiln.cli:main"
 
 [project.optional-dependencies]
 discord = [
-    "discord.py>=2.3",
+    "discord.py==2.7.1",
 ]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
+    "pytest~=9.0.3",
+    "pytest-asyncio~=1.3.0",
 ]
 
 [tool.hatch.build.targets.wheel]
