@@ -134,8 +134,57 @@ def _parse_plan_simple(path: Path) -> dict | None:
     return {"goal": goal, "tasks": tasks}
 
 
+def _resolve_agent_home(agent_id: str) -> Path | None:
+    """Resolve an agent's home directory from its ID prefix via agents.yml."""
+    agents_yml = Path.home() / ".kiln" / "agents.yml"
+    if not agents_yml.exists():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(agents_yml.read_text()) or {}
+    except ImportError:
+        # Fallback: simple line parsing for "prefix: path" format
+        try:
+            data = {}
+            for line in agents_yml.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and ":" in line:
+                    k, v = line.split(":", 1)
+                    data[k.strip()] = v.strip()
+        except OSError:
+            return None
+    except Exception:
+        return None
+    prefix = agent_id.split("-")[0]
+    home_str = data.get(prefix)
+    if isinstance(home_str, str):
+        return Path(home_str).expanduser().resolve()
+    return None
+
+
 def get_context_usage(agent_id: str, registry: dict) -> tuple[int, int] | None:
-    """Get (used_tokens, max_tokens) from live JSONL. Returns None if unavailable."""
+    """Get (used_tokens, max_tokens) from session state or live JSONL."""
+    # Backend-agnostic: session-state YAML written by the harness.
+    # Works for all backends (Claude, OpenAI, etc.) and cross-agent.
+    agent_home = _resolve_agent_home(agent_id)
+    if not agent_home:
+        entry = registry.get(agent_id)
+        if entry and entry.get("cwd"):
+            agent_home = Path(entry["cwd"])
+
+    if agent_home:
+        state_path = agent_home / "logs" / "session-state" / f"{agent_id}.yml"
+        if state_path.exists():
+            try:
+                import yaml
+                state = yaml.safe_load(state_path.read_text()) or {}
+                context_tokens = state.get("context_tokens")
+                if isinstance(context_tokens, int) and context_tokens > 0:
+                    return (context_tokens, MAX_TOKENS)
+            except Exception:
+                pass
+
+    # Legacy Claude fallback: conversation JSONL under ~/.claude/projects.
     entry = registry.get(agent_id)
     if not entry:
         return None
