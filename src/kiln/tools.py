@@ -1415,6 +1415,7 @@ def create_mcp_server(
     plans_path: Path | None = None,
     supplemental: SupplementalContent | None = None,
     daemon_client=None,
+    on_channel_subscriptions_changed=None,
 ):
     """Create the Kiln MCP server with standard agent runtime tools.
 
@@ -1513,6 +1514,8 @@ def create_mcp_server(
             if not daemon_client:
                 return _error("Channel operations require the Kiln daemon.")
             count = await daemon_client.subscribe(channel)
+            if on_channel_subscriptions_changed:
+                on_channel_subscriptions_changed("subscribe", channel)
             return _ok(f"Subscribed to channel '{channel}'. {count} subscriber(s).")
 
         elif action == "unsubscribe":
@@ -1522,7 +1525,10 @@ def create_mcp_server(
             if not daemon_client:
                 return _error("Channel operations require the Kiln daemon.")
             await daemon_client.unsubscribe(channel)
+            if on_channel_subscriptions_changed:
+                on_channel_subscriptions_changed("unsubscribe", channel)
             return _ok(f"Unsubscribed from channel '{channel}'.")
+
 
         elif action == "send":
             to = args.get("to")

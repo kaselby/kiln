@@ -512,7 +512,36 @@ async def test_message_tool_unsubscribe_via_daemon(running_daemon, message_tool_
 
 
 @pytest.mark.asyncio
+async def test_message_tool_subscribe_tracks_desired_subscriptions(running_daemon, make_client, daemon_config):
+
+    """message tool subscribe/unsubscribe keeps harness continuation state in sync."""
+    from kiln.tools import create_mcp_server
+
+    inbox_root = daemon_config.agents_registry.parent / "beth" / "inbox"
+    client = make_client("beth", "beth-tool-state")
+    harness = FakeHarness(daemon_client=client)
+
+    _, _, _, mcp_tools = create_mcp_server(
+        inbox_root=inbox_root,
+        skills_path=Path("/nonexistent"),
+        agent_id="beth-tool-state",
+        daemon_client=client,
+        on_channel_subscriptions_changed=harness._on_channel_subscriptions_changed,
+    )
+    handler = next(t for t in mcp_tools if t.name == "message").handler
+
+    await handler({"action": "subscribe", "channel": "alpha"})
+    await handler({"action": "subscribe", "channel": "beta"})
+    await handler({"action": "subscribe", "channel": "alpha"})
+    assert harness._snapshot_channel_subscriptions() == ["alpha", "beta"]
+
+    await handler({"action": "unsubscribe", "channel": "alpha"})
+    assert harness._snapshot_channel_subscriptions() == ["beta"]
+
+
+@pytest.mark.asyncio
 async def test_message_tool_channel_broadcast_via_daemon(
+
     running_daemon, message_tool_fn, make_client, daemon_config
 ):
     """Channel broadcast goes through daemon, delivers to subscriber inboxes."""
@@ -648,6 +677,16 @@ class FakeHarness:
         self._desired_subscriptions = list(subscriptions)
         if self._daemon_client:
             await self._daemon_client.restore_subscriptions(subscriptions)
+
+    def _on_channel_subscriptions_changed(self, action: str, channel: str) -> None:
+        if action == "subscribe":
+            if channel not in self._desired_subscriptions:
+                self._desired_subscriptions.append(channel)
+        elif action == "unsubscribe":
+            self._desired_subscriptions = [
+                ch for ch in self._desired_subscriptions if ch != channel
+            ]
+
 
 
 @pytest.mark.asyncio

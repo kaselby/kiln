@@ -380,7 +380,18 @@ class KilnHarness:
             except DaemonUnavailableError:
                 log.debug("Daemon unavailable — subscriptions will restore on next use")
 
+    def _on_channel_subscriptions_changed(self, action: str, channel: str) -> None:
+        """Keep desired subscription state in sync with tool-level channel changes."""
+        if action == "subscribe":
+            if channel not in self._desired_subscriptions:
+                self._desired_subscriptions.append(channel)
+        elif action == "unsubscribe":
+            self._desired_subscriptions = [
+                ch for ch in self._desired_subscriptions if ch != channel
+            ]
+
     def _cleanup_stale_session_configs(self) -> None:
+
         """Remove session config files for sessions that are no longer running.
 
         Catches orphans left behind by crashes or hard kills where stop()
@@ -688,6 +699,7 @@ class KilnHarness:
             plans_path=plans_path,
             supplemental=self._supplemental,
             daemon_client=self._daemon_client,
+            on_channel_subscriptions_changed=self._on_channel_subscriptions_changed,
         )
         mcp_servers = {"kiln": mcp_server}
 
