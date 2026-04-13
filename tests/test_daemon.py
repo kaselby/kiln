@@ -5103,40 +5103,4 @@ class TestSecurityChallengeOp:
         assert result["result"] == "error"
         assert "no #security channel" in result["error"]
 
-    @pytest.mark.skip(reason="Hangs: run_security_challenge waits for user input with no mock response")
-    async def test_empty_reason_falls_back(self):
-        """Empty string reason should fall back to 'Unspecified' (no regression)."""
-        from kiln.daemon.adapters.discord import _DiscordChallengeTransport
 
-        adapter = _make_adapter(
-            channels={"security": "5555"},
-            users={"111": {"name": "Kira", "max_trust": "full"}},
-        )
-
-        # Fake channel that records sent messages
-        class FakeChannel:
-            id = 5555
-            def __init__(self):
-                self.sent: list[str] = []
-            async def send(self, text):
-                self.sent.append(text)
-                class Msg:
-                    id = 1
-                return Msg()
-            def get_partial_message(self, mid):
-                class Partial:
-                    async def delete(self): pass
-                return Partial()
-
-        fake_ch = FakeChannel()
-        transport = _DiscordChallengeTransport(adapter, fake_ch)
-
-        from kiln.daemon.security import run_security_challenge
-        # Run with a correct password so it completes quickly
-        result = await run_security_challenge(
-            transport,
-            reason="Unspecified",  # this is what the adapter should pass for ""
-            passwords=[{"word": "alpha"}],
-        )
-        # Verify the challenge text contains "Unspecified"
-        assert any("Unspecified" in s for s in fake_ch.sent)
