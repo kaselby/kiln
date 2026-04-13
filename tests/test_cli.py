@@ -2,13 +2,14 @@
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
 
-from kiln.cli import _find_agent_spec, _rebuild_run_args, cmd_run
+from kiln.cli import _build_inner_command, _find_agent_spec, _rebuild_run_args, cmd_run
 
 
 # ---------------------------------------------------------------------------
@@ -260,3 +261,47 @@ class TestCmdRunDispatch:
         assert "--effort" in exec_argv
         assert "--template" in exec_argv
         assert "--var" in exec_argv
+
+
+# ---------------------------------------------------------------------------
+# Inner command / re-entry
+# ---------------------------------------------------------------------------
+
+class TestBuildInnerCommand:
+    """Verify the tmux inner command uses interpreter-relative re-entry."""
+
+    def test_uses_sys_executable(self):
+        args = _make_run_namespace()
+        spec = Path("/tmp/agent.yml")
+        cmd = _build_inner_command(args, "test-agent-1", spec)
+        parts = cmd.split()
+        assert parts[0] == sys.executable
+        assert parts[1:4] == ["-m", "kiln.cli", "run"]
+
+    def test_includes_spec_and_id(self):
+        args = _make_run_namespace()
+        spec = Path("/home/user/.myagent/agent.yml")
+        cmd = _build_inner_command(args, "myagent-red-fox", spec)
+        assert str(spec) in cmd
+        assert "myagent-red-fox" in cmd
+
+    def test_forwards_flags(self):
+        args = _make_run_namespace(
+            model="gpt-5.4", mode="yolo", effort="high",
+            heartbeat="10", template="worker", var=["X=1"],
+        )
+        cmd = _build_inner_command(args, "test-1", Path("/tmp/agent.yml"))
+        assert "--model gpt-5.4" in cmd
+        assert "--mode yolo" in cmd
+        assert "--effort high" in cmd
+        assert "--heartbeat 10" in cmd
+        assert "--template worker" in cmd
+        assert "--var X=1" in cmd
+
+    def test_no_path_dependency(self):
+        """Inner command must not depend on PATH resolution."""
+        args = _make_run_namespace()
+        cmd = _build_inner_command(args, "test-1", Path("/tmp/agent.yml"))
+        parts = cmd.split()
+        # First element is an absolute path (sys.executable), not a bare name
+        assert os.path.isabs(parts[0])

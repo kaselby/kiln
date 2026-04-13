@@ -181,15 +181,15 @@ def parse_args() -> argparse.Namespace:
 # kiln run
 # ---------------------------------------------------------------------------
 
-def _cli_bin() -> str:
-    """Resolve the current CLI binary for use in subprocesses and continuations."""
-    name = Path(sys.argv[0]).name
-    return shutil.which(name) or sys.argv[0]
-
-
 def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Path) -> str:
-    """Build the shell command that runs inside the tmux session."""
-    cmd_parts = [_cli_bin(), "run", str(spec_path), "--id", agent_id]
+    """Build the shell command that runs inside the tmux session.
+
+    Uses sys.executable to re-enter via the same Python interpreter, preserving
+    the active venv and import path. This makes worktree testing work (the inner
+    tmux process uses the same code as the outer) and avoids fragile PATH-based
+    binary resolution.
+    """
+    cmd_parts = [sys.executable, "-m", "kiln.cli", "run", str(spec_path), "--id", agent_id]
     if args.model:
         cmd_parts += ["--model", args.model]
     if args.parent:
@@ -480,9 +480,9 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
         _stop_caffeinate(_caffeinate_proc)
 
     if harness.continue_requested:
-        cli_bin = _cli_bin()
         cont = getattr(harness, '_continuation_state', {})
-        exec_args = [cli_bin, "run", str(spec_path.resolve()),
+        exec_args = [sys.executable, "-m", "kiln.cli",
+                     "run", str(spec_path.resolve()),
                      "--mode", "yolo",
                      "--parent", harness.agent_id, "--continuation"]
         if cont.get('heartbeat_enabled'):
@@ -510,11 +510,13 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             os.write(fd, harness.handoff_text.encode())
             os.close(fd)
             exec_args += ["--prompt-file", path]
-        os.execvp(cli_bin, exec_args)
+        os.execvp(sys.executable, exec_args)
 
     if harness.restart_requested:
-        cli_bin = _cli_bin()
-        os.execvp(cli_bin, [cli_bin, "run", str(spec_path.resolve())])
+        os.execvp(sys.executable, [
+            sys.executable, "-m", "kiln.cli",
+            "run", str(spec_path.resolve()),
+        ])
 
 
 # ---------------------------------------------------------------------------
