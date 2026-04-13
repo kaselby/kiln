@@ -24,15 +24,19 @@ from claude_agent_sdk import HookMatcher
 
 from .backends.claude import ClaudeBackend
 from .daemon.client import DaemonClient, DaemonUnavailableError
+from .guardrails import detect_role_injection
 from .types import (
     Backend,
     BackendConfig,
     ContentBlock,
+    ContentBlockDeltaEvent,
+    ContentBlockStartEvent,
     DocumentContent,
     ErrorEvent,
     HookDispatcher,
     HookRule,
     TextContent,
+    TextEvent,
     ToolDef,
     TurnCompleteEvent,
 )
@@ -981,6 +985,10 @@ class KilnHarness:
     async def receive(self):
         """Yield Kiln Events from the backend until the turn ends.
 
+        Scans assistant text output for role injection (fabricated Human
+        turns).  If detected, interrupts generation immediately to prevent
+        tool calls from executing on fabricated input.
+
         After each receive cycle, checks for pending supplemental content
         (e.g. PDF document blocks). If found, transparently injects it as
         a new user turn and continues yielding.
@@ -992,7 +1000,35 @@ class KilnHarness:
         if not self._backend:
             raise RuntimeError("Harness not started. Call start() first.")
 
+        async for event in self._receive_guarded():
+            yield event
+
+        # Transparent supplemental content injection.
+        while self._supplemental and self._supplemental.has_pending:
+            items = self._supplemental.drain()
+            rich_blocks = self._build_supplemental_blocks(items)
+            await self._backend.send(rich_blocks)
+            async for event in self._receive_guarded():
+                yield event
+
+    async def _receive_guarded(self):
+        """Yield events from the backend with output guardrail scanning.
+
+        Accumulates streaming text deltas per content block and runs
+        detect_role_injection() on the buffer.  On detection: interrupts
+        the backend (cancelling pending tool calls), yields an ErrorEvent,
+        and stops.
+
+        Also scans complete TextEvents as a fallback — streaming deltas
+        aren't always available (e.g. include_partial_messages=False).
+        """
+        # Per-block text accumulator for streaming detection.
+        text_buf = ""
+        in_text_block = False
+        injection_detected = False
+
         async for event in self._backend.receive():
+            # Retryable errors → queue recovery, skip.
             if isinstance(event, ErrorEvent) and event.is_retryable:
                 self.followup_queue.append(
                     "[SYSTEM] The previous model generation stalled — "
@@ -1001,21 +1037,60 @@ class KilnHarness:
                     "context above. Please continue where you left off."
                 )
                 continue
-            yield event
 
-        # Transparent supplemental content injection.
-        while self._supplemental and self._supplemental.has_pending:
-            items = self._supplemental.drain()
-            rich_blocks = self._build_supplemental_blocks(items)
-            await self._backend.send(rich_blocks)
-            async for event in self._backend.receive():
-                if isinstance(event, ErrorEvent) and event.is_retryable:
-                    self.followup_queue.append(
-                        "[SYSTEM] " + event.message
-                        + " Please continue where you left off."
+            # Track text block boundaries for streaming accumulation.
+            if isinstance(event, ContentBlockStartEvent):
+                if event.content_type == "text":
+                    in_text_block = True
+                    text_buf = ""
+                else:
+                    in_text_block = False
+
+            # Streaming text — accumulate and scan.
+            if isinstance(event, ContentBlockDeltaEvent) and in_text_block and event.text:
+                text_buf += event.text
+                # Only scan the leading portion — role injection happens at or
+                # near the start.  Cap buffer to avoid waste on long outputs.
+                if not injection_detected and len(text_buf) <= 500:
+                    desc = detect_role_injection(text_buf)
+                    if desc:
+                        injection_detected = True
+                        log.warning(
+                            "\033[1;31mROLE INJECTION DETECTED: %s\033[0m", desc
+                        )
+                        await self._backend.interrupt()
+                        yield ErrorEvent(
+                            message=(
+                                f"ROLE INJECTION DETECTED — {desc}. "
+                                "Generation interrupted. The model attempted to "
+                                "fabricate a Human turn in its output. Tool calls "
+                                "from this turn have been cancelled."
+                            ),
+                            is_retryable=False,
+                        )
+                        return
+
+            # Complete text block — fallback scan for non-streaming paths.
+            if isinstance(event, TextEvent) and not injection_detected:
+                desc = detect_role_injection(event.text)
+                if desc:
+                    injection_detected = True
+                    log.warning(
+                        "\033[1;31mROLE INJECTION DETECTED: %s\033[0m", desc
                     )
-                    continue
-                yield event
+                    await self._backend.interrupt()
+                    yield ErrorEvent(
+                        message=(
+                            f"ROLE INJECTION DETECTED — {desc}. "
+                            "Generation interrupted. The model attempted to "
+                            "fabricate a Human turn in its output. Tool calls "
+                            "from this turn have been cancelled."
+                        ),
+                        is_retryable=False,
+                    )
+                    return
+
+            yield event
 
     def _build_supplemental_blocks(self, items: list[dict]) -> list[ContentBlock]:
         """Convert pending supplemental content to backend-agnostic ContentBlocks."""

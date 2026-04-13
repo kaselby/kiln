@@ -260,3 +260,32 @@ def classify_danger(command: str) -> tuple[str, str] | None:
             return ("confirm", desc)
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Role injection detection
+# ---------------------------------------------------------------------------
+# Catches the model generating fake Human turns in its own output — a failure
+# mode where the model predicts the next conversation event instead of
+# generating its own response, bypassing the API's \n\nHuman: stop sequence
+# by omitting the \n\n prefix.  See journal #12 / fabricated-turn-incident-analysis.md.
+
+_ROLE_INJECTION_RE = re.compile(
+    r"^\s{0,2}Human:\s",     # "Human:" at or very near the start of text
+)
+
+_ROLE_INJECTION_MID_RE = re.compile(
+    r"\n\n\s{0,2}Human:\s",  # Turn boundary embedded mid-text
+)
+
+
+def detect_role_injection(text: str) -> str | None:
+    """Check assistant text for fabricated Human turn boundaries.
+
+    Returns a description string if detected, None otherwise.
+    """
+    if _ROLE_INJECTION_RE.match(text):
+        return "model generated 'Human:' at the start of its text output"
+    if _ROLE_INJECTION_MID_RE.search(text):
+        return "model generated a '\\n\\nHuman:' turn boundary in its text output"
+    return None
