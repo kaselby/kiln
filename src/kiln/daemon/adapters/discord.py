@@ -951,6 +951,10 @@ class DiscordAdapter:
         # Subscribe to daemon events only after successful startup
         daemon.events.add_handler(self._event_handler)
 
+        # Reconstruct bridge records from persisted channel threads
+        for channel in self._channel_threads:
+            await self._ensure_channel_bridge(channel)
+
         # Load persisted status message ID and start status loop
         self._status_message_id = self._load_status_message_id()
         await self._start_status_loop()
