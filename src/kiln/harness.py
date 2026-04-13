@@ -432,7 +432,7 @@ class KilnHarness:
     def _select_backend(self) -> Backend:
         """Choose backend based on config."""
         from .config import infer_backend
-        backend_name = self.config.backend or infer_backend(self.config.model)
+        backend_name = infer_backend(self.config.model)
         if backend_name == "claude":
             return ClaudeBackend()
         elif backend_name == "openai":

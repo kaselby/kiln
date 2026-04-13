@@ -85,7 +85,7 @@ class AgentConfig:
 
     # Backend selection — "claude" (default), "openai", "openai-compat", "litellm".
     # None means infer from model name. Explicit setting overrides inference.
-    backend: str | None = None
+
 
     # Heartbeat
     heartbeat: bool = False
@@ -288,7 +288,7 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
     """
     # Scalar fields — simple setattr
     for field_name in [
-        "identity_doc", "owner_name", "model", "effort", "backend", "session_prefix",
+        "identity_doc", "owner_name", "model", "effort", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
         "orientation", "cleanup", "initial_mode",
