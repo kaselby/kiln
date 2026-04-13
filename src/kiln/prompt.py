@@ -74,6 +74,21 @@ _TOOL_DOC_NAMES = {
     "activate_skill": "activate_skill",
 }
 
+_TOOL_GUIDE_SECTIONS = [
+    ("Shell and Execution", {"bash"}),
+    ("File Tools", {"read", "write", "edit"}),
+    ("Workflow Tools", {"plan", "activate_skill"}),
+    ("Coordination and Session Tools", {"message", "exit_session"}),
+    ("Research Tools", {"websearch"}),
+]
+
+
+_TOOL_GUIDE_SECTION_BY_KEY = {
+    key: title
+    for title, keys in _TOOL_GUIDE_SECTIONS
+    for key in keys
+}
+
 
 def _tool_doc_key(tool_name: str) -> str:
     """Extract the base tool name from a possibly namespaced name.
@@ -86,12 +101,28 @@ def _tool_doc_key(tool_name: str) -> str:
     return tool_name.lower()
 
 
+def _bump_markdown_headings(text: str, levels: int = 1) -> str:
+    """Increase markdown heading levels so sections can be nested cleanly."""
+    bumped_lines = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            prefix_len = len(line) - len(stripped)
+            original_hashes = len(stripped) - len(stripped.lstrip("#"))
+            if original_hashes > 0 and len(stripped) > original_hashes and stripped[original_hashes] == " ":
+                new_hashes = min(6, original_hashes + levels)
+                line = (" " * prefix_len) + ("#" * new_hashes) + stripped[original_hashes:]
+        bumped_lines.append(line)
+    return "\n".join(bumped_lines)
+
+
+
 def load_tool_docs(
     tool_names: list[str],
     *,
     extra_dirs: list[Path] | None = None,
 ) -> str:
-    """Load tool documentation for the given tool names.
+    """Load built-in tool docs and render them as a coherent guide.
 
     Searches kiln's built-in tool_docs/ first, then any extra directories
     (e.g. an agent's own tool_docs/ for agent-namespaced tools).
@@ -103,15 +134,16 @@ def load_tool_docs(
             Searched after kiln's built-in docs, so agent docs can override.
 
     Returns:
-        Concatenated tool documentation as a string, suitable for injection
-        into the system prompt. Empty string if no docs found.
+        Built-in tool documentation as a string, suitable for injection into
+        the system prompt. Empty string if no docs found.
     """
     search_dirs = [_KILN_TOOL_DOCS_DIR]
     if extra_dirs:
         search_dirs.extend(extra_dirs)
 
     seen = set()
-    docs = []
+    grouped_docs: dict[str, list[str]] = {title: [] for title, _ in _TOOL_GUIDE_SECTIONS}
+    other_docs = []
 
     for name in tool_names:
         key = _tool_doc_key(name)
@@ -121,17 +153,43 @@ def load_tool_docs(
 
         # Search directories in order — last match wins (agent overrides kiln)
         doc_content = None
+        doc_name = _TOOL_DOC_NAMES.get(key, key)
         for d in search_dirs:
-            doc_file = d / f"{key}.md"
+            doc_file = d / f"{doc_name}.md"
             if doc_file.exists():
                 doc_content = doc_file.read_text().strip()
 
-        if doc_content:
-            docs.append(doc_content)
+        if not doc_content:
+            continue
 
-    if not docs:
+        section_title = _TOOL_GUIDE_SECTION_BY_KEY.get(key)
+
+        rendered_doc = _bump_markdown_headings(doc_content, levels=1)
+        if section_title:
+            grouped_docs[section_title].append(rendered_doc)
+        else:
+            other_docs.append(rendered_doc)
+
+    if not any(grouped_docs.values()) and not other_docs:
         return ""
-    return "## Tools\n\n" + "\n\n".join(docs) + "\n"
+
+    parts = [
+        "## Built-In Tool Guide",
+        "",
+        "This guide covers Kiln's built-in API tools. Shell and custom tools are listed separately in the session context.",
+    ]
+
+    for section_title, _keys in _TOOL_GUIDE_SECTIONS:
+        section_docs = grouped_docs[section_title]
+        if not section_docs:
+            continue
+        parts.extend(["", f"### {section_title}", "", "\n\n".join(section_docs)])
+
+    if other_docs:
+        parts.extend(["", "### Other built-in tools", "", "\n\n".join(other_docs)])
+
+    return "\n".join(parts) + "\n"
+
 
 
 # ---------------------------------------------------------------------------
