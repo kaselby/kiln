@@ -1194,10 +1194,7 @@ class DiscordAdapter:
             Bridge lifecycle — bridge-level bookkeeping
             Status — status display updates
         """
-        etype = event.data.get("event_type")
-        if not etype:
-            return
-
+        etype = event.type
         handler_name = self._EVENT_HANDLERS.get(etype)
         if handler_name:
             handler = getattr(self, handler_name)
@@ -1250,8 +1247,8 @@ class DiscordAdapter:
 
     # --- Session lifecycle (branch threads) ---
 
-    async def _on_session_connected(self, event: proto.Message) -> None:
-        """A session registered with the daemon.
+    async def _on_session_live(self, event: proto.Message) -> None:
+        """A session became live (discovered via tmux or first request).
 
         Create or reuse a branch thread in #branches for this session.
         Branch threads are one-to-one session bindings (adapter-local state),
@@ -1292,8 +1289,8 @@ class DiscordAdapter:
         except Exception:
             log.exception("Failed to create branch thread for %s", session_id)
 
-    async def _on_session_disconnected(self, event: proto.Message) -> None:
-        """A session disconnected from the daemon.
+    async def _on_session_gone(self, event: proto.Message) -> None:
+        """A session is no longer live (pruned by tmux reconciliation).
 
         Archive the branch thread. The thread mapping is kept in
         _branch_threads so the thread can be reused on resume.
@@ -1406,8 +1403,8 @@ class DiscordAdapter:
     # overrides/patches, making event routing testable.
     _EVENT_HANDLERS: dict[str, str] = {
         proto.EVT_MESSAGE_CHANNEL: "_on_channel_message",
-        proto.EVT_SESSION_CONNECTED: "_on_session_connected",
-        proto.EVT_SESSION_DISCONNECTED: "_on_session_disconnected",
+        proto.EVT_SESSION_LIVE: "_on_session_live",
+        proto.EVT_SESSION_GONE: "_on_session_gone",
         proto.EVT_SESSION_MODE_CHANGED: "_on_session_mode_changed",
         proto.EVT_CHANNEL_SUBSCRIBED: "_on_channel_subscribed",
         proto.EVT_CHANNEL_UNSUBSCRIBED: "_on_channel_unsubscribed",
@@ -1546,7 +1543,7 @@ class DiscordAdapter:
                 "id": s.session_id,
                 "agent_name": s.agent_name,
                 "agent_home": s.agent_home,
-                "uptime": _format_uptime(s.connected_at.isoformat()),
+                "uptime": _format_uptime(s.first_seen_at.isoformat()),
             })
         agents.sort(key=lambda a: a["id"])
         return agents

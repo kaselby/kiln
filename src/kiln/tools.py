@@ -1485,7 +1485,7 @@ def create_mcp_server(
             channel = args.get("channel")
             if not channel:
                 return _error("subscribe requires a channel name.")
-            if not daemon_client or not daemon_client.connected:
+            if not daemon_client:
                 return _error("Channel operations require the Kiln daemon.")
             count = await daemon_client.subscribe(channel)
             return _ok(f"Subscribed to channel '{channel}'. {count} subscriber(s).")
@@ -1494,7 +1494,7 @@ def create_mcp_server(
             channel = args.get("channel")
             if not channel:
                 return _error("unsubscribe requires a channel name.")
-            if not daemon_client or not daemon_client.connected:
+            if not daemon_client:
                 return _error("Channel operations require the Kiln daemon.")
             await daemon_client.unsubscribe(channel)
             return _ok(f"Unsubscribed from channel '{channel}'.")
@@ -1511,7 +1511,7 @@ def create_mcp_server(
 
             if channel:
                 # Channel broadcast — daemon required
-                if not daemon_client or not daemon_client.connected:
+                if not daemon_client:
                     return _error("Channel broadcast requires the Kiln daemon.")
                 count = await daemon_client.publish(channel, summary, body, priority)
                 return _ok(
@@ -1521,7 +1521,7 @@ def create_mcp_server(
 
             elif to:
                 # Agent DM — daemon-first, filesystem fallback
-                if daemon_client and daemon_client.connected:
+                if daemon_client:
                     msg = await daemon_client.send_direct(to, summary, body, priority)
                     return _ok(msg)
                 else:

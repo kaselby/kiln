@@ -1,12 +1,15 @@
-"""Daemon in-memory state — presence, channels, and bridges.
+"""Daemon state — in-memory registries backed by durable files.
 
-These registries are the daemon's live truth for shared coordination.
-They are NOT persisted to disk as primary storage — the daemon rebuilds
-from connected clients on startup. Lightweight snapshots for crash
-recovery are handled separately.
+Files are the source of truth. In-memory registries are derived caches
+rebuilt from files on startup and kept in sync on mutation. The daemon
+is the single writer for subscription files.
+
+Layout under ``subscriptions_dir`` (default ``~/.kiln/daemon/state/subscriptions/``):
+    channels/<session_id>.yml   — Kiln channel subscriptions
+    surfaces/<session_id>.yml   — platform surface subscriptions
 
 Important distinction:
-    - This module = live shared state (who's connected, who's subscribed)
+    - This module = shared coordination state (subscriptions, presence, bridges)
     - kiln.registry = durable per-home session history (for resume/CLI)
     Do NOT conflate them.
 """
@@ -14,9 +17,16 @@ Important distinction:
 from __future__ import annotations
 
 import asyncio
+import logging
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+import yaml
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -25,22 +35,18 @@ from typing import Any
 
 @dataclass
 class SessionRecord:
-    """A connected agent session."""
+    """A known live agent session (derived from tmux + files)."""
 
     session_id: str
     agent_name: str
     agent_home: str
-    pid: int
-    connected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    pid: int = 0
+    first_seen_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     mode: str = "supervised"
     status: str = "running"
     thread_ids: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
-
-    # The asyncio transport for this session's socket connection.
-    # Not serialized — only meaningful while connected.
-    _writer: asyncio.StreamWriter | None = field(default=None, repr=False)
 
     def touch(self) -> None:
         self.last_seen_at = datetime.now(timezone.utc)
@@ -50,7 +56,7 @@ class SessionRecord:
         return {
             "session_id": self.session_id,
             "agent_name": self.agent_name,
-            "connected_at": self.connected_at.isoformat(),
+            "first_seen_at": self.first_seen_at.isoformat(),
             "last_seen_at": self.last_seen_at.isoformat(),
             "mode": self.mode,
             "status": self.status,
@@ -91,7 +97,7 @@ class PresenceRegistry:
 # ---------------------------------------------------------------------------
 
 class ChannelRegistry:
-    """Tracks channel subscriptions. Session-scoped — cleaned up on disconnect."""
+    """Tracks channel subscriptions. In-memory cache derived from files."""
 
     def __init__(self) -> None:
         # channel_name -> set of session_ids
@@ -144,7 +150,7 @@ class ChannelRegistry:
 # ---------------------------------------------------------------------------
 
 class SurfaceSubscriptionRegistry:
-    """Tracks adapter-defined surface subscriptions.
+    """Tracks adapter-defined surface subscriptions. In-memory cache derived from files.
 
     Maps canonical surface refs (opaque strings like ``discord:user:116377...``)
     to sets of subscribed session IDs. This is the daemon's many-to-many
@@ -156,8 +162,6 @@ class SurfaceSubscriptionRegistry:
     unsupported and should be treated as an invariant violation / adapter bug.
     The daemon registry does not enforce this; enforcement belongs at the
     adapter/configuration layer when routing constructs are created.
-
-    Session-scoped — cleaned up on disconnect via ``unsubscribe_all``.
     """
 
     def __init__(self) -> None:
@@ -272,11 +276,249 @@ class BridgeRegistry:
 # Combined daemon state
 # ---------------------------------------------------------------------------
 
-class DaemonState:
-    """Aggregate of all daemon-managed live state."""
+# ---------------------------------------------------------------------------
+# File-backed subscription storage
+# ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
+class SubscriptionStore:
+    """Reads and writes per-session subscription files.
+
+    The daemon is the single writer. Files are YAML under:
+        subscriptions_dir/channels/<session_id>.yml
+        subscriptions_dir/surfaces/<session_id>.yml
+    """
+
+    def __init__(self, subscriptions_dir: Path) -> None:
+        self._dir = subscriptions_dir
+        self._channels_dir = subscriptions_dir / "channels"
+        self._surfaces_dir = subscriptions_dir / "surfaces"
+
+    def ensure_dirs(self) -> None:
+        self._channels_dir.mkdir(parents=True, exist_ok=True)
+        self._surfaces_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Channel subscriptions ---
+
+    def read_channel_subs(self, session_id: str) -> list[str]:
+        path = self._channels_dir / f"{session_id}.yml"
+        if not path.exists():
+            return []
+        try:
+            data = yaml.safe_load(path.read_text()) or {}
+            return data.get("channels", [])
+        except Exception:
+            log.warning("Failed to read channel subs for %s", session_id)
+            return []
+
+    def write_channel_subs(self, session_id: str, agent: str,
+                           channels: list[str]) -> None:
+        path = self._channels_dir / f"{session_id}.yml"
+        if not channels:
+            path.unlink(missing_ok=True)
+            return
+        data = {"version": 1, "agent": agent, "session": session_id,
+                "channels": sorted(channels)}
+        path.write_text(yaml.dump(data, default_flow_style=False))
+
+    def read_all_channel_subs(self) -> dict[str, list[str]]:
+        """Read all channel subscription files. Returns session_id -> channels."""
+        result: dict[str, list[str]] = {}
+        if not self._channels_dir.exists():
+            return result
+        for path in self._channels_dir.glob("*.yml"):
+            session_id = path.stem
+            channels = self.read_channel_subs(session_id)
+            if channels:
+                result[session_id] = channels
+        return result
+
+    # --- Surface subscriptions ---
+
+    def read_surface_subs(self, session_id: str) -> list[str]:
+        path = self._surfaces_dir / f"{session_id}.yml"
+        if not path.exists():
+            return []
+        try:
+            data = yaml.safe_load(path.read_text()) or {}
+            return data.get("surfaces", [])
+        except Exception:
+            log.warning("Failed to read surface subs for %s", session_id)
+            return []
+
+    def write_surface_subs(self, session_id: str, agent: str,
+                           surfaces: list[str]) -> None:
+        path = self._surfaces_dir / f"{session_id}.yml"
+        if not surfaces:
+            path.unlink(missing_ok=True)
+            return
+        data = {"version": 1, "agent": agent, "session": session_id,
+                "surfaces": sorted(surfaces)}
+        path.write_text(yaml.dump(data, default_flow_style=False))
+
+    def read_all_surface_subs(self) -> dict[str, list[str]]:
+        """Read all surface subscription files. Returns session_id -> surfaces."""
+        result: dict[str, list[str]] = {}
+        if not self._surfaces_dir.exists():
+            return result
+        for path in self._surfaces_dir.glob("*.yml"):
+            session_id = path.stem
+            surfaces = self.read_surface_subs(session_id)
+            if surfaces:
+                result[session_id] = surfaces
+        return result
+
+    def remove_session(self, session_id: str) -> None:
+        """Remove all subscription files for a session."""
+        for subdir in (self._channels_dir, self._surfaces_dir):
+            path = subdir / f"{session_id}.yml"
+            path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Tmux-based session liveness
+# ---------------------------------------------------------------------------
+
+def get_live_tmux_sessions() -> set[str] | None:
+    """Get the set of tmux session names that currently exist.
+
+    Returns None on error (tmux missing, timeout, command failure) to
+    distinguish "no sessions" from "couldn't check." Callers must treat
+    None as "uncertain" and avoid destructive actions.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            # tmux returns 1 when no server is running (no sessions) —
+            # that's a real answer, not an error.
+            if "no server running" in (result.stderr or "").lower():
+                return set()
+            log.warning("tmux list-sessions failed (exit %d): %s",
+                        result.returncode, result.stderr.strip())
+            return None
+        return {line.strip() for line in result.stdout.strip().split("\n")
+                if line.strip()}
+    except subprocess.TimeoutExpired:
+        log.warning("tmux list-sessions timed out")
+        return None
+    except FileNotFoundError:
+        log.warning("tmux not found on PATH")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Combined daemon state
+# ---------------------------------------------------------------------------
+
+class DaemonState:
+    """Aggregate of all daemon-managed state.
+
+    In-memory registries are derived caches. The ``store`` provides
+    durable file-backed subscription truth.
+    """
+
+    def __init__(self, subscriptions_dir: Path | None = None) -> None:
         self.presence = PresenceRegistry()
         self.channels = ChannelRegistry()
         self.surfaces = SurfaceSubscriptionRegistry()
         self.bridges = BridgeRegistry()
+        self.store = SubscriptionStore(
+            subscriptions_dir or Path.home() / ".kiln" / "daemon" / "state" / "subscriptions"
+        )
+
+    def load_from_files(self) -> None:
+        """Rebuild in-memory registries from durable subscription files."""
+        self.store.ensure_dirs()
+
+        # Load channel subscriptions
+        for session_id, channels in self.store.read_all_channel_subs().items():
+            for ch in channels:
+                self.channels.subscribe(ch, session_id)
+
+        # Load surface subscriptions
+        for session_id, surfaces in self.store.read_all_surface_subs().items():
+            for surf in surfaces:
+                self.surfaces.subscribe(surf, session_id)
+
+        log.info(
+            "Loaded state from files: %d channel subs, %d surface subs",
+            len(self.channels.all_channels()),
+            len(self.surfaces.all_surfaces()),
+        )
+
+    def reconcile(
+        self, agents_registry: dict[str, Path] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Reconcile in-memory state against tmux liveness.
+
+        Two-way reconciliation:
+        1. **Discover** — register live tmux sessions that match known
+           agent prefixes but aren't in presence yet.
+        2. **Prune** — remove subscriptions and presence for sessions
+           that no longer exist in tmux.
+
+        Returns ``(pruned, discovered)`` session ID lists.
+
+        If tmux is unavailable (returns None), skips entirely to avoid
+        destroying subscription truth on a transient failure.
+        """
+        live_sessions = get_live_tmux_sessions()
+        if live_sessions is None:
+            log.warning("Reconcile skipped — tmux status uncertain")
+            return [], []
+
+        # --- Discover live agent sessions not yet in presence ---
+        discovered: list[str] = []
+        if agents_registry:
+            for tmux_name in live_sessions:
+                if self.presence.get(tmux_name):
+                    continue
+                # Agent session names follow <prefix>-<adj>-<noun>
+                parts = tmux_name.split("-")
+                if len(parts) >= 3 and parts[0] in agents_registry:
+                    agent_home = agents_registry[parts[0]]
+                    record = SessionRecord(
+                        session_id=tmux_name,
+                        agent_name=parts[0],
+                        agent_home=str(agent_home),
+                    )
+                    self.presence.register(record)
+                    discovered.append(tmux_name)
+
+        if discovered:
+            log.info("Reconcile discovered %d live sessions: %s",
+                     len(discovered), discovered)
+
+        # --- Prune dead sessions ---
+        known_sessions = (
+            self.presence.session_ids()
+            | set(self._sessions_with_subscriptions())
+        )
+
+        pruned: list[str] = []
+        for session_id in known_sessions:
+            if session_id not in live_sessions:
+                self._prune_session(session_id)
+                pruned.append(session_id)
+
+        if pruned:
+            log.info("Reconcile pruned %d dead sessions: %s", len(pruned), pruned)
+        return pruned, discovered
+
+    def _sessions_with_subscriptions(self) -> set[str]:
+        """Get all session IDs that have any subscriptions."""
+        sessions: set[str] = set()
+        for ch in self.channels.all_channels():
+            sessions.update(self.channels.subscribers(ch))
+        for surf in self.surfaces.all_surfaces():
+            sessions.update(self.surfaces.subscribers(surf))
+        return sessions
+
+    def _prune_session(self, session_id: str) -> None:
+        """Remove all state for a dead session."""
+        self.channels.unsubscribe_all(session_id)
+        self.surfaces.unsubscribe_all(session_id)
+        self.presence.deregister(session_id)
+        self.store.remove_session(session_id)

@@ -1208,7 +1208,7 @@ class KilnApp:
             elif source == "user":
                 stamped = f"[{ts} | TERMINAL MESSAGE | trust: always ✓]\n{text}"
             elif source == "agent":
-                # Agent/gateway messages build their own [header] in _deliver_agent_message
+                # Agent/platform messages build their own [header] in _deliver_agent_message
                 # — just prepend the injection timestamp into the existing bracket
                 if text.startswith("["):
                     stamped = f"[{ts} | {text[1:]}"
@@ -1710,7 +1710,7 @@ class KilnApp:
         """Detect and announce external permission mode changes.
 
         Mode is now stored in the session config file, so external tools
-        (gateway control channel, scripts) can change it directly.  This
+        (daemon control channel, scripts) can change it directly.  This
         method detects the change and refreshes the TUI display.
         """
         current = self._perm_mode

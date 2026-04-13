@@ -22,8 +22,6 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 # Requests (C->D)
-REGISTER = "register"
-DEREGISTER = "deregister"
 SUBSCRIBE = "subscribe"
 UNSUBSCRIBE = "unsubscribe"
 PUBLISH = "publish"
@@ -43,12 +41,8 @@ ACK = "ack"
 RESULT = "result"
 ERROR = "error"
 
-# Pushed events (D->C)
-EVENT = "event"
-
-
 # ---------------------------------------------------------------------------
-# Event type constants (carried in the event_type field of EVENT messages)
+# Event type constants (daemon-internal, carried on the EventBus)
 # ---------------------------------------------------------------------------
 
 EVT_MESSAGE_DIRECT = "message.direct"
@@ -56,9 +50,9 @@ EVT_MESSAGE_CHANNEL = "message.channel"
 EVT_MESSAGE_INBOUND = "message.inbound"
 EVT_CHANNEL_SUBSCRIBED = "channel.subscribed"
 EVT_CHANNEL_UNSUBSCRIBED = "channel.unsubscribed"
-# Connection/presence events (agent connected/disconnected from daemon)
-EVT_SESSION_CONNECTED = "session.connected"
-EVT_SESSION_DISCONNECTED = "session.disconnected"
+# Session liveness events (driven by reconciliation against tmux)
+EVT_SESSION_LIVE = "session.live"
+EVT_SESSION_GONE = "session.gone"
 # Management lifecycle events (session spawned/killed via management actions)
 EVT_SESSION_STARTED = "session.started"
 EVT_SESSION_STOPPED = "session.stopped"
@@ -113,29 +107,33 @@ class Message:
     def is_response(self) -> bool:
         return self.type in (ACK, RESULT, ERROR)
 
-    @property
-    def is_event(self) -> bool:
-        return self.type == EVENT
-
-    @property
-    def event_type(self) -> str | None:
-        """The event_type field for EVENT messages, None otherwise."""
-        if self.type == EVENT:
-            return self.data.get("event_type")
-        return None
-
 
 @dataclass
 class RequestContext:
     """Identity of the requester, threaded through internal boundaries.
 
-    Carried from ClientConnection into management actions and adapter
-    calls so the daemon can enforce permissions and maintain auditability
-    without relying on tool availability as the only gate.
+    Built from the ``requester`` envelope in each request message.
+    Threaded into management actions and adapter calls so the daemon
+    can enforce permissions and maintain auditability.
     """
 
     agent_name: str
     session_id: str
+
+    @classmethod
+    def from_request(cls, msg: Message) -> RequestContext | None:
+        """Extract requester identity from a request message.
+
+        Returns None if the request has no requester envelope.
+        """
+        req = msg.data.get("requester")
+        if not req or not isinstance(req, dict):
+            return None
+        agent = req.get("agent", "")
+        session = req.get("session", "")
+        if not agent or not session:
+            return None
+        return cls(agent_name=agent, session_id=session)
 
 
 @dataclass
@@ -163,71 +161,80 @@ def make_ref() -> str:
 
 # ---------------------------------------------------------------------------
 # Request builders (C->D)
+#
+# Requests that mutate session-scoped state or need auditability carry
+# a ``requester`` envelope: {"agent": "...", "session": "..."}.
+# Pure queries (list_sessions, get_status) omit it.
 # ---------------------------------------------------------------------------
 
-def register(agent: str, session: str, pid: int) -> Message:
-    """Register this session with the daemon."""
-    return Message(REGISTER, make_ref(), {
-        "agent": agent,
-        "session": session,
-        "pid": pid,
-    })
+def _with_requester(
+    data: dict[str, Any],
+    agent: str,
+    session: str,
+) -> dict[str, Any]:
+    """Inject a requester envelope into a request payload."""
+    data["requester"] = {"agent": agent, "session": session}
+    return data
 
 
-def deregister() -> Message:
-    """Deregister and disconnect."""
-    return Message(DEREGISTER, make_ref())
-
-
-def subscribe(channel: str) -> Message:
+def subscribe(channel: str, *, agent: str, session: str) -> Message:
     """Subscribe to a channel."""
-    return Message(SUBSCRIBE, make_ref(), {"channel": channel})
+    return Message(SUBSCRIBE, make_ref(), _with_requester(
+        {"channel": channel}, agent, session,
+    ))
 
 
-def unsubscribe(channel: str) -> Message:
+def unsubscribe(channel: str, *, agent: str, session: str) -> Message:
     """Unsubscribe from a channel."""
-    return Message(UNSUBSCRIBE, make_ref(), {"channel": channel})
+    return Message(UNSUBSCRIBE, make_ref(), _with_requester(
+        {"channel": channel}, agent, session,
+    ))
 
 
 def publish(channel: str, summary: str, body: str,
-            priority: str = "normal") -> Message:
+            priority: str = "normal",
+            *, agent: str, session: str) -> Message:
     """Publish a message to a channel."""
-    return Message(PUBLISH, make_ref(), {
+    return Message(PUBLISH, make_ref(), _with_requester({
         "channel": channel,
         "summary": summary,
         "body": body,
         "priority": priority,
-    })
+    }, agent, session))
 
 
 def send_direct(to: str, summary: str, body: str,
-                priority: str = "normal") -> Message:
+                priority: str = "normal",
+                *, agent: str, session: str) -> Message:
     """Send a direct message to another agent session."""
-    return Message(SEND_DIRECT, make_ref(), {
+    return Message(SEND_DIRECT, make_ref(), _with_requester({
         "to": to,
         "summary": summary,
         "body": body,
         "priority": priority,
-    })
+    }, agent, session))
 
 
-def send_user(to: str, summary: str, body: str) -> Message:
+def send_user(to: str, summary: str, body: str,
+              *, agent: str, session: str) -> Message:
     """Send a message to an external user (routed through an adapter)."""
-    return Message(SEND_USER, make_ref(), {
+    return Message(SEND_USER, make_ref(), _with_requester({
         "to": to,
         "summary": summary,
         "body": body,
-    })
+    }, agent, session))
 
 
-def list_subscriptions() -> Message:
-    """Query this session's active channel subscriptions."""
-    return Message(LIST_SUBSCRIPTIONS, make_ref())
+def list_subscriptions(*, agent: str, session: str) -> Message:
+    """Query a session's active channel subscriptions."""
+    return Message(LIST_SUBSCRIPTIONS, make_ref(), _with_requester(
+        {}, agent, session,
+    ))
 
 
 def list_sessions(agent: str | None = None,
                   status: str | None = None) -> Message:
-    """Query registered sessions."""
+    """Query known sessions."""
     data: dict[str, Any] = {}
     if agent is not None:
         data["agent"] = agent
@@ -245,47 +252,52 @@ def get_status(scope: str | None = None) -> Message:
 
 
 def platform_op(platform: str, action: str,
-                args: dict[str, Any] | None = None) -> Message:
+                args: dict[str, Any] | None = None,
+                *, agent: str, session: str) -> Message:
     """Execute a platform-specific operation via an adapter."""
-    return Message(PLATFORM_OP, make_ref(), {
+    return Message(PLATFORM_OP, make_ref(), _with_requester({
         "platform": platform,
         "action": action,
         "args": args or {},
-    })
+    }, agent, session))
 
 
-def subscribe_surface(surface_ref: str) -> Message:
+def subscribe_surface(surface_ref: str,
+                      *, agent: str, session: str) -> Message:
     """Subscribe to an adapter-defined surface (e.g. Discord DM, channel)."""
-    return Message(SUBSCRIBE_SURFACE, make_ref(), {
+    return Message(SUBSCRIBE_SURFACE, make_ref(), _with_requester({
         "surface_ref": surface_ref,
-    })
+    }, agent, session))
 
 
-def unsubscribe_surface(surface_ref: str) -> Message:
+def unsubscribe_surface(surface_ref: str,
+                        *, agent: str, session: str) -> Message:
     """Unsubscribe from an adapter-defined surface."""
-    return Message(UNSUBSCRIBE_SURFACE, make_ref(), {
+    return Message(UNSUBSCRIBE_SURFACE, make_ref(), _with_requester({
         "surface_ref": surface_ref,
-    })
+    }, agent, session))
 
 
-def list_surface_subscriptions(adapter_id: str | None = None) -> Message:
-    """Query this session's surface subscriptions.
+def list_surface_subscriptions(adapter_id: str | None = None,
+                               *, agent: str, session: str) -> Message:
+    """Query a session's surface subscriptions.
 
     If adapter_id is given, only return subscriptions for that adapter
     (matched by surface_ref prefix before the first ':').
     """
-    data: dict[str, Any] = {}
-    if adapter_id is not None:
-        data["adapter_id"] = adapter_id
-    return Message(LIST_SURFACE_SUBSCRIPTIONS, make_ref(), data)
+    data: dict[str, Any] = {"adapter_id": adapter_id} if adapter_id else {}
+    return Message(LIST_SURFACE_SUBSCRIPTIONS, make_ref(), _with_requester(
+        data, agent, session,
+    ))
 
 
-def mgmt(action: str, args: dict[str, Any] | None = None) -> Message:
+def mgmt(action: str, args: dict[str, Any] | None = None,
+         *, agent: str, session: str) -> Message:
     """Execute a management action (spawn, stop, interrupt, etc.)."""
-    return Message(MGMT, make_ref(), {
+    return Message(MGMT, make_ref(), _with_requester({
         "action": action,
         "args": args or {},
-    })
+    }, agent, session))
 
 
 # ---------------------------------------------------------------------------
@@ -313,9 +325,9 @@ def error(ref: str, message: str, code: str | None = None) -> Message:
 
 
 # ---------------------------------------------------------------------------
-# Event builders (D->C, pushed)
+# Event builders (daemon-internal, dispatched via EventBus)
 # ---------------------------------------------------------------------------
 
 def event(event_type: str, **data: Any) -> Message:
-    """Build a pushed event message."""
-    return Message(EVENT, data={"event_type": event_type, **data})
+    """Build a daemon-internal event for the EventBus."""
+    return Message(type=event_type, data=data)

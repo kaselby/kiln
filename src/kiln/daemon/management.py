@@ -94,8 +94,8 @@ class ManagementActions:
             if s.metadata.get("canonical"):
                 return s.session_id
 
-        # Fallback: most recently connected
-        sessions.sort(key=lambda s: s.connected_at, reverse=True)
+        # Fallback: most recently seen
+        sessions.sort(key=lambda s: s.first_seen_at, reverse=True)
         return sessions[0].session_id
 
     def list_historical_sessions(self, agent: str) -> set[str]:

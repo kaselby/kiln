@@ -237,7 +237,7 @@ class KilnHarness:
     @property
     def permission_mode(self) -> PermissionMode:
         """Current permission mode. Reads from session config so external
-        changes (gateway control channel, other tools) take effect on next
+        changes (daemon control channel, other tools) take effect on next
         tool use. Falls back to initial mode before session config exists."""
         if self.session_config is not None:
             raw = self.session_config.get("mode")
@@ -363,21 +363,22 @@ class KilnHarness:
             return None
 
     def _snapshot_channel_subscriptions(self) -> list[str]:
-        if self._daemon_client and self._daemon_client.connected:
-            # Daemon is truth when connected — sync desired state
-            live = self._daemon_client.subscriptions
-            self._desired_subscriptions = list(live)
-            return live
-        # Disconnected — preserve desired subscriptions for reconnect
+        """Snapshot channel subscriptions for session state persistence.
+
+        Uses the harness's desired subscriptions list, which is kept in
+        sync with daemon state on subscribe/unsubscribe operations.
+        """
         return list(self._desired_subscriptions)
 
     async def _restore_channel_subscriptions(self, subscriptions: list[str]) -> None:
         if not subscriptions:
             return
-        # Always record desired state, even if daemon is unavailable
         self._desired_subscriptions = list(subscriptions)
-        if self._daemon_client and self._daemon_client.connected:
-            await self._daemon_client.restore_subscriptions(subscriptions)
+        if self._daemon_client:
+            try:
+                await self._daemon_client.restore_subscriptions(subscriptions)
+            except DaemonUnavailableError:
+                log.debug("Daemon unavailable — subscriptions will restore on next use")
 
     def _cleanup_stale_session_configs(self) -> None:
         """Remove session config files for sessions that are no longer running.
@@ -629,7 +630,7 @@ class KilnHarness:
 
         # Permission handler — always active, even in headless mode.
         # TUI provides interactive callbacks; headless passes no terminal
-        # handler (gateway-only for confirm-tier guardrails).
+        # handler (daemon-only for confirm-tier guardrails).
         if self._permission_callbacks:
             get_mode, terminal_handler = self._permission_callbacks
         else:
@@ -860,23 +861,12 @@ class KilnHarness:
             except Exception:
                 log.exception("Startup command error: %s", cmd)
 
-    async def _connect_daemon(self) -> None:
-        """Connect to the Kiln daemon. Sets self._daemon_client on success, None on failure."""
-        client = DaemonClient()
-        try:
-            await client.connect()
-            await client.register(
-                agent=self.config.name,
-                session=self.agent_id,
-                pid=os.getpid(),
-            )
-            self._daemon_client = client
-        except DaemonUnavailableError:
-            log.warning("Daemon unavailable — running without live coordination")
-            self._daemon_client = None
-        except Exception:
-            log.warning("Daemon connection failed — running without live coordination", exc_info=True)
-            self._daemon_client = None
+    def _create_daemon_client(self) -> None:
+        """Create a stateless daemon client for this session."""
+        self._daemon_client = DaemonClient(
+            agent=self.config.name,
+            session=self.agent_id,
+        )
 
     async def start(self):
         """Start the agent session.
@@ -888,8 +878,8 @@ class KilnHarness:
         """
         self._run_startup_commands()
 
-        # Connect to daemon before building config so message tool has client
-        await self._connect_daemon()
+        # Create stateless daemon client before building config so message tool has it
+        self._create_daemon_client()
 
         self._backend = self._select_backend()
         config = self._build_backend_config()
@@ -950,12 +940,8 @@ class KilnHarness:
     def session_state_labels(self) -> list[str]:
         """Extra labels for the session state hook. Override in subclasses."""
         labels = []
-        if self._daemon_client and self._daemon_client.connected:
-            channels = self._daemon_client.subscriptions
-        else:
-            channels = self._desired_subscriptions
-        if channels:
-            labels.append(f"Channels: {', '.join(channels)}")
+        if self._desired_subscriptions:
+            labels.append(f"Channels: {', '.join(self._desired_subscriptions)}")
         return labels
 
     def _build_orientation(self) -> str | None:
@@ -1164,13 +1150,7 @@ class KilnHarness:
             return []
         return [self.config.cleanup.format(**self._template_vars())]
 
-    async def _deregister_daemon(self) -> None:
-        """Deregister from the daemon on shutdown. Daemon cleans up subscriptions."""
-        if self._daemon_client and self._daemon_client.connected:
-            try:
-                await self._daemon_client.deregister()
-            except Exception:
-                log.debug("Daemon deregister failed — daemon may already be gone")
+    # No daemon deregistration needed — tmux reconciliation handles cleanup.
 
     def _snapshot_session_state(self) -> None:
         """Update the session state file with final config and channel subscriptions."""
@@ -1191,7 +1171,6 @@ class KilnHarness:
     async def stop(self):
         """Disconnect the agent session and clean up resources."""
         self._snapshot_session_state()
-        await self._deregister_daemon()
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None

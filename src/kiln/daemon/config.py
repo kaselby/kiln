@@ -29,6 +29,7 @@ CONFIG_FILE = DAEMON_DIR / "config.yml"
 AGENTS_REGISTRY = KILN_ROOT / "agents.yml"
 CHANNELS_DIR = KILN_ROOT / "channels"
 STATE_DIR = DAEMON_DIR / "state"
+SUBSCRIPTIONS_DIR = STATE_DIR / "subscriptions"
 
 
 @dataclass
@@ -63,6 +64,7 @@ class DaemonConfig:
     agents_registry: Path = field(default_factory=lambda: AGENTS_REGISTRY)
     channels_dir: Path = field(default_factory=lambda: CHANNELS_DIR)
     state_dir: Path = field(default_factory=lambda: STATE_DIR)
+    subscriptions_dir: Path = field(default_factory=lambda: SUBSCRIPTIONS_DIR)
 
     users: dict[str, UserConfig] = field(default_factory=dict)
     adapters: dict[str, AdapterConfig] = field(default_factory=dict)
@@ -83,7 +85,8 @@ def load_daemon_config(path: Path | None = None) -> DaemonConfig:
 
     # Path overrides — resolve ~ and make absolute
     for key in ("socket_path", "pid_file", "log_file", "lockdown_file",
-                "agents_registry", "channels_dir", "state_dir"):
+                "agents_registry", "channels_dir", "state_dir",
+                "subscriptions_dir"):
         if key in raw:
             setattr(config, key, Path(raw[key]).expanduser().resolve())
 

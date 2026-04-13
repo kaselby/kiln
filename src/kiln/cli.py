@@ -787,9 +787,11 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                 import asyncio
                 from .daemon.client import DaemonClient, DaemonUnavailableError
                 async def _query():
-                    client = DaemonClient()
+                    client = DaemonClient(
+                        agent="cli", session="cli-status",
+                        auto_start=False,
+                    )
                     try:
-                        await client.connect(auto_start=False)
                         status = await client.get_status()
                         print(f"Sessions: {status.get('sessions', '?')}")
                         print(f"Channels: {status.get('channels', '?')}")
@@ -797,7 +799,6 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                         print(f"Adapters: {', '.join(status.get('adapters', [])) or 'none'}")
                         if status.get("lockdown"):
                             print("** LOCKDOWN ACTIVE **")
-                        await client.disconnect()
                     except DaemonUnavailableError:
                         print("(could not query daemon)")
 
