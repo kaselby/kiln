@@ -27,6 +27,7 @@ import discord
 
 from .. import protocol as proto
 from ..protocol import PlatformMessage, RequestContext
+from ..state import BridgeRecord
 
 log = logging.getLogger(__name__)
 
@@ -1217,6 +1218,9 @@ class DiscordAdapter:
         if not channel or not self._daemon:
             return
 
+        # Auto-bridge if needed (handles publish-without-subscribe)
+        await self._ensure_channel_bridge(channel)
+
         # Look up bridge for this channel
         bridges = self._daemon.state.bridges.by_source("channel", channel)
         discord_bridges = [b for b in bridges if b.adapter_id == "discord"]
@@ -1322,14 +1326,12 @@ class DiscordAdapter:
     async def _on_channel_subscribed(self, event: proto.Message) -> None:
         """A session subscribed to a Kiln channel.
 
-        Channel thread lifecycle is tied to bridges (bridge_bound/unbound),
-        not individual subscriptions. This handler is a hook for future
-        status updates or notifications.
+        Auto-creates a Discord bridge (thread in #channels) if one
+        doesn't already exist, so Kira can see channel activity.
         """
-        log.debug(
-            "Channel subscribed: %s by %s",
-            event.data.get("channel"), event.data.get("session_id"),
-        )
+        channel = event.data.get("channel", "")
+        if channel:
+            await self._ensure_channel_bridge(channel)
 
     async def _on_channel_unsubscribed(self, event: proto.Message) -> None:
         """A session unsubscribed from a Kiln channel."""
@@ -1337,6 +1339,50 @@ class DiscordAdapter:
             "Channel unsubscribed: %s by %s",
             event.data.get("channel"), event.data.get("session_id"),
         )
+
+    # --- Auto-bridge ---
+
+    async def _ensure_channel_bridge(self, channel: str) -> None:
+        """Ensure a Discord bridge exists for a Kiln channel.
+
+        Creates a thread in #channels and registers a bridge record
+        if one doesn't already exist. Idempotent.
+        """
+        if not self._daemon:
+            return
+
+        # Already bridged?
+        existing = self._daemon.state.bridges.by_source("channel", channel)
+        if any(b.adapter_id == "discord" for b in existing):
+            return
+
+        channels_channel = self._discord_config.channels.get("channels")
+        if not channels_channel:
+            log.debug("No #channels configured, skipping auto-bridge for '%s'", channel)
+            return
+
+        # Reuse existing thread if we have one (e.g. from a previous daemon run)
+        thread_id = self._channel_threads.get(channel)
+        if not thread_id:
+            thread_id = await self._discord_create_thread(
+                channels_channel, channel,
+                f"Channel: {channel}",
+            )
+            if not thread_id:
+                return
+            self._channel_threads[channel] = thread_id
+            self._rebuild_reverse_indexes()
+            self._persist_state()
+
+        bridge = BridgeRecord(
+            bridge_id=f"auto-discord-channel-{channel}",
+            source_kind="channel",
+            source_name=channel,
+            adapter_id="discord",
+            platform_target=str(thread_id),
+        )
+        self._daemon.state.bridges.bind(bridge)
+        log.info("Auto-bridged channel '%s' to Discord thread %d", channel, thread_id)
 
     # --- Bridge lifecycle (channel threads) ---
 
