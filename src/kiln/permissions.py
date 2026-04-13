@@ -2,17 +2,14 @@
 
 Provides PermissionHandler, which manages tool permissions including
 mode-based access control, guardrail enforcement, and unified approval
-routing across terminal and gateway sources.
+routing across terminal and daemon sources.
 """
 
 import asyncio
 import difflib
-import json
 import logging
 import os
 import subprocess
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -217,7 +214,7 @@ class PermissionHandler:
 
     Provides a PreToolUse hook that checks guardrails and mode-based
     permissions, routing all approval requests through available sources
-    (terminal TUI, gateway/Discord) with first-response-wins semantics.
+    (terminal TUI, daemon/Discord) with first-response-wins semantics.
     """
 
     def __init__(
@@ -296,7 +293,7 @@ class PermissionHandler:
             diff_text=diff_text,
         )
 
-        # Build fields for gateway display
+        # Build fields for daemon display
         base_name = self._base_tool_name(tool_name)
         preview = self._build_preview(tool_name, tool_input)
         allowed, context = await self._request_approval(
@@ -327,8 +324,8 @@ class PermissionHandler:
     ) -> tuple[bool, str]:
         """Route an approval request to all available sources, first response wins.
 
-        Races the terminal handler (TUI or None) against the gateway
-        (if online). Handles cross-source cleanup: if gateway wins,
+        Races the terminal handler (TUI or None) against the daemon
+        (if online). Handles cross-source cleanup: if daemon wins,
         dismisses the TUI prompt; if terminal wins, updates the Discord
         message.
 
@@ -337,23 +334,23 @@ class PermissionHandler:
         additionalContext injection so the agent knows a prompt occurred.
         """
         has_terminal = self._terminal_handler is not None
-        gateway_url = await self._check_gateway()
+        daemon_available = self._is_daemon_available()
 
         tasks: dict[asyncio.Task, str] = {}
 
         if has_terminal:
             tasks[asyncio.create_task(self._terminal_handler(req))] = "terminal"
 
-        if gateway_url:
-            async def _gw():
-                result = await self._gateway_request(
-                    gateway_url, title=title, preview=preview,
+        if daemon_available:
+            async def _daemon():
+                result = await self._daemon_request_approval(
+                    title=title, preview=preview,
                     detail=detail, severity=severity,
                 )
                 if "error" in result:
-                    return None  # gateway failed, not a decision
+                    return None  # daemon call failed, not a decision
                 return result.get("approved", False)
-            tasks[asyncio.create_task(_gw())] = "gateway"
+            tasks[asyncio.create_task(_daemon())] = "daemon"
 
         if not tasks:
             _log.info("No approval sources available \u2014 denying")
@@ -372,22 +369,19 @@ class PermissionHandler:
                     continue
 
                 if result is None:
-                    # Source failed (e.g. gateway HTTP error) — keep waiting
+                    # Source failed (e.g. daemon unavailable) — keep waiting
                     continue
 
                 allowed = bool(result)
                 _log.info("Resolved by %s: %s", source, "approved" if allowed else "denied")
 
                 # Cross-source cleanup
-                if source == "gateway" and not req.event.is_set():
+                if source == "daemon" and not req.event.is_set():
                     req.decide(allowed)
 
-                if source == "terminal" and gateway_url:
+                if source == "terminal" and daemon_available:
                     status = "approved" if allowed else "rejected"
-                    loop = asyncio.get_running_loop()
-                    loop.run_in_executor(
-                        None, self._resolve_gateway, gateway_url, status,
-                    )
+                    asyncio.create_task(self._resolve_daemon_approval(status))
 
                 # Cancel remaining sources
                 for t in tasks:
@@ -404,85 +398,70 @@ class PermissionHandler:
         _log.warning("All approval sources failed \u2014 denying")
         return False, f"Permission request: {title} \u2014 denied (all sources failed)"
 
-    # -- Gateway communication ----------------------------------------------
+    # -- Daemon communication -----------------------------------------------
 
-    async def _check_gateway(self) -> str | None:
-        """Check if gateway is online and supports remote approval.
-
-        Reads the gateway state file for connection info, then hits the
-        status endpoint. Returns the base URL or None. Fast path —
-        should complete in <50ms for a local gateway.
-        """
-        state_file = Path(self._agent_home) / "state" / "gateway.json"
-        if not state_file.exists():
-            return None
-        try:
-            state = json.loads(state_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            return None
-
-        url = f"http://{state.get('bind', '127.0.0.1')}:{state.get('port', 18820)}"
-
-        def _check():
-            req = urllib.request.Request(f"{url}/api/status")
+    def _get_daemon_client(self):
+        """Lazily create a DaemonClient for approval routing."""
+        if not hasattr(self, "_daemon_client"):
             try:
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    data = json.loads(resp.read())
-                    if data.get("permissions"):
-                        return url
-            except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
-                pass
-            return None
+                from .daemon.client import DaemonClient
+                agent = self._agent_id.split("-")[0]
+                self._daemon_client = DaemonClient(
+                    agent=agent, session=self._agent_id, auto_start=False,
+                )
+            except ImportError:
+                _log.debug("DaemonClient not available")
+                self._daemon_client = None
+        return self._daemon_client
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _check)
+    def _is_daemon_available(self) -> bool:
+        """Check if the daemon socket exists and a client can be created."""
+        from .daemon.config import SOCKET_PATH, PID_FILE
+        if not SOCKET_PATH.exists():
+            return False
+        if PID_FILE.exists():
+            try:
+                pid = int(PID_FILE.read_text().strip())
+                os.kill(pid, 0)
+            except (ValueError, ProcessLookupError, PermissionError, OSError):
+                return False
+        return self._get_daemon_client() is not None
 
-    async def _gateway_request(
-        self, gateway_url: str, *,
+    async def _daemon_request_approval(
+        self, *,
         title: str, preview: str,
         detail: str | None = None, severity: str = "info",
         timeout: float = 300,
     ) -> dict:
-        """POST a permission request to the gateway. Long-polls until resolved."""
-        def _request():
-            body = {
-                "agent_id": self._agent_id,
-                "title": title,
-                "preview": preview,
-                "severity": severity,
-                "timeout": timeout,
-            }
-            if detail:
-                body["detail"] = detail
-            payload = json.dumps(body).encode()
-            req = urllib.request.Request(
-                f"{gateway_url}/api/permission/request",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=timeout + 15) as resp:
-                    return json.loads(resp.read())
-            except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as e:
-                _log.warning("Gateway permission request failed: %s", e)
-                return {"error": str(e)}
+        """Request approval via the daemon's management API."""
+        client = self._get_daemon_client()
+        if not client:
+            return {"error": "no daemon client"}
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _request)
+        args = {
+            "title": title,
+            "preview": preview,
+            "severity": severity,
+            "timeout": timeout,
+        }
+        if detail:
+            args["detail"] = detail
 
-    def _resolve_gateway(self, gateway_url: str, status: str) -> None:
-        """Tell the gateway to resolve a pending permission. Best-effort."""
         try:
-            payload = json.dumps({"agent_id": self._agent_id, "status": status}).encode()
-            req = urllib.request.Request(
-                f"{gateway_url}/api/permission/resolve",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            return await client.mgmt(
+                "request_approval", args, timeout=timeout + 15,
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                resp.read()
+        except Exception as e:
+            _log.warning("Daemon approval request failed: %s", e)
+            return {"error": str(e)}
+
+    async def _resolve_daemon_approval(self, status: str) -> None:
+        """Tell the daemon to resolve a pending approval. Best-effort."""
+        client = self._get_daemon_client()
+        if not client:
+            return
+        try:
+            await client.mgmt("resolve_approval", {"status": status}, timeout=5)
         except Exception:
             pass
 
@@ -490,7 +469,7 @@ class PermissionHandler:
 
     @staticmethod
     def _build_preview(tool_name: str, tool_input: dict) -> str:
-        """Build a short preview string for the gateway embed body."""
+        """Build a short preview string for the daemon embed body."""
         if _is_tool(tool_name, "Edit"):
             path = tool_input.get("file_path", "unknown")
             old = tool_input.get("old_string", "")
