@@ -1652,11 +1652,23 @@ class DiscordAdapter:
 
     @staticmethod
     def _read_context_usage(agent_home: Path, session_id: str) -> tuple[int, int] | None:
-        """Read context token usage from CC conversation JSONL. Soft-fail."""
+        """Read context token usage from session state or CC conversation JSONL. Soft-fail."""
         if not agent_home:
             return None
 
-        # Look up session UUID from session registry
+        # Backend-agnostic source: live session state written by the harness.
+        session_state_path = agent_home / "logs" / "session-state" / f"{session_id}.yml"
+        if session_state_path.exists():
+            try:
+                import yaml
+                state = yaml.safe_load(session_state_path.read_text()) or {}
+                context_tokens = state.get("context_tokens")
+                if isinstance(context_tokens, int) and context_tokens > 0:
+                    return (context_tokens, MAX_CONTEXT_TOKENS)
+            except Exception:
+                pass
+
+        # Legacy Claude source: conversation JSONL under ~/.claude/projects.
         registry_path = agent_home / "logs" / "session-registry.json"
         if not registry_path.exists():
             return None
@@ -1669,7 +1681,6 @@ class DiscordAdapter:
         except (json.JSONDecodeError, OSError):
             return None
 
-        # Find JSONL file
         claude_projects = Path.home() / ".claude" / "projects"
         encoded_cwd = str(Path(agent_home).resolve()).replace("/", "-").replace(".", "-")
         jsonl_path = claude_projects / encoded_cwd / f"{session_uuid}.jsonl"
@@ -1709,6 +1720,7 @@ class DiscordAdapter:
             return (total, MAX_CONTEXT_TOKENS)
         except OSError:
             return None
+
 
     @staticmethod
     def _read_plan(agent_home: Path, session_id: str) -> dict | None:

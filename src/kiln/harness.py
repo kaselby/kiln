@@ -336,12 +336,16 @@ class KilnHarness:
         system_prompt: str,
         session_config: dict | None = None,
         channel_subscriptions: list[str] | None = None,
+        context_tokens: int | None = None,
     ) -> None:
         state: dict = {"system_prompt": system_prompt}
         if session_config is not None:
             state["session_config"] = session_config
         if channel_subscriptions is not None:
             state["channel_subscriptions"] = channel_subscriptions
+        if context_tokens is not None:
+            state["context_tokens"] = context_tokens
+
         if self.config.template:
             state["template"] = self.config.template
         if self.config.template_vars:
@@ -1173,6 +1177,9 @@ class KilnHarness:
         if self.session_config:
             state["session_config"] = self.session_config.all
         state["channel_subscriptions"] = self._snapshot_channel_subscriptions()
+        if self.session_control and self.session_control.context_tokens > 0:
+            state["context_tokens"] = self.session_control.context_tokens
+
         tmp = path.with_suffix(".tmp")
         try:
             tmp.write_text(yaml.dump(state, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False, allow_unicode=True))

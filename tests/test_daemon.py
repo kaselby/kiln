@@ -4065,6 +4065,11 @@ class TestEnrichWithHomeDecorators:
 
         # Set up agent home structure
         (tmp_path / "state").mkdir(parents=True)
+        (tmp_path / "logs" / "session-state").mkdir(parents=True)
+        (tmp_path / "logs" / "session-state" / "beth-fox.yml").write_text(
+            yaml.dump({"context_tokens": 42000})
+        )
+
         (tmp_path / "state" / "session-config-beth-fox.yml").write_text(
             yaml.dump({"mode": "yolo"})
         )
@@ -4083,8 +4088,9 @@ class TestEnrichWithHomeDecorators:
         assert a["mode"] == "yolo"
         assert a["plan"]["goal"] == "test"
         assert a["inbox"] == 1
-        assert a["context"] == "?"  # No JSONL, so "?"
-        assert a["context_pct"] is None
+        assert a["context"] == "21%"
+        assert a["context_pct"] == 21
+
 
     def test_graceful_with_empty_home(self, tmp_path):
         adapter = _make_adapter(channel_access="open")
@@ -4106,8 +4112,21 @@ class TestEnrichWithHomeDecorators:
         assert a["mode"] == ""
         assert a["context"] == "?"
 
+    def test_read_context_usage_from_session_state(self, tmp_path):
+        import yaml
+        from kiln.daemon.adapters.discord import DiscordAdapter
+
+        (tmp_path / "logs" / "session-state").mkdir(parents=True)
+        (tmp_path / "logs" / "session-state" / "dalet-gold-pine.yml").write_text(
+            yaml.dump({"context_tokens": 85000})
+        )
+
+        usage = DiscordAdapter._read_context_usage(tmp_path, "dalet-gold-pine")
+        assert usage == (85000, 200000)
+
 
 class TestConclaveMembership:
+
     def test_parses_briefing(self, tmp_path):
         from kiln.daemon.state import SessionRecord
         adapter = _make_adapter(channel_access="open")
