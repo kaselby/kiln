@@ -45,7 +45,7 @@ class SessionConfig:
         self._path = path
         self._defaults = {**self.CORE_DEFAULTS, **(defaults or {})}
         # Ensure defaults are present in the file.  If the file already
-        # exists (e.g. gateway wrote subscriptions before the harness
+        # exists (e.g. daemon wrote subscriptions before the harness
         # started), merge missing defaults into it rather than skipping.
         if self._path.exists():
             data = self._read()

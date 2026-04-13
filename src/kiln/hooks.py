@@ -307,18 +307,17 @@ def create_supplemental_content_hook(supplemental):
 def create_session_state_hook(
     harness,
     interval: int = 15,
-    channels_path: Path | None = None,
     session_prefix: str = "kiln-",
 ):
     """Create a PostToolUse hook that periodically shows session state.
 
     Shows permission mode, active agent sessions, and active channels.
-    Fires every `interval` tool calls.
+    Fires every `interval` tool calls. Channel info comes from
+    harness.session_state_labels() (daemon-backed).
 
     Args:
         harness: The KilnHarness instance (for permission mode, etc.).
         interval: Number of tool calls between checks.
-        channels_path: Path to channels.json (for listing active channels).
         session_prefix: Tmux session name prefix for agent sessions.
     """
     call_count = 0
@@ -366,16 +365,6 @@ def create_session_state_hook(
                     parts.append(f"Agents: {', '.join(display)} ({len(sessions)} total)")
         except (OSError, subprocess.TimeoutExpired):
             pass
-
-        # Get active channels
-        if channels_path and channels_path.exists():
-            try:
-                data = json.loads(channels_path.read_text())
-                channels = [name for name, subs in data.items() if subs]
-                if channels:
-                    parts.append(f"Channels: {', '.join(channels)}")
-            except (json.JSONDecodeError, OSError):
-                pass
 
         # Always fire — at minimum shows permission mode
         return {
@@ -594,10 +583,10 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
 
 
 def _resolve_live_trust(msg: dict, state_dir: Path | None) -> None:
-    """Override a gateway message's trust field with live trust state.
+    """Override a platform message's trust field with live trust state.
 
-    Modifies ``msg`` in place. Only applies to gateway messages (source is a
-    platform name, not "kiln"/"agent"). Agent and non-gateway messages are
+    Modifies ``msg`` in place. Only applies to platform messages (source is a
+    platform name, not "kiln"/"agent"). Agent and non-platform messages are
     left untouched.
 
     Extracts the platform from the message source and reads the corresponding

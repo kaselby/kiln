@@ -165,6 +165,17 @@ def parse_args() -> argparse.Namespace:
 
     sub.add_parser("list", help="List known sessions")
 
+    daemon_parser = sub.add_parser("daemon", help="Manage the Kiln daemon")
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_command")
+    daemon_start = daemon_sub.add_parser("start", help="Start the daemon")
+    daemon_start.add_argument("--foreground", action="store_true",
+                              help="Run in foreground (default: background)")
+    daemon_sub.add_parser("stop", help="Stop the daemon")
+    daemon_sub.add_parser("status", help="Show daemon status")
+    daemon_logs = daemon_sub.add_parser("logs", help="View daemon logs")
+    daemon_logs.add_argument("--follow", "-f", action="store_true",
+                             help="Follow log output")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -548,6 +559,26 @@ def _scaffold_harness(target: Path, name: str) -> None:
     )
 
 
+def _register_agent_home(name: str, target: Path) -> None:
+    """Register an agent namespace → home path mapping in ~/.kiln/agents.yml."""
+    agents_yml = Path.home() / ".kiln" / "agents.yml"
+    agents_yml.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import yaml as _yaml
+        registry = _yaml.safe_load(agents_yml.read_text()) or {} if agents_yml.exists() else {}
+    except Exception:
+        registry = {}
+
+    registry[name] = str(target.expanduser())
+    try:
+        import yaml as _yaml
+        agents_yml.write_text(_yaml.safe_dump(registry, sort_keys=True))
+    except Exception as e:
+        print(f"Warning: failed to update {agents_yml}: {e}")
+
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     """Scaffold a new agent home directory."""
     if args.dir:
@@ -560,6 +591,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     target.mkdir(parents=True)
+
 
     # agent.yml
     doc_name = f"{args.name.upper()}.md"
@@ -594,7 +626,10 @@ def cmd_init(args: argparse.Namespace) -> None:
     if args.harness:
         _scaffold_harness(target, args.name)
 
+    _register_agent_home(args.name, target)
+
     print(f"Agent scaffolded at {target}/")
+
     if args.harness:
         print(f"  Install the harness:  uv tool install --editable {target}/harness")
         print(f"  Then launch with:     {args.name}")
@@ -671,6 +706,120 @@ def cmd_list(args: argparse.Namespace) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def cmd_daemon(args: argparse.Namespace) -> None:
+    """Manage the Kiln daemon."""
+    from .daemon.config import DAEMON_DIR, SOCKET_PATH, PID_FILE, LOG_FILE
+
+    subcmd = args.daemon_command
+    if not subcmd:
+        print("Usage: kiln daemon {start|stop|status|logs}")
+        sys.exit(1)
+
+    if subcmd == "start":
+        if SOCKET_PATH.exists():
+            # Check if actually running
+            if PID_FILE.exists():
+                try:
+                    pid = int(PID_FILE.read_text().strip())
+                    os.kill(pid, 0)
+                    print(f"Daemon already running (PID {pid})")
+                    return
+                except (ValueError, ProcessLookupError, PermissionError):
+                    # Stale — clean up and start fresh
+                    SOCKET_PATH.unlink(missing_ok=True)
+                    PID_FILE.unlink(missing_ok=True)
+
+        DAEMON_DIR.mkdir(parents=True, exist_ok=True)
+
+        if args.foreground:
+            import asyncio
+            from .daemon.server import KilnDaemon, _setup_logging
+            _setup_logging()
+            asyncio.run(KilnDaemon().serve_forever())
+        else:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "kiln.daemon.server", "--background"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait briefly for socket
+            import time
+            for _ in range(50):  # 5 seconds
+                if SOCKET_PATH.exists():
+                    break
+                time.sleep(0.1)
+
+            if SOCKET_PATH.exists():
+                pid = PID_FILE.read_text().strip() if PID_FILE.exists() else "?"
+                print(f"Daemon started (PID {pid})")
+            else:
+                print("Daemon failed to start — check logs at", LOG_FILE)
+                sys.exit(1)
+
+    elif subcmd == "stop":
+        if not PID_FILE.exists():
+            print("Daemon not running")
+            return
+
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+            print(f"Sent SIGTERM to daemon (PID {pid})")
+        except (ValueError, ProcessLookupError):
+            print("Daemon not running (stale PID file)")
+            PID_FILE.unlink(missing_ok=True)
+            SOCKET_PATH.unlink(missing_ok=True)
+
+    elif subcmd == "status":
+        if not SOCKET_PATH.exists():
+            print("Daemon: not running")
+            return
+
+        if PID_FILE.exists():
+            try:
+                pid = int(PID_FILE.read_text().strip())
+                os.kill(pid, 0)
+                print(f"Daemon: running (PID {pid})")
+                print(f"Socket: {SOCKET_PATH}")
+                print(f"Log: {LOG_FILE}")
+
+                # Query daemon for status
+                import asyncio
+                from .daemon.client import DaemonClient, DaemonUnavailableError
+                async def _query():
+                    client = DaemonClient(
+                        agent="cli", session="cli-status",
+                        auto_start=False,
+                    )
+                    try:
+                        status = await client.get_status()
+                        print(f"Sessions: {status.get('sessions', '?')}")
+                        print(f"Channels: {status.get('channels', '?')}")
+                        print(f"Bridges: {status.get('bridges', '?')}")
+                        print(f"Adapters: {', '.join(status.get('adapters', [])) or 'none'}")
+                        if status.get("lockdown"):
+                            print("** LOCKDOWN ACTIVE **")
+                    except DaemonUnavailableError:
+                        print("(could not query daemon)")
+
+                asyncio.run(_query())
+                return
+            except (ValueError, ProcessLookupError, PermissionError):
+                pass
+
+        print("Daemon: not running (stale socket)")
+
+    elif subcmd == "logs":
+        if not LOG_FILE.exists():
+            print(f"No log file at {LOG_FILE}")
+            return
+
+        if args.follow:
+            os.execvp("tail", ["tail", "-f", str(LOG_FILE)])
+        else:
+            os.execvp("tail", ["tail", "-50", str(LOG_FILE)])
+
+
 def main():
     args = parse_args()
 
@@ -680,6 +829,8 @@ def main():
         cmd_init(args)
     elif args.command == "list":
         cmd_list(args)
+    elif args.command == "daemon":
+        cmd_daemon(args)
 
 
 if __name__ == "__main__":

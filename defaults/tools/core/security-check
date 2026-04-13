@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # ---
 # name: security-check
-# brief: OTP identity verification via gateway platform
+# brief: OTP identity verification via a remote platform
 # description: |
-#   Security challenge via any gateway backend. Sends the OTP password pool
-#   to the gateway, which handles the full interactive challenge flow
-#   (posting, waiting, validating, retrying). The tool handles consequences:
-#   marking passwords used, writing trust state, triggering lockdown.
+#   Security challenge via any daemon-backed remote platform. Sends the OTP
+#   password pool to the daemon adapter, which handles the full interactive
+#   challenge flow (posting, waiting, validating, retrying). The tool handles
+#   consequences: marking passwords used, writing trust state, triggering
+#   lockdown.
 # arguments: "<platform> [reason]"
 # ---
 #
@@ -18,20 +19,19 @@
 # Flow:
 #   1. Loads password pool and validates unused passwords exist
 #   2. Notifies all active agents that a challenge is in progress
-#   3. Sends one request to gateway — gateway handles the full UX loop
+#   3. Sends one request to the daemon — the platform adapter handles the UX loop
 #   4. On success: marks password used, writes per-platform trust state
 #   5. On failure: notifies agents, triggers lockdown
 #
 # Exit codes:
 #   0 = verified successfully
 #   1 = lockdown triggered (2 failures)
-#   2 = error (gateway unreachable, missing passwords, unsupported platform, etc.)
+#   2 = error (daemon unreachable, missing passwords, unsupported platform, etc.)
 
-import json
+import asyncio
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -58,29 +58,38 @@ _config = _load_agent_config()
 SESSION_PREFIX = _config.get("session_prefix", "kiln-")
 
 
-def gateway_api(method: str, path: str, body: dict | None = None,
-                timeout: float = 30) -> dict | None:
-    state_file = AGENT_HOME / "state" / "gateway.json"
-    if not state_file.exists():
-        return None
+def get_request_identity() -> tuple[str, str]:
+    session = os.environ.get("KILN_AGENT_ID", "")
+    agent = os.environ.get("AGENT_PREFIX", "")
+    if not agent and session:
+        agent = session.split("-", 1)[0]
+    if not agent:
+        agent = AGENT_HOME.name
+    if not session:
+        session = f"{agent}-security-check"
+    return agent, session
+
+
+async def daemon_status() -> dict | None:
     try:
-        state = json.loads(state_file.read_text())
-        port = state["port"]
-        bind = state.get("bind", "127.0.0.1")
-    except (json.JSONDecodeError, KeyError):
+        from kiln.daemon.client import DaemonClient, DaemonUnavailableError
+    except ImportError:
         return None
 
-    import urllib.request
-    url = f"http://{bind}:{port}{path}"
-    data = json.dumps(body).encode() if body else None
-    headers = {"Content-Type": "application/json"} if data else {}
-
+    agent, session = get_request_identity()
+    client = DaemonClient(agent=agent, session=session, auto_start=False)
     try:
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except Exception:
+        return await client.get_status()
+    except DaemonUnavailableError:
         return None
+
+
+async def daemon_security_challenge(platform: str, payload: dict, timeout: float) -> dict:
+    from kiln.daemon.client import DaemonClient
+
+    agent, session = get_request_identity()
+    client = DaemonClient(agent=agent, session=session, auto_start=False)
+    return await client.platform_op(platform, "security_challenge", payload, timeout=timeout)
 
 
 def load_passwords() -> list[dict]:
@@ -185,21 +194,20 @@ def run_challenge(platform: str, reason: str) -> bool:
     )
     print(f"Notified {agent_count} active session(s)")
 
-    # Single call — gateway handles the full interactive flow.
-    # Timeout: worst case is max_attempts * per-attempt timeout + overhead.
-    http_timeout = MAX_STRIKES * TIMEOUT_SECONDS + 30
-    print(f"Challenge started on {platform} — waiting for gateway response...")
+    # Worst case is max_attempts * per-attempt timeout + overhead.
+    rpc_timeout = MAX_STRIKES * TIMEOUT_SECONDS + 30
+    print(f"Challenge started on {platform} — waiting for remote response...")
 
-    result = gateway_api("POST", f"/api/{platform}/security/challenge", {
+    payload = {
         "reason": reason_text,
         "timeout": TIMEOUT_SECONDS,
         "max_attempts": MAX_STRIKES,
         "passwords": passwords,
-    }, timeout=http_timeout)
-
-    if not result or not result.get("ok"):
-        error = (result or {}).get("error", "unknown error")
-        print(f"ERROR: Challenge failed: {error}")
+    }
+    try:
+        result = asyncio.run(daemon_security_challenge(platform, payload, rpc_timeout))
+    except Exception as e:
+        print(f"ERROR: Challenge failed: {e}")
         return False
 
     challenge_result = result.get("result")
@@ -219,7 +227,7 @@ def run_challenge(platform: str, reason: str) -> bool:
         )
         return True
 
-    elif challenge_result == "failed":
+    if challenge_result == "failed":
         strikes = result.get("strikes", MAX_STRIKES)
         print(f"LOCKDOWN — {strikes} strikes on {platform}")
         notify_agents(
@@ -229,10 +237,9 @@ def run_challenge(platform: str, reason: str) -> bool:
         call_lockdown(f"OTP verification failed on {platform}: {reason_text}")
         return False
 
-    else:
-        error = result.get("error", "unknown")
-        print(f"ERROR: {error}")
-        return False
+    error = result.get("error", "unknown")
+    print(f"ERROR: {error}")
+    return False
 
 
 def main():
@@ -240,7 +247,7 @@ def main():
 
     if "-h" in args or "--help" in args:
         print("Usage: security-check <platform> [reason]")
-        print("Run an OTP challenge via the specified gateway platform.")
+        print("Run an OTP challenge via the specified remote platform.")
         print("\nExamples:")
         print('  security-check discord "Suspicious request"')
         print("  security-check slack")
@@ -254,9 +261,9 @@ def main():
     platform = args[0]
     reason = " ".join(args[1:]) if len(args) > 1 else ""
 
-    status = gateway_api("GET", "/api/status")
-    if not status or not status.get("running"):
-        print("ERROR: Gateway is not running. Cannot issue challenge.")
+    status = asyncio.run(daemon_status())
+    if not status:
+        print("ERROR: Daemon is not running. Cannot issue challenge.")
         sys.exit(2)
 
     success = run_challenge(platform, reason)
