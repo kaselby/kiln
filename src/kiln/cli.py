@@ -311,6 +311,52 @@ def _most_recent_agent_id(config: AgentConfig) -> str | None:
     return most_recent_agent_id(registry_path)
 
 
+def _rebuild_run_args(args: argparse.Namespace, *, omit_spec: bool = False) -> list[str]:
+    """Reconstruct CLI run args from a parsed namespace.
+
+    Used by dispatch (to forward args to a custom CLI binary) and could
+    later replace the manual reconstruction in _build_inner_command.
+    """
+    parts: list[str] = []
+    if not omit_spec and getattr(args, "spec", None):
+        parts.append(str(args.spec))
+    if getattr(args, "id", None):
+        parts += ["--id", args.id]
+    if getattr(args, "model", None):
+        parts += ["--model", args.model]
+    if getattr(args, "parent", None):
+        parts += ["--parent", args.parent]
+    if getattr(args, "prompt", None):
+        parts += ["--prompt", args.prompt]
+    if getattr(args, "prompt_file", None):
+        parts += ["--prompt-file", args.prompt_file]
+    if getattr(args, "depth", None):
+        parts += ["--depth", str(args.depth)]
+    if getattr(args, "persistent", False):
+        parts.append("--persistent")
+    if getattr(args, "last_session", False):
+        parts.append("--last")
+    if getattr(args, "resume", None):
+        parts += ["--resume", args.resume]
+    if getattr(args, "mode", None):
+        parts += ["--mode", args.mode]
+    if getattr(args, "detach", False):
+        parts.append("--detach")
+    if getattr(args, "heartbeat", None) is not None:
+        parts += ["--heartbeat", args.heartbeat]
+    if getattr(args, "idle_nudge", None) is not None:
+        parts += ["--idle-nudge", args.idle_nudge]
+    if getattr(args, "continuation", False):
+        parts.append("--continuation")
+    if getattr(args, "effort", None):
+        parts += ["--effort", args.effort]
+    if getattr(args, "template", None):
+        parts += ["--template", args.template]
+    for var_str in getattr(args, "var", []):
+        parts += ["--var", var_str]
+    return parts
+
+
 def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     """Handle 'kiln run'.
 
@@ -320,6 +366,18 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     """
     spec_path = _find_agent_spec(args.spec)
     config = load_agent_spec(spec_path)
+
+    # Dispatch to custom CLI if configured.
+    # The harness_class guard prevents recursion: when a custom CLI (e.g. beth)
+    # calls cmd_run(args, harness_class=BethHarness), dispatch is skipped.
+    if config.cli and not harness_class:
+        cli_bin = shutil.which(config.cli)
+        if not cli_bin:
+            print(f"Error: CLI binary '{config.cli}' not found.")
+            print(f"  Install it:  uv tool install -e {config.home / 'harness'}")
+            sys.exit(1)
+        exec_args = [config.cli, "run"] + _rebuild_run_args(args, omit_spec=True)
+        os.execvp(cli_bin, exec_args)
 
     # Apply session template (before CLI overrides, so flags always win)
     if getattr(args, "template", None):

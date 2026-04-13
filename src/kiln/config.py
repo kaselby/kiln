@@ -135,6 +135,11 @@ class AgentConfig:
     # Tmux session prefix for agent naming
     session_prefix: str = "kiln-"
 
+    # CLI binary for agents with custom harnesses.
+    # When set, `kiln run <agent>` execs to this binary instead of running
+    # in-process with stock KilnHarness.
+    cli: str | None = None
+
     # Inbox / messaging
     inbox_dir: str = "inbox"          # relative to home
 
@@ -291,7 +296,7 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
         "identity_doc", "owner_name", "model", "effort", "session_prefix",
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
-        "orientation", "cleanup", "initial_mode",
+        "orientation", "cleanup", "initial_mode", "cli",
     ]:
         if field_name in raw:
             setattr(config, field_name, raw[field_name])
