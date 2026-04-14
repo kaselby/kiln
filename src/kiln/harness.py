@@ -232,6 +232,8 @@ class KilnHarness:
         self.ui_events: list[dict] = []
         self.session_config: SessionConfig | None = None  # created in _build_backend_config
         self._resume_uuid: str | None = None  # set in _build_backend_config if resuming
+        self._resume_transcript: str | None = None  # custom backend JSONL path for resume
+        self._transcript_path: str | None = None  # live transcript path (custom backend)
         self._worklog_path = self._resolve_worklog_path()
 
         # Spawned subagents default to yolo — no human watching
@@ -317,12 +319,18 @@ class KilnHarness:
 
     def register_session(self) -> None:
         """Register this session in the registry."""
+        extras = {}
+        # For custom backend sessions, store the transcript path so
+        # resume can locate the JSONL without a Claude session_uuid.
+        if self._transcript_path:
+            extras["transcript_path"] = self._transcript_path
         register_session(
             self._registry_path,
             self.agent_id,
             cwd=str(self.config.home),
             model=self.config.model,
             session_uuid=self.session_id,
+            extras=extras or None,
         )
 
     def set_permission_callbacks(self, get_mode, request_permission) -> None:
@@ -725,22 +733,47 @@ class KilnHarness:
 
         # Resolve conversation continuity for --resume / --last.
         resume_uuid = None
+        resume_transcript: str | None = None
         if self.config.resume_session:
             entry = lookup_session(self._registry_path, self.config.resume_session)
             if not entry:
                 raise RuntimeError(
                     f"Cannot resume: no session found for '{self.config.resume_session}'."
                 )
+            # Claude backend: needs session_uuid for CC SDK resume
             resume_uuid = entry.get("session_uuid")
-            if not resume_uuid:
+            # Custom backend: needs transcript path for JSONL-based resume
+            resume_transcript = entry.get("transcript_path")
+            if not resume_transcript:
+                # Infer from deterministic path convention
+                candidate = self.config.home / "logs" / "conversations" / "live" / f"{self.config.resume_session}.jsonl"
+                if candidate.exists():
+                    resume_transcript = str(candidate)
+            if not resume_uuid and not resume_transcript:
                 raise RuntimeError(
-                    f"Cannot resume: no session UUID recorded for '{self.config.resume_session}'. "
+                    f"Cannot resume: no session UUID or transcript found for "
+                    f"'{self.config.resume_session}'. "
                     f"The session may have exited before completing its first turn."
                 )
             if entry.get("cwd"):
                 cwd = entry["cwd"]
-        # Expose resume UUID so the TUI can locate the prior conversation.
+        # Expose resume state so the TUI can locate the prior conversation.
         self._resume_uuid = resume_uuid
+        self._resume_transcript = resume_transcript
+
+        # Determine transcript path for custom backend sessions.
+        # For new sessions: deterministic path under agent home.
+        # For resumed sessions: reuse the existing transcript (append to it).
+        from .config import infer_backend
+        backend_name = self.config.backend or infer_backend(self.config.model)
+        transcript_path: str | None = None
+        if backend_name != "claude":
+            if resume_transcript:
+                transcript_path = resume_transcript
+            else:
+                tp = self.config.home / "logs" / "conversations" / "live" / f"{self.agent_id}.jsonl"
+                transcript_path = str(tp)
+        self._transcript_path = transcript_path
 
         # Stderr logging
         log_dir = self.config.home / "logs"
@@ -766,6 +799,7 @@ class KilnHarness:
             max_output_tokens=getattr(self.config, "max_output_tokens", None),
             session_id=self.agent_id,
             resume_conversation_id=resume_uuid,
+            transcript_path=transcript_path,
             stream_timeout=self.config.stream_timeout,
             stderr_callback=_stderr_callback,
             supplemental=self._supplemental,
@@ -913,12 +947,13 @@ class KilnHarness:
         # Queue startup messages onto followup_queue (programmatic user turns).
         # steering_queue is for user-typed mid-turn input only.
         # Skip orientation on resume — the prior conversation already has it.
+        is_resume = bool(self._resume_uuid or self._resume_transcript)
         orientation = self._build_orientation()
-        if orientation and not self._resume_uuid:
+        if orientation and not is_resume:
             self.followup_queue.append(orientation)
 
         if self.config.prompt:
-            if orientation and not self._resume_uuid:
+            if orientation and not is_resume:
                 # Deliver as inbox message — discovered naturally during orientation
                 self._deliver_prompt_to_inbox()
             else:
@@ -1185,21 +1220,32 @@ class KilnHarness:
         return None
 
     def archive_conversation(self) -> str | None:
-        """Copy conversation JSONL to agent logs. Returns path or None."""
+        """Copy conversation JSONL to agent logs. Returns path or None.
+
+        Claude backend: copies from ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
+        Custom backend: copies from the live transcript path (already durable).
+        """
+        dest_dir = self.config.home / "logs" / "conversations"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        today = date.today().strftime("%Y-%m-%d")
+
+        # Custom backend: live transcript is the source of truth
+        if self._transcript_path:
+            source = Path(self._transcript_path)
+            if not source.exists():
+                return None
+            dest = self._dedup_path(dest_dir / f"{today}-{self.agent_id}.jsonl")
+            shutil.copy2(source, dest)
+            return str(dest)
+
+        # Claude backend: copy from CC's storage
         if not self.session_id:
             return None
-
         cwd = str(self.config.home.resolve())
         project_dir_name = cwd.replace("/", "-").replace(".", "-")
         source = Path.home() / ".claude" / "projects" / project_dir_name / f"{self.session_id}.jsonl"
-
         if not source.exists():
             return None
-
-        dest_dir = self.config.home / "logs" / "conversations"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        today = date.today().strftime("%Y-%m-%d")
         dest = self._dedup_path(dest_dir / f"{today}-{self.agent_id}.jsonl")
         shutil.copy2(source, dest)
         return str(dest)
@@ -1210,7 +1256,16 @@ class KilnHarness:
         Used by the TUI to render prior message history when resuming.
         Only returns a path if (a) this session was started as a resume/continue
         and (b) the JSONL file actually exists on disk.
+
+        Custom backend: uses the transcript path directly.
+        Claude backend: looks in ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
         """
+        # Custom backend: transcript path is the JSONL
+        if self._resume_transcript:
+            path = Path(self._resume_transcript)
+            return path if path.exists() else None
+
+        # Claude backend: look up in CC's storage
         if not self._resume_uuid:
             return None
         cwd = str(self.config.home.resolve())

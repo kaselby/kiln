@@ -368,8 +368,25 @@ class Provider(Protocol):
         """
         ...
 
+    def build_assistant_input(
+        self,
+        *,
+        text: str,
+        tool_calls: list[ToolCallEvent],
+    ) -> list[dict[str, Any]]:
+        """Build provider-compatible input items for an assistant turn replay.
+
+        Used when resuming from a transcript or any history source that lacks
+        raw provider output items.  Returns a list of top-level input items
+        (e.g. a message item for text, separate function_call items for tool
+        calls) matching the provider's expected replay format.  Returns an
+        empty list if there is nothing to replay.
+        """
+        ...
+
     @property
     def context_injection_role(self) -> str:
+
         """Role for hook context injection messages.
 
         "developer" for OpenAI (reasoning models ignore "system"),
@@ -418,6 +435,9 @@ class BackendConfig:
     # Session identity
     session_id: str | None = None            # Stable ID (OpenAI prompt_cache_key, logging)
     resume_conversation_id: str | None = None  # CC-specific: conversation UUID to resume
+
+    # Transcript — durable JSONL for custom-backend resume
+    transcript_path: str | None = None       # Live transcript file path (custom backend only)
 
     # Stream behavior
     stream_timeout: float | None = None
