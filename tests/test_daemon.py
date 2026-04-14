@@ -5149,6 +5149,33 @@ class TestAdapterBootstrap:
         cls = gw_mod._resolve_adapter_class("mock")
         assert cls is _BootstrapMockAdapter
 
+    @pytest.mark.asyncio
+    async def test_service_discoverable_during_adapter_start(self, daemon_config, monkeypatch):
+        """Adapters can find their owning service via daemon.services during start().
+
+        Regression test: the gateway service must be registered in
+        daemon.services before adapter.start() is called, because
+        adapters look up the gateway through the daemon.
+        """
+        class _ReentrantAdapter(_BootstrapMockAdapter):
+            async def start(self, daemon):
+                # This is what the Discord adapter does during startup
+                gateway = daemon.services.get("gateway")
+                assert gateway is not None, "gateway not in daemon.services during adapter start"
+                assert hasattr(gateway, "bridges"), "gateway missing bridges state"
+                await super().start(daemon)
+
+        daemon_config.services["gateway"] = _gateway_config({
+            "reentrant": {"platform": "reentrant", "enabled": True},
+        })
+        _patch_adapter_registry(monkeypatch, {"reentrant": _ReentrantAdapter})
+
+        daemon = KilnDaemon(daemon_config)
+        await daemon.start()
+
+        assert "reentrant" in daemon.services["gateway"].adapters
+        await daemon.stop()
+
 
 # ---------------------------------------------------------------------------
 # D3b — Security challenge op (adapter wrapper)
