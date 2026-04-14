@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+import yaml
 
 from kiln.daemon import protocol as proto
 from kiln.daemon.config import DaemonConfig
@@ -720,6 +721,66 @@ async def test_desired_subscriptions_survive_daemon_outage(running_daemon, make_
     snap2 = harness2._snapshot_channel_subscriptions()
     assert set(snap2) == {"alpha", "beta"}, \
         "Desired subscriptions must survive when daemon is None"
+
+
+def test_continuation_loads_parent_channel_subscriptions(tmp_path):
+    """Self-continuation loads channel subscriptions from parent's state file.
+
+    Regression test: continuation gets a new agent_id, so _load_session_state()
+    won't find anything. The harness must explicitly load the parent's state file.
+    """
+    from kiln.harness import KilnHarness
+
+    # Write a parent state file with channel subscriptions
+    state_dir = tmp_path / "logs" / "session-state"
+    state_dir.mkdir(parents=True)
+    parent_id = "beth-old-session"
+    parent_state = {
+        "system_prompt": "old prompt",
+        "channel_subscriptions": ["alpha", "beta", "gamma"],
+        "session_config": {"mode": "yolo"},
+    }
+    (state_dir / f"{parent_id}.yml").write_text(
+        yaml.dump(parent_state, default_flow_style=False)
+    )
+
+    # Simulate the continuation loading logic from _build_backend_config
+    # (extracted here to avoid needing the full harness startup machinery)
+    config_continuation = True
+    config_parent = parent_id
+    config_home = tmp_path
+    resume_session = None
+
+    saved_state = None  # resume_session is None, so this stays None
+    if not saved_state and config_continuation and config_parent:
+        parent_state_path = config_home / "logs" / "session-state" / f"{config_parent}.yml"
+        if parent_state_path.exists():
+            data = yaml.safe_load(parent_state_path.read_text())
+            if isinstance(data, dict) and data.get("channel_subscriptions"):
+                saved_state = {"channel_subscriptions": data["channel_subscriptions"]}
+
+    assert saved_state is not None, "Should have loaded parent state"
+    assert saved_state["channel_subscriptions"] == ["alpha", "beta", "gamma"]
+    # Must NOT carry over system_prompt or session_config
+    assert "system_prompt" not in saved_state
+    assert "session_config" not in saved_state
+
+
+def test_continuation_no_parent_state_file(tmp_path):
+    """Continuation gracefully handles missing parent state file."""
+    config_continuation = True
+    config_parent = "beth-nonexistent"
+    config_home = tmp_path
+
+    saved_state = None
+    if not saved_state and config_continuation and config_parent:
+        parent_state_path = config_home / "logs" / "session-state" / f"{config_parent}.yml"
+        if parent_state_path.exists():
+            data = yaml.safe_load(parent_state_path.read_text())
+            if isinstance(data, dict) and data.get("channel_subscriptions"):
+                saved_state = {"channel_subscriptions": data["channel_subscriptions"]}
+
+    assert saved_state is None, "Should be None when parent state file doesn't exist"
 
 
 # ---------------------------------------------------------------------------

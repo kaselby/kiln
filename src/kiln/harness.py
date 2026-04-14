@@ -507,6 +507,23 @@ class KilnHarness:
         # Restore saved state if resuming (--resume and --last both set resume_session).
         saved_state = self._load_session_state() if self.config.resume_session else None
 
+        # On self-continuation, carry over channel subscriptions from parent session.
+        # The parent's state file has them, but we can't use resume_session (different
+        # agent_id, and we don't want to resume the full state — just subscriptions).
+        if not saved_state and self.config.continuation and self.config.parent:
+            parent_state_path = (
+                self.config.home / "logs" / "session-state" / f"{self.config.parent}.yml"
+            )
+            if parent_state_path.exists():
+                try:
+                    data = yaml.safe_load(parent_state_path.read_text())
+                    if isinstance(data, dict) and data.get("channel_subscriptions"):
+                        saved_state = {
+                            "channel_subscriptions": data["channel_subscriptions"]
+                        }
+                except (OSError, yaml.YAMLError):
+                    pass
+
         # Re-apply template from saved state so cleanup, hooks, and other
         # runtime config fields are restored.  CLI --template wins if set.
         if saved_state and not self.config.template:
@@ -765,7 +782,7 @@ class KilnHarness:
         # For new sessions: deterministic path under agent home.
         # For resumed sessions: reuse the existing transcript (append to it).
         from .config import infer_backend
-        backend_name = self.config.backend or infer_backend(self.config.model)
+        backend_name = infer_backend(self.config.model)
         transcript_path: str | None = None
         if backend_name != "claude":
             if resume_transcript:
