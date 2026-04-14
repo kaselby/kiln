@@ -527,7 +527,7 @@ class KilnApp:
     Responses print in full at commit time (no live streaming).
     """
 
-    _HEARTBEAT_BASE_INTERVAL: float = 60.0  # 1 min starting interval
+
 
     def __init__(self, harness) -> None:
         self._harness = harness
@@ -560,14 +560,10 @@ class KilnApp:
         self._last_turn_source: str = "user"  # "user" or "agent"
         self._watcher_task: asyncio.Task | None = None
 
-        # Heartbeat: nudge agent after idle period, with exponential backoff.
-        # heartbeat_max = cap for exponential backoff; heartbeat_override = fixed interval (no backoff).
-        self._heartbeat_enabled = harness.config.heartbeat
-        self._heartbeat_max: float = harness.config.heartbeat_max
-        self._heartbeat_override: float = harness.config.heartbeat_override
-        self._heartbeat_backoff: float = self._HEARTBEAT_BASE_INTERVAL
+        # Heartbeat: nudge agent after a fixed idle interval.
+        self._heartbeat_interval: float = harness.config.heartbeat
         self._heartbeat_task: asyncio.Task | None = None
-        self._heartbeat_oneshot: float | None = None  # one-shot override (seconds)
+
 
         # Idle nudge: send a message after prolonged inactivity.
         self._idle_nudge_timeout: float = harness.config.idle_nudge_timeout
@@ -1302,11 +1298,11 @@ class KilnApp:
 
                 self._last_auto_delivery = time.monotonic()
 
-                # Reset heartbeat backoff on real activity (not heartbeats themselves)
+                # Reset idle tracking on real activity (not heartbeats themselves)
                 if source not in ("heartbeat", "idle-nudge"):
-                    self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
                     self._last_real_activity = time.monotonic()
                     self._idle_nudge_sent = False
+
 
                 # Check if the agent requested a session exit (exit_session tool)
                 sc = self._harness.session_control
@@ -1473,30 +1469,13 @@ class KilnApp:
         if sc is None:
             return
 
-        enabled = sc.get("heartbeat_enabled")
-        if enabled is not None:
-            self._heartbeat_enabled = bool(enabled)
+        heartbeat = sc.get("heartbeat")
+        try:
+            self._heartbeat_interval = max(float(heartbeat or 0), 0.0)
+        except (ValueError, TypeError):
+            pass
 
-        # Override: fixed interval bypassing backoff (0 = disabled)
-        override = sc.get("heartbeat_override")
-        if override is not None:
-            try:
-                self._heartbeat_override = float(override)
-            except (ValueError, TypeError):
-                pass
 
-        # Max: cap for exponential backoff (fall back to legacy heartbeat_interval)
-        hb_max = sc.get("heartbeat_max") or sc.get("heartbeat_interval")
-        if hb_max is not None:
-            try:
-                new_max = float(hb_max)
-                if new_max > 0 and new_max != self._heartbeat_max:
-                    self._heartbeat_max = new_max
-                    self._heartbeat_backoff = min(
-                        self._heartbeat_backoff, self._heartbeat_max
-                    )
-            except (ValueError, TypeError):
-                pass
 
     async def _heartbeat_watcher(self) -> None:
         """Nudge the agent after a period of inactivity."""
@@ -1529,24 +1508,13 @@ class KilnApp:
 
             # --- Regular heartbeat ---
             self._sync_heartbeat_from_config()
-            if not self._heartbeat_enabled:
+            if self._heartbeat_interval <= 0:
                 continue
             if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
                 continue
             elapsed = time.monotonic() - self._last_auto_delivery
-
-            # Priority: oneshot > override > backoff
-            if self._heartbeat_oneshot:
-                interval = self._heartbeat_oneshot
-            elif self._heartbeat_override > 0:
-                interval = self._heartbeat_override
-            else:
-                interval = self._heartbeat_backoff
-
-            if elapsed < interval:
+            if elapsed < self._heartbeat_interval:
                 continue
-
-            self._heartbeat_oneshot = None
 
             ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
             msg = f"[{ts}] (heartbeat)"
@@ -1557,59 +1525,43 @@ class KilnApp:
             await task
 
 
-            # Only increase backoff when not using override
-            if self._heartbeat_override <= 0:
-                self._heartbeat_backoff = min(
-                    self._heartbeat_backoff * 2, self._heartbeat_max
-                )
-
     def _toggle_heartbeat(self, text: str) -> None:
         """Handle /heartbeat command."""
         parts = text.split()
+        default_interval = 30 * 60.0
         if len(parts) >= 2:
             try:
                 minutes = float(parts[1])
-                self._heartbeat_override = minutes * 60
-                self._heartbeat_enabled = True
-                _tprint("<dim>Heartbeat: on, fixed {}min (no backoff)</dim>", int(minutes))
+                self._heartbeat_interval = max(minutes * 60, 0.0)
+                if self._heartbeat_interval > 0:
+                    _tprint("<dim>Heartbeat: on, fixed {}min</dim>", int(minutes))
+                else:
+                    _tprint("<dim>Heartbeat: off</dim>")
             except ValueError:
                 if parts[1] == "off":
-                    self._heartbeat_enabled = False
+                    self._heartbeat_interval = 0.0
                     _tprint("<dim>Heartbeat: off</dim>")
                 elif parts[1] == "on":
-                    self._heartbeat_enabled = True
-                    if self._heartbeat_override > 0:
-                        _tprint("<dim>Heartbeat: on, fixed {}min</dim>",
-                                int(self._heartbeat_override / 60))
-                    else:
-                        _tprint("<dim>Heartbeat: on, backoff up to {}min</dim>",
-                                int(self._heartbeat_max / 60))
-                elif parts[1] == "backoff":
-                    # Switch back to backoff mode
-                    self._heartbeat_override = 0.0
-                    self._heartbeat_backoff = self._HEARTBEAT_BASE_INTERVAL
-                    self._heartbeat_enabled = True
-                    _tprint("<dim>Heartbeat: on, backoff up to {}min</dim>",
-                            int(self._heartbeat_max / 60))
+                    if self._heartbeat_interval <= 0:
+                        self._heartbeat_interval = default_interval
+                    _tprint("<dim>Heartbeat: on, fixed {}min</dim>",
+                            int(self._heartbeat_interval / 60))
                 else:
-                    _tprint("<dim>Usage: /heartbeat [on|off|backoff|<minutes>]</dim>")
+                    _tprint("<dim>Usage: /heartbeat [on|off|<minutes>]</dim>")
+                    return
         else:
-            self._heartbeat_enabled = not self._heartbeat_enabled
-            state = "on" if self._heartbeat_enabled else "off"
-            if self._heartbeat_override > 0:
-                _tprint("<dim>Heartbeat: {} (fixed {}min)</dim>",
-                        state, int(self._heartbeat_override / 60))
+            if self._heartbeat_interval > 0:
+                self._heartbeat_interval = 0.0
+                _tprint("<dim>Heartbeat: off</dim>")
             else:
-                _tprint("<dim>Heartbeat: {} (backoff up to {}min)</dim>",
-                        state, int(self._heartbeat_max / 60))
+                self._heartbeat_interval = default_interval
+                _tprint("<dim>Heartbeat: on, fixed {}min</dim>",
+                        int(self._heartbeat_interval / 60))
         # Persist to session config so changes survive and the agent can see them.
         sc = self._harness.session_config
         if sc is not None:
-            sc.update({
-                "heartbeat_enabled": self._heartbeat_enabled,
-                "heartbeat_max": self._heartbeat_max,
-                "heartbeat_override": self._heartbeat_override,
-            })
+            sc.set("heartbeat", self._heartbeat_interval)
+
 
     def _pending_message_count(self) -> int:
         """Count unread messages in the inbox."""
@@ -1920,18 +1872,10 @@ class KilnApp:
         if self._stream_chunks:
             full_text = "".join(self._stream_chunks)
 
-            # Parse !hb <minutes> suffix — one-shot heartbeat override
-            hb_match = re.search(r'!hb\s+(\d+(?:\.\d+)?)\s*$', full_text)
-            if hb_match:
-                minutes = float(hb_match.group(1))
-                self._heartbeat_oneshot = minutes * 60
-                full_text = full_text[:hb_match.start()].rstrip()
-
             _tprint("\n<assistant>{}:</assistant>", self._agent_label)
             print_formatted_text(_markdown_to_ft(full_text), style=TUI_STYLE)
-            if hb_match:
-                _tprint("<dim>Heartbeat one-shot: {}min</dim>", hb_match.group(1))
             self._stream_chunks = []
+
 
     def _commit_thinking(self) -> None:
         """Flush the thinking buffer as dimmed text."""

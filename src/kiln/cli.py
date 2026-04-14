@@ -96,9 +96,10 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         help="Don't attach to the tmux session after launch",
     )
     parser.add_argument(
-        "--heartbeat", nargs="?", const="10", default=None, metavar="MINUTES",
-        help="Enable heartbeat (nudge agent after idle). Default 10 min.",
+        "--heartbeat", nargs="?", const="30", default=None, metavar="MINUTES",
+        help="Set heartbeat interval in minutes. Default 30 min.",
     )
+
     parser.add_argument(
         "--idle-nudge", dest="idle_nudge", default=None, metavar="MINUTES",
         help="Send idle nudge after N minutes of inactivity. 0 to disable.",
@@ -405,8 +406,8 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
     if args.mode:
         config.initial_mode = args.mode
     if args.heartbeat is not None:
-        config.heartbeat = True
-        config.heartbeat_max = float(args.heartbeat) * 60
+        config.heartbeat = max(float(args.heartbeat) * 60, 0.0)
+
     if args.idle_nudge is not None:
         config.idle_nudge_timeout = float(args.idle_nudge) * 60
     if getattr(args, "effort", None):
@@ -485,8 +486,14 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
                      "run", str(spec_path.resolve()),
                      "--mode", "yolo",
                      "--parent", harness.agent_id, "--continuation"]
-        if cont.get('heartbeat_enabled'):
-            exec_args += ["--heartbeat", str(int(cont.get('heartbeat_max', 600) / 60))]
+        heartbeat = cont.get('heartbeat', 0)
+        try:
+            heartbeat = float(heartbeat)
+        except (TypeError, ValueError):
+            heartbeat = 0
+        if heartbeat > 0:
+            exec_args += ["--heartbeat", str(int(heartbeat / 60))]
+
         if args.model:
             exec_args += ["--model", args.model]
         if getattr(args, "effort", None):

@@ -592,11 +592,10 @@ class KilnHarness:
         # On resume, saved values override harness defaults so state is restored.
         config_defaults = {
             "mode": self._initial_mode.value,
-            "heartbeat_enabled": self.config.heartbeat,
-            "heartbeat_max": self.config.heartbeat_max,
-            "heartbeat_override": self.config.heartbeat_override,
+            "heartbeat": self.config.heartbeat,
             "stream_timeout": self.config.stream_timeout,
         }
+
         if saved_state and saved_state.get("session_config"):
             config_defaults.update(saved_state["session_config"])
         self.session_config = SessionConfig(
@@ -765,7 +764,8 @@ class KilnHarness:
         # For new sessions: deterministic path under agent home.
         # For resumed sessions: reuse the existing transcript (append to it).
         from .config import infer_backend
-        backend_name = self.config.backend or infer_backend(self.config.model)
+        backend_name = infer_backend(self.config.model)
+
         transcript_path: str | None = None
         if backend_name != "claude":
             if resume_transcript:
