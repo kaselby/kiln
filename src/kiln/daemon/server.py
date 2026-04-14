@@ -698,10 +698,13 @@ class KilnDaemon:
 
             try:
                 service = cls(config=svc_cfg)
-                await service.start(self)
+                # Register before start() so adapters/subcomponents can
+                # find the service via daemon.services during their init.
                 self.services[service.name] = service
+                await service.start(self)
                 log.info("Started service '%s'", service.name)
             except Exception:
+                self.services.pop(svc_name, None)
                 log.exception("Failed to start service '%s'", svc_name)
 
     @classmethod
