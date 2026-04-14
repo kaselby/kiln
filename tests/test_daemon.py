@@ -5177,6 +5177,80 @@ class TestAdapterBootstrap:
         await daemon.stop()
 
 
+class TestServiceDisableGuarantees:
+    """Verify that disabled services/adapters are truly absent at runtime."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_gateway_no_platform_vocabulary(self, daemon_config):
+        """With gateway disabled, daemon has zero platform concepts."""
+        daemon_config.services["gateway"] = {"enabled": False}
+
+        daemon = KilnDaemon(daemon_config)
+        await daemon.start()
+
+        # No gateway service registered
+        assert "gateway" not in daemon.services
+
+        # No platform RPC handlers
+        assert daemon.get_handler(proto.PLATFORM_OP) is None
+        assert daemon.get_handler(proto.SUBSCRIBE_SURFACE) is None
+        assert daemon.get_handler(proto.SEND_USER) is None
+
+        # Status has no platform fields
+        client = DaemonClient(
+            agent="test", session="test-disable-1",
+            socket_path=daemon_config.socket_path,
+            auto_start=False,
+        )
+        status = await client.get_status()
+        assert "adapters" not in status
+        assert "surfaces" not in status
+        assert "bridges" not in status
+        assert status["services"] == {}
+
+        await daemon.stop()
+
+    @pytest.mark.asyncio
+    async def test_no_services_configured(self, daemon_config):
+        """Daemon with no services section has zero platform concepts."""
+        daemon_config.services.clear()
+
+        daemon = KilnDaemon(daemon_config)
+        await daemon.start()
+
+        assert len(daemon.services) == 0
+        assert daemon.get_handler(proto.PLATFORM_OP) is None
+
+        await daemon.stop()
+
+    @pytest.mark.asyncio
+    async def test_gateway_enabled_adapter_disabled(self, daemon_config, monkeypatch):
+        """Gateway active but adapter disabled: no adapter instance, no connection."""
+        daemon_config.services["gateway"] = _gateway_config({
+            "mock": {"platform": "mock", "enabled": False},
+        })
+        _patch_adapter_registry(monkeypatch, {"mock": _BootstrapMockAdapter})
+
+        daemon = KilnDaemon(daemon_config)
+        await daemon.start()
+
+        gateway = daemon.services["gateway"]
+        # Gateway service exists but has no adapters
+        assert len(gateway.adapters) == 0
+        # Gateway RPC handlers still registered (surfaces etc. work)
+        assert daemon.get_handler(proto.SUBSCRIBE_SURFACE) is not None
+        # But platform ops fail gracefully — no adapter to route to
+        client = DaemonClient(
+            agent="test", session="test-disable-2",
+            socket_path=daemon_config.socket_path,
+            auto_start=False,
+        )
+        with pytest.raises(DaemonError, match="No adapter for platform"):
+            await client.platform_op("mock", "ping", {})
+
+        await daemon.stop()
+
+
 # ---------------------------------------------------------------------------
 # D3b — Security challenge op (adapter wrapper)
 # ---------------------------------------------------------------------------
