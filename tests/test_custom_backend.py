@@ -48,6 +48,13 @@ class StubProvider:
         """Delegates to OpenAI's implementation for realistic behavior."""
         return OpenAIResponsesProvider.build_rich_tool_result(self, content_blocks)
 
+    def build_assistant_input(self, *, text, tool_calls):
+        """Delegates to OpenAI assistant replay formatting for realism."""
+        return OpenAIResponsesProvider.build_assistant_input(
+            self, text=text, tool_calls=tool_calls,
+        )
+
+
     def build_image_content(self, data, mime_type):
         b64 = base64.b64encode(data).decode("ascii")
         return {"type": "input_image", "image_url": f"data:{mime_type};base64,{b64}"}
@@ -55,6 +62,7 @@ class StubProvider:
     @property
     def context_injection_role(self):
         return "developer"
+
 
 
 class NoRichProvider(StubProvider):
@@ -381,6 +389,28 @@ class TestBuildInput:
         # Provider fails closed on unknown block → string fallback
         assert items[0]["output"] == "header"
 
+    def test_assistant_fallback_uses_provider_native_replay_shape(self):
+        """Transcript-loaded assistant turns must replay in provider-native format."""
+        backend = make_backend()
+        backend._history = [
+            AssistantTurn(
+                text="I can help.",
+                tool_calls=[
+                    ToolCallEvent(id="c1", name="Read", input={"file_path": "/tmp/x"}),
+                ],
+            ),
+        ]
+
+        items = backend._build_input()
+        assert len(items) == 2
+        assert items[0]["type"] == "message"
+        assert items[0]["role"] == "assistant"
+        assert items[0]["content"][0]["type"] == "output_text"
+        assert items[0]["content"][0]["text"] == "I can help."
+        assert items[1]["type"] == "function_call"
+        assert items[1]["call_id"] == "c1"
+
+
     def test_parallel_tool_calls_orphan_handling(self):
         """When continue_=False stops after tool 1 of 2, tool 2 gets
         a synthetic orphan result via _apply_transforms.
@@ -449,6 +479,7 @@ class TestBuildInput:
             and "[Document" in str(item.get("content", ""))
         )
         assert c1_idx < c2_idx < user_idx
+
 
 
 # ---------------------------------------------------------------------------

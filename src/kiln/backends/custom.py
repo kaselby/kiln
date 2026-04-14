@@ -12,6 +12,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import base64 as _b64
@@ -53,6 +54,7 @@ class AssistantTurn:
     tool_calls: list[ToolCallEvent] = field(default_factory=list)
     text: str = ""
     thinking_text: str = ""
+    thinking_events: list[ThinkingEvent] = field(default_factory=list)
 
 @dataclass
 class ToolResultTurn:
@@ -91,6 +93,7 @@ class CustomBackend:
         self._turn_start_time: float = 0
         self._turn_count: int = 0
         self._interrupted: bool = False
+        self._transcript: TranscriptWriter | None = None
 
     async def start(self, config: BackendConfig) -> None:
         self._config = config
@@ -98,17 +101,68 @@ class CustomBackend:
         self._hook_dispatcher = config.hook_dispatcher
         self._supplemental = config.supplemental
 
+        # Resume from transcript: load prior history before creating writer.
+        # The writer opens in append mode, so resumed sessions continue
+        # appending to the existing transcript with the same sessionId.
+        prior_session_id: str | None = None
+        if config.transcript_path:
+            tp = Path(config.transcript_path)
+            if tp.exists() and tp.stat().st_size > 0:
+                from ..transcript import load_transcript, transcript_session_id
+                self._history = load_transcript(tp)
+                prior_session_id = transcript_session_id(tp)
+                log.info("Resumed %d history entries from %s", len(self._history), tp)
+
+        # Create transcript writer for durable JSONL if path provided
+        if config.transcript_path:
+            from ..transcript import TranscriptWriter
+            self._transcript = TranscriptWriter(
+                Path(config.transcript_path),
+                cwd=config.cwd,
+                model=config.model,
+                session_id=prior_session_id,
+            )
+
     async def send(self, message: str | list[ContentBlock]) -> None:
         if isinstance(message, str):
             self._history.append(UserTurn(text=message))
+            if self._transcript:
+                self._transcript.write_user(message)
         elif isinstance(message, list):
             self._history.append(UserTurn(content_blocks=message))
+            # Rich content: build Claude-compatible block list for transcript
+            if self._transcript:
+                self._transcript.write_user(
+                    self._content_blocks_to_transcript(message),
+                )
         else:
             self._history.append(UserTurn(text=str(message)))
+            if self._transcript:
+                self._transcript.write_user(str(message))
         self._has_pending_turn = True
         self._turn_start_time = time.monotonic()
         self._turn_count = 0
         self._interrupted = False
+
+    @staticmethod
+    def _content_blocks_to_transcript(blocks: list[ContentBlock]) -> list[dict]:
+        """Convert ContentBlock list to Claude-style content blocks for transcript."""
+        from ..types import DocumentContent, TextContent
+        result = []
+        for block in blocks:
+            if isinstance(block, TextContent):
+                result.append({"type": "text", "text": block.text})
+            elif isinstance(block, DocumentContent):
+                block_type = "image" if block.mime_type.startswith("image/") else "document"
+                result.append({
+                    "type": block_type,
+                    "source": {
+                        "type": "base64",
+                        "media_type": block.mime_type,
+                        "data": _b64.b64encode(block.data).decode("ascii"),
+                    },
+                })
+        return result or [{"type": "text", "text": ""}]
 
     async def receive(self) -> AsyncIterator[Event]:
         if not self._config or not self._provider:
@@ -160,6 +214,7 @@ class CustomBackend:
                         assistant_turn.text += event.text
                     elif isinstance(event, ThinkingEvent):
                         assistant_turn.thinking_text += event.text
+                        assistant_turn.thinking_events.append(event)
                     elif isinstance(event, UsageUpdateEvent):
                         saw_usage_update = True
                     elif isinstance(event, TurnCompleteEvent):
@@ -177,8 +232,9 @@ class CustomBackend:
 
             except Exception as e:
                 log.error("Provider stream error: %s", e)
+                if self._transcript:
+                    self._transcript.write_system_error(str(e))
                 yield ErrorEvent(
-
                     message=f"Provider error: {e}",
                     is_retryable=_is_retryable_error(e),
                 )
@@ -190,6 +246,20 @@ class CustomBackend:
 
             # Store assistant turn in history
             self._history.append(assistant_turn)
+
+            # Write assistant record to transcript
+            if self._transcript:
+                stop = None
+                if last_turn_complete:
+                    stop = last_turn_complete.stop_reason
+                self._transcript.write_assistant(
+                    text=assistant_turn.text,
+                    thinking_events=assistant_turn.thinking_events or None,
+                    tool_calls=assistant_turn.tool_calls or None,
+                    stop_reason=stop,
+                    usage=last_turn_complete.usage if last_turn_complete else None,
+                    model=last_turn_complete.model if last_turn_complete else None,
+                )
 
             # Claude surfaces live usage updates mid-turn from streaming deltas.
             # Custom providers may only report usage at provider-call boundaries,
@@ -224,6 +294,10 @@ class CustomBackend:
                         self._history.append(ToolResultTurn(
                             call_id=tc.id, output=reason, is_error=True,
                         ))
+                        if self._transcript:
+                            self._transcript.write_tool_result(
+                                tc.id, reason, is_error=True,
+                            )
                         yield ToolResultEvent(
                             tool_call_id=tc.id, output=reason, is_error=True,
                         )
@@ -255,6 +329,12 @@ class CustomBackend:
                 )
                 self._history.append(tool_result_turn)
 
+                if self._transcript:
+                    self._transcript.write_tool_result(
+                        tc.id, result_text, is_error=result_error,
+                        rich_content=tool_result_turn.rich_content,
+                    )
+
                 # Post-tool hook (context injection + flow control)
                 if self._hook_dispatcher:
                     post_result = await self._hook_dispatcher.post_tool(
@@ -266,7 +346,18 @@ class CustomBackend:
                         self._history.append(
                             ContextInjection(text=post_result.additional_context),
                         )
+                        if self._transcript:
+                            self._transcript.write_hook_additional_context(
+                                post_result.additional_context,
+                                hook_name=f"PostToolUse:{tc.name}",
+                                tool_use_id=tc.id,
+                            )
                     if not post_result.continue_:
+                        if self._transcript:
+                            self._transcript.write_hook_stopped_continuation(
+                                hook_name=f"PostToolUse:{tc.name}",
+                                tool_use_id=tc.id,
+                            )
                         hook_stopped = True
                         break
                 if stashed_for_injection:
@@ -287,11 +378,22 @@ class CustomBackend:
                 model=last_turn_complete.model,
             )
 
+    @property
+    def transcript_session_id(self) -> str | None:
+        return self._transcript.session_id if self._transcript else None
+
+    @property
+    def transcript_path(self) -> Path | None:
+        return self._transcript.path if self._transcript else None
+
     async def interrupt(self) -> None:
         self._interrupted = True
         self._has_pending_turn = False
 
     async def stop(self) -> None:
+        if self._transcript:
+            self._transcript.close()
+            self._transcript = None
         if self._provider:
             try:
                 await self._provider.close()
@@ -331,22 +433,16 @@ class CustomBackend:
                     for raw in turn.raw_output_items:
                         items.append(_strip_output_only_fields(raw))
                 else:
-                    # Fallback: reconstruct from our parsed data
-                    parts = []
-                    if turn.text:
-                        parts.append({"type": "text", "text": turn.text})
-                    for tc in turn.tool_calls:
-                        parts.append({
-                            "type": "tool_call",
-                            "id": tc.id,
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.input),
-                        })
-                    if parts:
-                        items.append({
-                            "role": "assistant",
-                            "content": parts,
-                        })
+                    # Fallback: reconstruct in provider-native replay format.
+                    assistant_items = self._provider.build_assistant_input(
+                        text=turn.text,
+                        tool_calls=turn.tool_calls,
+                    )
+                    if assistant_items:
+                        items.extend(assistant_items)
+
+
+
 
             elif isinstance(turn, ToolResultTurn):
                 output: str | list[dict] = turn.output
@@ -446,12 +542,17 @@ class CustomBackend:
                 content = item.get("content", [])
                 if isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") == "tool_call":
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "tool_call":
                             pending_call_ids.add(part.get("id", ""))
+                        elif part.get("type") == "function_call":
+                            pending_call_ids.add(part.get("call_id", ""))
 
             # Track function call items (OpenAI Responses format)
             if item.get("type") == "function_call":
                 pending_call_ids.add(item.get("call_id", ""))
+
 
             # Remove matched tool results
             if item.get("type") == "function_call_output":

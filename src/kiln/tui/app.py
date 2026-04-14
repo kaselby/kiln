@@ -1037,7 +1037,7 @@ class KilnApp:
         _tprint("<dim>Session started: {}</dim>\n", self._harness.agent_id)
 
         # Resumed session: show prior conversation history and arm the indicator.
-        if getattr(self._harness, "_resume_uuid", None):
+        if getattr(self._harness, "_resume_uuid", None) or getattr(self._harness, "_resume_transcript", None):
             self._render_prior_conversation()
             self._resume_indicator_pending = True
 
@@ -1740,8 +1740,12 @@ class KilnApp:
                 if warning:
                     _tprint("\n<err-b>Warning:</err-b> <err>{}</err>", warning)
             if event.session_id and not self._harness.session_id:
-                self._harness.session_id = event.session_id
-                self._harness.register_session()
+                # For transcript-backed sessions (custom backend), the provider's
+                # session_id is a per-call response ID, not a durable conversation
+                # UUID. Skip storing it as session_uuid to avoid misleading metadata.
+                if not getattr(self._harness, "_transcript_path", None):
+                    self._harness.session_id = event.session_id
+                    self._harness.register_session()
             if event.usage:
                 self._update_usage_state(event.usage, update_last_call=True)
             self._on_turn_complete_event(event)

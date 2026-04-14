@@ -530,8 +530,44 @@ class OpenAIResponsesProvider:
                 return None
         return parts if parts else None
 
+    def build_assistant_input(
+        self,
+        *,
+        text: str,
+        tool_calls: list[ToolCallEvent],
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+        """Build Responses-API-compatible assistant replay items.
+
+        OpenAI input accepts assistant text as an output message item, but tool
+        calls replay as top-level `function_call` input items rather than nested
+        inside assistant message content.
+        """
+        items: list[dict[str, Any]] = []
+        if text:
+            items.append({
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }],
+            })
+        for tc in tool_calls:
+            items.append({
+                "type": "function_call",
+                "call_id": tc.id,
+                "name": tc.name,
+                "arguments": json.dumps(tc.input),
+                "status": "completed",
+            })
+        return items
+
+
     @property
     def context_injection_role(self) -> str:
+
         return "developer"
 
     async def close(self):
