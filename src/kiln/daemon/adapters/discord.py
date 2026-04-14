@@ -1666,7 +1666,8 @@ class DiscordAdapter:
         if not agent_home:
             return None
 
-        # Backend-agnostic source: live session state written by the harness.
+        # Backend-agnostic source: derived session snapshot written by the harness.
+
         session_state_path = agent_home / "logs" / "session-state" / f"{session_id}.yml"
         if session_state_path.exists():
             try:

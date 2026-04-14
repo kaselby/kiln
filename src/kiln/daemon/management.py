@@ -23,7 +23,8 @@ import yaml
 
 from . import protocol as proto
 from .config import DaemonConfig, load_agents_registry
-from .state import BridgeRecord, DaemonState
+from .state import BridgeRecord, DaemonState, _load_live_session_metadata
+
 
 log = logging.getLogger(__name__)
 
@@ -56,12 +57,39 @@ class ManagementActions:
 
     # ----- Session queries -----
 
+    def _refresh_session_record(self, record) -> None:
+        """Refresh cached live session metadata from session-config.
+
+        Presence is a cache. The authoritative live mutable session state lives
+        in the session-config file, so tag- or mode-sensitive reads should
+        refresh from disk before making routing/status decisions.
+        """
+        if not record or not record.agent_home:
+            return
+        mode, tags = _load_live_session_metadata(Path(record.agent_home), record.session_id)
+        record.mode = mode
+        record.tags = tags
+
+    def _refresh_presence_for_agent(self, agent: str) -> list:
+        sessions = self._state.presence.by_agent(agent)
+        for record in sessions:
+            self._refresh_session_record(record)
+        return sessions
+
+    def _refresh_session_summary(self, session_id: str):
+        record = self._state.presence.get(session_id)
+        if record:
+            self._refresh_session_record(record)
+        return record
+
     def list_sessions(
         self,
         agent: str | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         sessions = self._state.presence.all_sessions()
+        for record in sessions:
+            self._refresh_session_record(record)
         if agent:
             sessions = [s for s in sessions if s.agent_name == agent]
         if status:
@@ -69,10 +97,11 @@ class ManagementActions:
         return [s.to_summary() for s in sessions]
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
-        record = self._state.presence.get(session_id)
+        record = self._refresh_session_summary(session_id)
         if record:
             return record.to_summary()
         return None
+
 
     def resolve_dm_target(self, agent: str) -> str | None:
         """Resolve the single session that should receive platform DMs for an agent.
@@ -82,17 +111,20 @@ class ManagementActions:
         2. Most-recently-connected session for the agent.
         3. None if no sessions are connected.
 
-        Canonical detection: checks session metadata for ``canonical=True``.
-        Set during registration if the agent claims canonical status.
+        Canonical detection currently checks the live session tag set for
+        ``canonical``.
+
         """
-        sessions = self._state.presence.by_agent(agent)
+        sessions = self._refresh_presence_for_agent(agent)
         if not sessions:
             return None
 
-        # Prefer canonical
+
+        # Prefer canonical-tagged sessions
         for s in sessions:
-            if s.metadata.get("canonical"):
+            if "canonical" in s.tags:
                 return s.session_id
+
 
         # Fallback: most recently seen
         sessions.sort(key=lambda s: s.first_seen_at, reverse=True)

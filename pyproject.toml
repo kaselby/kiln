@@ -13,6 +13,7 @@ dependencies = [
     "prompt-toolkit~=3.0.52",
     "markdown-it-py~=4.0.0",
     "openai~=2.31.0",
+    "croniter~=6.0.0",
 ]
 
 [project.scripts]

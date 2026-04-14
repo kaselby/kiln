@@ -44,8 +44,10 @@ from .state import (
     PresenceRegistry,
     SessionRecord,
     SurfaceSubscriptionRegistry,
+    _load_live_session_metadata,
     get_live_tmux_sessions,
 )
+
 
 log = logging.getLogger(__name__)
 
@@ -859,11 +861,18 @@ class KilnDaemon:
         agents = load_agents_registry(self.config.agents_registry)
         agent_home = str(agents.get(ctx.agent_name, ""))
 
+        mode, tags = ("supervised", [])
+        if agent_home:
+            mode, tags = _load_live_session_metadata(Path(agent_home), ctx.session_id)
+
         record = SessionRecord(
             session_id=ctx.session_id,
             agent_name=ctx.agent_name,
             agent_home=agent_home,
+            mode=mode,
+            tags=tags,
         )
+
         self.state.presence.register(record)
 
         await self.events.emit(proto.event(
