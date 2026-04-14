@@ -27,7 +27,7 @@ import discord
 
 from .. import protocol as proto
 from ..protocol import PlatformMessage, RequestContext
-from ..state import BridgeRecord
+from kiln.services.gateway.state import BridgeRecord
 
 log = logging.getLogger(__name__)
 
@@ -916,8 +916,13 @@ class DiscordAdapter:
     def platform_name(self) -> str:
         return "discord"
 
+    @property
+    def _gateway(self) -> Any:
+        """Access the gateway service that owns this adapter."""
+        return self._daemon.services.get("gateway") if self._daemon else None
+
     async def start(self, daemon: Any) -> None:
-        """Start the adapter. Called by the daemon after server is running.
+        """Start the adapter. Called by the gateway service after daemon is running.
 
         Creates and connects the Discord client, waiting for on_ready
         before returning. Raises on login failure or timeout so the daemon
@@ -1227,7 +1232,7 @@ class DiscordAdapter:
         await self._ensure_channel_bridge(channel)
 
         # Look up bridge for this channel
-        bridges = self._daemon.state.bridges.by_source("channel", channel)
+        bridges = self._gateway.bridges.by_source("channel", channel)
         discord_bridges = [b for b in bridges if b.adapter_id == "discord"]
         if not discord_bridges:
             return
@@ -1366,7 +1371,7 @@ class DiscordAdapter:
             return
 
         # Already bridged?
-        existing = self._daemon.state.bridges.by_source("channel", channel)
+        existing = self._gateway.bridges.by_source("channel", channel)
         if any(b.adapter_id == "discord" for b in existing):
             return
 
@@ -1395,7 +1400,7 @@ class DiscordAdapter:
             adapter_id="discord",
             platform_target=str(thread_id),
         )
-        self._daemon.state.bridges.bind(bridge)
+        self._gateway.bridges.bind(bridge)
         log.info("Auto-bridged channel '%s' to Discord thread %d", channel, thread_id)
 
     # --- Bridge lifecycle (channel threads) ---
@@ -1963,7 +1968,7 @@ class DiscordAdapter:
                 msg, sender_name, trust,
                 channel_desc=f"branch:{decision.session_id}",
             )
-            await self._daemon.deliver_platform_message(
+            await self._gateway.deliver_platform_message(
                 decision.session_id, platform_msg,
             )
 
@@ -1977,7 +1982,7 @@ class DiscordAdapter:
             platform_msg = self._build_platform_message(
                 msg, sender_name, trust,
             )
-            await self._daemon.deliver_to_surface_subscribers(
+            await self._gateway.deliver_to_surface_subscribers(
                 decision.surface_ref, platform_msg,
             )
 
@@ -2015,7 +2020,7 @@ class DiscordAdapter:
 
         # Surface subscription
         surface_ref = self._build_surface_ref(msg)
-        if self._daemon and self._daemon.state.surfaces.subscribers(surface_ref):
+        if self._gateway and self._gateway.surfaces.subscribers(surface_ref):
             matches.append(RouteDecision(
                 bucket=RouteBucket.SURFACE,
                 surface_ref=surface_ref,

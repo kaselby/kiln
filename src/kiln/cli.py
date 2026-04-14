@@ -849,8 +849,15 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                         status = await client.get_status()
                         print(f"Sessions: {status.get('sessions', '?')}")
                         print(f"Channels: {status.get('channels', '?')}")
-                        print(f"Bridges: {status.get('bridges', '?')}")
-                        print(f"Adapters: {', '.join(status.get('adapters', [])) or 'none'}")
+                        services = status.get("services", {})
+                        if services:
+                            print(f"Services: {', '.join(services.keys())}")
+                            for svc_name, svc_status in services.items():
+                                if isinstance(svc_status, dict):
+                                    parts = [f"{k}={v}" for k, v in svc_status.items()]
+                                    print(f"  {svc_name}: {', '.join(parts)}")
+                        else:
+                            print("Services: (none)")
                         if status.get("lockdown"):
                             print("** LOCKDOWN ACTIVE **")
                     except DaemonUnavailableError:

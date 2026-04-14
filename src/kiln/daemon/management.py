@@ -23,7 +23,7 @@ import yaml
 
 from . import protocol as proto
 from .config import DaemonConfig, load_agents_registry
-from .state import BridgeRecord, DaemonState
+from .state import DaemonState
 
 log = logging.getLogger(__name__)
 
@@ -119,52 +119,6 @@ class ManagementActions:
             return set(data.keys()) if isinstance(data, dict) else set()
         except (json.JSONDecodeError, OSError):
             return set()
-
-    # ----- Status -----
-
-    def get_status(self, scope: str | None = None) -> dict[str, Any]:
-        return {
-            "sessions": len(self._state.presence),
-            "channels": self._state.channels.all_channels(),
-            "bridges": len(self._state.bridges.all_bridges()),
-        }
-
-    # ----- Bridge management -----
-
-    def bind_bridge(
-        self,
-        bridge_id: str,
-        source_kind: str,
-        source_name: str,
-        adapter_id: str,
-        platform_target: str,
-        mode: str = "mirror",
-    ) -> BridgeRecord:
-        record = BridgeRecord(
-            bridge_id=bridge_id,
-            source_kind=source_kind,
-            source_name=source_name,
-            adapter_id=adapter_id,
-            platform_target=platform_target,
-            mode=mode,
-        )
-        self._state.bridges.bind(record)
-        log.info("Bridge bound: %s -> %s/%s", source_name, adapter_id, platform_target)
-        return record
-
-    def unbind_bridge(self, bridge_id: str) -> ActionResult:
-        record = self._state.bridges.unbind(bridge_id)
-        if record:
-            log.info("Bridge unbound: %s", bridge_id)
-            return ActionResult(True, f"Bridge '{bridge_id}' removed")
-        return ActionResult(False, f"Bridge '{bridge_id}' not found")
-
-    def list_bridges(self, adapter_id: str | None = None) -> list[dict[str, Any]]:
-        if adapter_id:
-            bridges = self._state.bridges.by_adapter(adapter_id)
-        else:
-            bridges = self._state.bridges.all_bridges()
-        return [b.to_dict() for b in bridges]
 
     # ----- Query seam for adapters -----
 

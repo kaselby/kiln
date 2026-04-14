@@ -1,8 +1,8 @@
 """Kiln daemon — Unix socket server, event bus, message routing.
 
 The daemon process. Accepts connections from agent sessions over a Unix
-domain socket, manages shared live state (presence, channels, bridges),
-routes messages, and hosts platform adapters.
+domain socket, manages shared live state (presence, channels), routes
+messages between agents, and hosts optional services.
 
 Can be run directly::
 
@@ -25,7 +25,6 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 import yaml
 
@@ -35,16 +34,9 @@ from .config import (
     load_agents_registry,
     load_daemon_config,
 )
-from .protocol import PlatformMessage
 from .state import (
-    BridgeRecord,
-    BridgeRegistry,
-    ChannelRegistry,
     DaemonState,
-    PresenceRegistry,
     SessionRecord,
-    SurfaceSubscriptionRegistry,
-    get_live_tmux_sessions,
 )
 
 log = logging.getLogger(__name__)
@@ -148,72 +140,6 @@ def _write_inbox_message(
     return msg_path
 
 
-def _write_platform_inbox_message(
-    inbox_root: Path,
-    recipient: str,
-    msg: PlatformMessage,
-) -> Path:
-    """Write a platform-originated message to a recipient's inbox.
-
-    Generates rich frontmatter with platform-specific fields from the
-    structured PlatformMessage. This is the daemon-owned counterpart to
-    the adapter's identity resolution — the adapter populates the struct,
-    the daemon writes the artifact.
-    """
-    recipient_inbox = inbox_root / recipient
-    recipient_inbox.mkdir(parents=True, exist_ok=True)
-
-    now = datetime.now(ZoneInfo("America/Toronto"))
-    ts_str = now.strftime("%Y%m%d-%H%M%S")
-    msg_id = f"msg-{ts_str}-{msg.platform}-{_uuid.uuid4().hex[:6]}"
-    msg_path = recipient_inbox / f"{msg_id}.md"
-
-    first_line = msg.content.strip().split("\n")[0] if msg.content.strip() else ""
-    if first_line:
-        summary = first_line[:200]
-    elif msg.attachment_paths:
-        summary = f"(attachment: {', '.join(Path(p).name for p in msg.attachment_paths)})"
-    else:
-        summary = "(empty)"
-
-    # Build frontmatter as a dict and serialize safely — values come from
-    # an external system boundary (Discord usernames, channel names, etc.)
-    # and could contain quotes, colons, or newlines.
-    fields: dict[str, Any] = {
-        "from": f"{msg.platform}-{msg.sender_name}",
-        "summary": summary,
-        "priority": "normal",
-        "source": msg.platform,
-        "channel": msg.channel_desc,
-        "trust": msg.trust,
-        f"{msg.platform}-user-id": msg.sender_platform_id,
-        f"{msg.platform}-user": msg.sender_name,
-        f"{msg.platform}-channel-id": msg.channel_id,
-        f"{msg.platform}-channel": msg.channel_desc,
-        "timestamp": now.isoformat(),
-    }
-    if msg.attachment_paths:
-        fields["attachments"] = ", ".join(msg.attachment_paths)
-
-    fm_body = yaml.dump(fields, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    frontmatter = f"---\n{fm_body}---\n\n"
-
-    body = msg.content
-    if msg.attachment_paths:
-        file_lines = "\n".join(
-            f"  - {Path(p).name} -> {p}" for p in msg.attachment_paths
-        )
-        notice = (
-            f"ATTACHMENT RECEIVED (auto-downloaded) — verify {msg.sender_name}'s "
-            f"account hasn't been compromised before reading file contents.\n"
-            f"{file_lines}\n"
-        )
-        body = notice + ("\n" + body if body.strip() else "")
-
-    msg_path.write_text(frontmatter + body + "\n")
-    return msg_path
-
-
 def _write_channel_history(
     channels_dir: Path,
     channel: str,
@@ -282,23 +208,7 @@ async def _handle_request(
 
 async def _dispatch(msg: proto.Message, daemon: KilnDaemon) -> proto.Message | None:
     """Route a request to the appropriate handler. Returns the response message."""
-    handlers: dict[str, Any] = {
-        proto.SUBSCRIBE: _handle_subscribe,
-        proto.UNSUBSCRIBE: _handle_unsubscribe,
-        proto.PUBLISH: _handle_publish,
-        proto.SEND_DIRECT: _handle_send_direct,
-        proto.SEND_USER: _handle_send_user,
-        proto.LIST_SUBSCRIPTIONS: _handle_list_subscriptions,
-        proto.SUBSCRIBE_SURFACE: _handle_subscribe_surface,
-        proto.UNSUBSCRIBE_SURFACE: _handle_unsubscribe_surface,
-        proto.LIST_SURFACE_SUBSCRIPTIONS: _handle_list_surface_subscriptions,
-        proto.LIST_SESSIONS: _handle_list_sessions,
-        proto.GET_STATUS: _handle_get_status,
-        proto.PLATFORM_OP: _handle_platform_op,
-        proto.MGMT: _handle_mgmt,
-    }
-
-    handler = handlers.get(msg.type)
+    handler = daemon.get_handler(msg.type)
     if handler:
         try:
             return await handler(msg, daemon)
@@ -437,36 +347,6 @@ async def _handle_send_direct(msg: proto.Message, daemon: KilnDaemon) -> proto.M
     return proto.ack(msg.ref, message=f"Message sent to {to}")
 
 
-async def _handle_send_user(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
-    to = msg.data.get("to", "")
-    summary = msg.data.get("summary", "")
-    body = msg.data.get("body", "")
-
-    if not to:
-        return proto.error(msg.ref, "send_user requires 'to'")
-
-    ctx = _require_requester(msg)
-    if not ctx:
-        return proto.error(msg.ref, "send_user requires requester identity")
-
-    user = daemon.config.users.get(to)
-    if not user:
-        return proto.error(msg.ref, f"Unknown user: '{to}'", code="unknown_user")
-
-    platform = user.default_platform
-    adapter = daemon.adapters.get(platform)
-    if not adapter:
-        return proto.error(
-            msg.ref, f"No adapter for platform '{platform}'", code="no_adapter",
-        )
-
-    try:
-        result = await adapter.send_user_message(to, summary, body, context=ctx)
-        return proto.ack(msg.ref, message=result)
-    except Exception as e:
-        return proto.error(msg.ref, f"Adapter error: {e}")
-
-
 async def _handle_list_subscriptions(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
     ctx = _require_requester(msg)
     if not ctx:
@@ -476,98 +356,6 @@ async def _handle_list_subscriptions(msg: proto.Message, daemon: KilnDaemon) -> 
     return proto.result(msg.ref, channels=channels)
 
 
-async def _handle_subscribe_surface(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
-    surface_ref = msg.data.get("surface_ref", "")
-    if not surface_ref:
-        return proto.error(msg.ref, "subscribe_surface requires a surface_ref")
-
-    ctx = _require_requester(msg)
-    if not ctx:
-        return proto.error(msg.ref, "subscribe_surface requires requester identity")
-
-    await daemon.ensure_session(ctx)
-
-    # Validate and canonicalize via the owning adapter
-    platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
-    adapter = daemon.adapters.get(platform) if platform else None
-    if adapter and hasattr(adapter, "validate_surface_ref"):
-        try:
-            surface_ref = adapter.validate_surface_ref(surface_ref)
-        except ValueError as e:
-            return proto.error(
-                msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
-            )
-
-    count = daemon.state.surfaces.subscribe(surface_ref, ctx.session_id)
-
-    # Persist to file
-    surfaces = daemon.state.surfaces.surfaces_for(ctx.session_id)
-    daemon.state.store.write_surface_subs(ctx.session_id, ctx.agent_name, surfaces)
-
-    await daemon.events.emit(proto.event(
-        proto.EVT_SURFACE_SUBSCRIBED,
-        surface_ref=surface_ref,
-        session_id=ctx.session_id,
-        subscriber_count=count,
-    ))
-
-    return proto.ack(msg.ref, subscriber_count=count, surface_ref=surface_ref)
-
-
-async def _handle_unsubscribe_surface(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
-    surface_ref = msg.data.get("surface_ref", "")
-    if not surface_ref:
-        return proto.error(msg.ref, "unsubscribe_surface requires a surface_ref")
-
-    ctx = _require_requester(msg)
-    if not ctx:
-        return proto.error(msg.ref, "unsubscribe_surface requires requester identity")
-
-    # Canonicalize via adapter
-    platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
-    adapter = daemon.adapters.get(platform) if platform else None
-    if adapter and hasattr(adapter, "validate_surface_ref"):
-        try:
-            surface_ref = adapter.validate_surface_ref(surface_ref)
-        except ValueError as e:
-            return proto.error(
-                msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
-            )
-
-    daemon.state.surfaces.unsubscribe(surface_ref, ctx.session_id)
-
-    # Persist to file
-    surfaces = daemon.state.surfaces.surfaces_for(ctx.session_id)
-    daemon.state.store.write_surface_subs(ctx.session_id, ctx.agent_name, surfaces)
-
-    await daemon.events.emit(proto.event(
-        proto.EVT_SURFACE_UNSUBSCRIBED,
-        surface_ref=surface_ref,
-        session_id=ctx.session_id,
-    ))
-
-    return proto.ack(msg.ref, surface_ref=surface_ref)
-
-
-async def _handle_list_surface_subscriptions(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
-    ctx = _require_requester(msg)
-    if not ctx:
-        return proto.error(msg.ref, "list_surface_subscriptions requires requester identity")
-
-    adapter_id = msg.data.get("adapter_id")
-    surfaces = daemon.state.surfaces.surfaces_for(
-        ctx.session_id, adapter_id=adapter_id,
-    )
-    subscriptions = [
-        {
-            "surface_ref": ref,
-            "subscriber_count": daemon.state.surfaces.subscriber_count(ref),
-        }
-        for ref in surfaces
-    ]
-    return proto.result(msg.ref, subscriptions=subscriptions)
-
-
 async def _handle_list_sessions(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
     agent_filter = msg.data.get("agent")
     sessions = daemon.management.list_sessions(agent=agent_filter)
@@ -575,110 +363,39 @@ async def _handle_list_sessions(msg: proto.Message, daemon: KilnDaemon) -> proto
 
 
 async def _handle_get_status(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
-    status = {
+    status: dict[str, Any] = {
         "sessions": len(daemon.state.presence),
         "channels": len(daemon.state.channels.all_channels()),
-        "surfaces": len(daemon.state.surfaces.all_surfaces()),
-        "bridges": len(daemon.state.bridges.all_bridges()),
-        "adapters": list(daemon.adapters.keys()),
         "lockdown": daemon.config.lockdown_file.exists(),
+        "services": {},
     }
+    # Each service contributes its own status section
+    for name, service in daemon.services.items():
+        try:
+            status["services"][name] = service.status()
+        except Exception:
+            status["services"][name] = {"error": "status unavailable"}
     return proto.result(msg.ref, **status)
-
-
-async def _handle_platform_op(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
-    platform = msg.data.get("platform", "")
-    action = msg.data.get("action", "")
-    args = msg.data.get("args", {})
-
-    adapter = daemon.adapters.get(platform)
-    if not adapter:
-        return proto.error(
-            msg.ref, f"No adapter for platform '{platform}'", code="no_adapter",
-        )
-
-    ctx = _require_requester(msg)
-
-    try:
-        result = await adapter.platform_op(action, args, context=ctx)
-        return proto.result(msg.ref, **result)
-    except Exception as e:
-        return proto.error(msg.ref, f"Platform op failed: {e}")
 
 
 async def _handle_mgmt(msg: proto.Message, daemon: KilnDaemon) -> proto.Message:
     action = msg.data.get("action", "")
-    args = msg.data.get("args", {})
 
-    if action == "list_sessions":
-        return await _handle_list_sessions(msg, daemon)
-    elif action == "get_status":
-        return await _handle_get_status(msg, daemon)
-    elif action in ("request_approval", "resolve_approval"):
-        return await _handle_approval(msg, daemon, action, args)
-    else:
-        return proto.error(
-            msg.ref,
-            f"Management action '{action}' not implemented",
-            code="not_implemented",
-        )
+    # Core mgmt actions
+    _core_actions: dict[str, Any] = {
+        "list_sessions": _handle_list_sessions,
+        "get_status": _handle_get_status,
+    }
 
+    handler = _core_actions.get(action) or daemon._mgmt_actions.get(action)
+    if handler:
+        return await handler(msg, daemon)
 
-async def _handle_approval(
-    msg: proto.Message, daemon: KilnDaemon, action: str, args: dict,
-) -> proto.Message:
-    """Route approval requests/resolutions to the adapter that supports permissions.
-
-    The requester context scopes the request — the caller cannot target
-    a different session's approval state.
-    """
-    ctx = _require_requester(msg)
-
-    # Find the configured adapter that supports permission approval.
-    # Exactly one must exist; ambiguity is an error, not a silent choice.
-    capable = [
-        (name, adapter) for name, adapter in daemon.adapters.items()
-        if hasattr(adapter, "supports") and adapter.supports("permission")
-    ]
-    if not capable:
-        return proto.error(msg.ref, "No adapter supports remote approval")
-    if len(capable) > 1:
-        names = ", ".join(n for n, _ in capable)
-        return proto.error(
-            msg.ref,
-            f"Ambiguous: multiple adapters support approval ({names}). "
-            f"Configure exactly one.",
-        )
-
-    _, adapter = capable[0]
-
-    if action == "request_approval":
-        # Route to the adapter's permission_request platform op.
-        # The session_id comes from ctx, not caller args.
-        op_args = {
-            "agent_id": ctx.session_id,
-            "title": args.get("title", ""),
-            "preview": args.get("preview", ""),
-            "detail": args.get("detail"),
-            "severity": args.get("severity", "info"),
-            "timeout": args.get("timeout", 300),
-        }
-        try:
-            result = await adapter.platform_op("permission_request", op_args, context=ctx)
-            return proto.result(msg.ref, **result)
-        except Exception as e:
-            return proto.error(msg.ref, f"Approval request failed: {e}")
-
-    else:  # resolve_approval
-        op_args = {
-            "session_id": ctx.session_id,
-            "status": args.get("status", "rejected"),
-        }
-        try:
-            result = await adapter.platform_op("permission_resolve", op_args, context=ctx)
-            return proto.result(msg.ref, **result)
-        except Exception as e:
-            return proto.error(msg.ref, f"Approval resolve failed: {e}")
+    return proto.error(
+        msg.ref,
+        f"Management action '{action}' not implemented",
+        code="not_implemented",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,13 +403,11 @@ async def _handle_approval(
 # ---------------------------------------------------------------------------
 
 class KilnDaemon:
-    """The main daemon process."""
+    """The main daemon process — service host and coordination substrate.
 
-    # Platform name -> adapter class. Deferred import avoids pulling in
-    # heavy deps (discord.py) unless the platform is actually configured.
-    _adapter_registry: dict[str, str] = {
-        "discord": "kiln.daemon.adapters.discord.DiscordAdapter",
-    }
+    Owns core primitives (messaging, presence, event bus) and manages
+    the lifecycle of optional services that extend its capabilities.
+    """
 
     def __init__(self, config: DaemonConfig | None = None):
         from .management import ManagementActions
@@ -701,9 +416,65 @@ class KilnDaemon:
         self.state = DaemonState(subscriptions_dir=self.config.subscriptions_dir)
         self.events = EventBus()
         self.management = ManagementActions(self.state, self.config)
-        self.adapters: dict[str, Any] = {}  # platform_name -> adapter instance
+        self.services: dict[str, Any] = {}  # name -> Service instance
         self._server: asyncio.Server | None = None
         self._reconcile_task: asyncio.Task | None = None
+
+        # Mgmt sub-action registry — services extend the mgmt RPC
+        # with their own actions (e.g. approval routing).
+        self._mgmt_actions: dict[str, Any] = {}
+
+        # RPC handler registry — core handlers registered here,
+        # services add their own during start().
+        self._handlers: dict[str, Any] = {
+            proto.SUBSCRIBE: _handle_subscribe,
+            proto.UNSUBSCRIBE: _handle_unsubscribe,
+            proto.PUBLISH: _handle_publish,
+            proto.SEND_DIRECT: _handle_send_direct,
+            proto.LIST_SUBSCRIPTIONS: _handle_list_subscriptions,
+            proto.LIST_SESSIONS: _handle_list_sessions,
+            proto.GET_STATUS: _handle_get_status,
+            proto.MGMT: _handle_mgmt,
+        }
+
+    # ------------------------------------------------------------------
+    # Handler registration — used by services to extend RPC surface
+    # ------------------------------------------------------------------
+
+    def register_handler(self, msg_type: str, handler: Any) -> None:
+        """Register an RPC handler for a message type.
+
+        Services call this during start() to add their handlers.
+        Raises if a handler is already registered for the type.
+        """
+        if msg_type in self._handlers:
+            raise ValueError(
+                f"Handler already registered for '{msg_type}' — "
+                f"cannot overwrite core or other service handlers"
+            )
+        self._handlers[msg_type] = handler
+        log.debug("Registered handler for '%s'", msg_type)
+
+    def unregister_handler(self, msg_type: str) -> None:
+        """Remove an RPC handler. Services call this during stop()."""
+        self._handlers.pop(msg_type, None)
+
+    def get_handler(self, msg_type: str) -> Any | None:
+        """Look up the handler for a message type."""
+        return self._handlers.get(msg_type)
+
+    def register_mgmt_action(self, action: str, handler: Any) -> None:
+        """Register a management sub-action handler.
+
+        Services call this to extend the 'mgmt' RPC with new actions.
+        """
+        if action in self._mgmt_actions:
+            raise ValueError(f"Mgmt action '{action}' already registered")
+        self._mgmt_actions[action] = handler
+
+    def unregister_mgmt_action(self, action: str) -> None:
+        """Remove a management sub-action handler."""
+        self._mgmt_actions.pop(action, None)
 
     # ------------------------------------------------------------------
     # Core ingress — shared by socket handlers and adapters
@@ -722,8 +493,8 @@ class KilnDaemon:
         """Publish a message to a channel.
 
         Core delivery path used by both socket request handlers and
-        platform adapters. Writes to subscriber inboxes, appends
-        channel history, and emits the event bus event.
+        services. Writes to subscriber inboxes, appends channel
+        history, and emits the event bus event.
 
         Args:
             source: Origin tag for echo prevention (e.g. "discord").
@@ -736,7 +507,7 @@ class KilnDaemon:
 
         # Write to each subscriber's inbox
         for sub_id in recipients:
-            inbox_root = self._resolve_inbox(sub_id)
+            inbox_root = self.resolve_inbox(sub_id)
             if inbox_root:
                 _write_inbox_message(
                     inbox_root, sub_id, sender,
@@ -760,70 +531,17 @@ class KilnDaemon:
 
         return len(recipients)
 
-    async def deliver_platform_message(
-        self,
-        recipient: str,
-        msg: PlatformMessage,
-    ) -> Path | None:
-        """Deliver a platform-originated message to a session's inbox.
 
-        The adapter resolves identity and populates the PlatformMessage;
-        the daemon owns choosing the write path and emitting events.
-
-        Returns the inbox message path, or None if the recipient
-        couldn't be resolved.
-        """
-        inbox_root = self._resolve_inbox(recipient)
-        if not inbox_root:
-            log.warning("Cannot resolve inbox for recipient '%s'", recipient)
-            return None
-
-        path = _write_platform_inbox_message(inbox_root, recipient, msg)
-
-        await self.events.emit(proto.event(
-            proto.EVT_MESSAGE_INBOUND,
-            sender=f"{msg.platform}-{msg.sender_name}",
-            recipient=recipient,
-            summary=msg.content[:200],
-            platform=msg.platform,
-        ))
-
-        return path
-
-    async def deliver_to_surface_subscribers(
-        self,
-        surface_ref: str,
-        msg: PlatformMessage,
-    ) -> int:
-        """Deliver a platform message to all sessions subscribed to a surface.
-
-        Called by adapters when an inbound message arrives on a subscribed
-        surface. Looks up subscribers in the surface registry and delivers
-        to each via ``deliver_platform_message``.
-
-        Returns number of successful deliveries.
-        """
-        subscribers = self.state.surfaces.subscribers(surface_ref)
-        if not subscribers:
-            log.debug("No subscribers for surface %s", surface_ref)
-            return 0
-
-        delivered = 0
-        for session_id in subscribers:
-            path = await self.deliver_platform_message(session_id, msg)
-            if path is not None:
-                delivered += 1
-
-        return delivered
 
     # ------------------------------------------------------------------
     # Inbox resolution
     # ------------------------------------------------------------------
 
-    def _resolve_inbox(self, recipient: str) -> Path | None:
+    def resolve_inbox(self, recipient: str) -> Path | None:
         """Resolve a recipient's inbox directory.
 
         Checks presence registry first, then falls back to agents registry.
+        Public — services use this to deliver messages to agent inboxes.
         """
         record = self.state.presence.get(recipient)
         if record and record.agent_home:
@@ -902,7 +620,7 @@ class KilnDaemon:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the daemon server and configured adapters."""
+        """Start the daemon server and configured services."""
         # Ensure directories exist
         self.config.socket_path.parent.mkdir(parents=True, exist_ok=True)
         self.config.channels_dir.mkdir(parents=True, exist_ok=True)
@@ -919,7 +637,7 @@ class KilnDaemon:
         self.state.load_from_files()
 
         # Initial reconciliation — populate state but defer events until
-        # adapters are running so they can observe startup discoveries.
+        # services are running so they can observe startup discoveries.
         agents = load_agents_registry(self.config.agents_registry)
         pruned, discovered = self.state.reconcile(agents_registry=agents)
 
@@ -931,10 +649,10 @@ class KilnDaemon:
         # Write PID file
         self.config.pid_file.write_text(str(os.getpid()))
 
-        # Start configured adapters
-        await self._start_adapters()
+        # Start configured services
+        await self._start_services()
 
-        # Now emit initial reconcile events — adapters are listening
+        # Now emit initial reconcile events — services are listening
         for session_id in discovered:
             await self.events.emit(proto.event(
                 proto.EVT_SESSION_LIVE,
@@ -950,51 +668,57 @@ class KilnDaemon:
         # Start periodic reconciliation
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
+        service_names = list(self.services.keys()) or ["(none)"]
         log.info(
-            "Daemon started on %s (PID %d, %d adapter(s))",
-            self.config.socket_path, os.getpid(), len(self.adapters),
+            "Daemon started on %s (PID %d, services: %s)",
+            self.config.socket_path, os.getpid(), ", ".join(service_names),
         )
 
-    async def _start_adapters(self) -> None:
-        """Instantiate and start adapters from daemon config."""
-        for adapter_id, adapter_cfg in self.config.adapters.items():
-            if not adapter_cfg.enabled:
-                log.info("Adapter '%s' disabled, skipping", adapter_id)
+    # ------------------------------------------------------------------
+    # Service registry
+    # ------------------------------------------------------------------
+
+    # Service name -> dotted class path. Lazily imported so optional
+    # deps (discord.py, etc.) aren't loaded unless the service is enabled.
+    _service_registry: dict[str, str] = {
+        "gateway": "kiln.services.gateway.service.GatewayService",
+    }
+
+    async def _start_services(self) -> None:
+        """Instantiate and start services from daemon config."""
+        for svc_name, svc_cfg in self.config.services.items():
+            if not svc_cfg.get("enabled", True):
+                log.info("Service '%s' disabled, skipping", svc_name)
                 continue
 
-            platform = adapter_cfg.platform
-            cls = self._resolve_adapter_class(platform)
+            cls = self._resolve_service_class(svc_name)
             if cls is None:
-                log.warning(
-                    "No adapter class for platform '%s' (adapter '%s')",
-                    platform, adapter_id,
-                )
+                log.warning("No service class for '%s'", svc_name)
                 continue
 
             try:
-                adapter = cls(config=adapter_cfg.config)
-                await adapter.start(self)
-                self.adapters[platform] = adapter
-                log.info("Started adapter '%s' (platform: %s)", adapter_id, platform)
+                service = cls(config=svc_cfg)
+                await service.start(self)
+                self.services[service.name] = service
+                log.info("Started service '%s'", service.name)
             except Exception:
-                log.exception("Failed to start adapter '%s'", adapter_id)
+                log.exception("Failed to start service '%s'", svc_name)
 
     @classmethod
-    def _resolve_adapter_class(cls, platform: str) -> type | None:
-        """Look up and import the adapter class for a platform."""
-        ref = cls._adapter_registry.get(platform)
+    def _resolve_service_class(cls, name: str) -> type | None:
+        """Look up and import the service class by name."""
+        ref = cls._service_registry.get(name)
         if ref is None:
             return None
         if isinstance(ref, type):
             return ref
-        # Dotted path — import lazily
         module_path, class_name = ref.rsplit(".", 1)
         import importlib
         module = importlib.import_module(module_path)
         return getattr(module, class_name)
 
     async def stop(self) -> None:
-        """Stop the daemon server and all adapters."""
+        """Stop the daemon server and all services."""
         # Cancel reconcile loop
         if self._reconcile_task:
             self._reconcile_task.cancel()
@@ -1003,14 +727,14 @@ class KilnDaemon:
             except asyncio.CancelledError:
                 pass
 
-        # Stop adapters
-        for name, adapter in self.adapters.items():
+        # Stop services in reverse startup order
+        for name in reversed(list(self.services)):
             try:
-                await adapter.stop()
-                log.info("Stopped adapter '%s'", name)
+                await self.services[name].stop()
+                log.info("Stopped service '%s'", name)
             except Exception:
-                log.exception("Error stopping adapter '%s'", name)
-        self.adapters.clear()
+                log.exception("Error stopping service '%s'", name)
+        self.services.clear()
 
         if self._server:
             self._server.close()

@@ -22,6 +22,10 @@ from kiln.daemon.state import (
     DaemonState,
     PresenceRegistry,
     SessionRecord,
+)
+from kiln.services.gateway.state import (
+    BridgeRecord,
+    BridgeRegistry,
     SurfaceSubscriptionRegistry,
 )
 
@@ -223,13 +227,15 @@ def daemon_config(tmp_daemon_dir):
 
 @pytest_asyncio.fixture
 async def running_daemon(daemon_config):
-    """Start a daemon server and yield it. Stops on cleanup.
+    """Start a daemon server with gateway service. Stops on cleanup.
 
     Patches get_live_tmux_sessions for the entire fixture lifetime so
     real tmux sessions never leak into test state — not at startup, and
     not during the periodic reconcile loop.
     """
     from unittest.mock import patch
+    # Enable gateway service (no adapters — tests add mocks as needed)
+    daemon_config.services["gateway"] = {"enabled": True, "adapters": {}}
     daemon = KilnDaemon(daemon_config)
     with patch("kiln.daemon.state.get_live_tmux_sessions", return_value=set()):
         await daemon.start()
@@ -892,7 +898,7 @@ async def test_deliver_platform_message(running_daemon, make_client, daemon_conf
         attachment_paths=["/tmp/audio.ogg"],
     )
 
-    path = await running_daemon.deliver_platform_message("beth-plat-1", msg)
+    path = await running_daemon.services["gateway"].deliver_platform_message("beth-plat-1", msg)
     assert path is not None
     assert path.exists()
 
@@ -916,7 +922,7 @@ async def test_deliver_platform_message_unknown_recipient(running_daemon):
         platform="test",
         content="hi",
     )
-    path = await running_daemon.deliver_platform_message("nobody-session-1", msg)
+    path = await running_daemon.services["gateway"].deliver_platform_message("nobody-session-1", msg)
     assert path is None
 
 
@@ -1350,7 +1356,7 @@ async def test_surface_subscribe_and_list(running_daemon, make_client):
     assert "discord:user:116377" in [s["surface_ref"] for s in await client.list_surface_subscriptions()]
 
     # Daemon-side truth
-    assert "beth-surf-1" in running_daemon.state.surfaces.subscribers("discord:user:116377")
+    assert "beth-surf-1" in running_daemon.services["gateway"].surfaces.subscribers("discord:user:116377")
 
     # List query
     subs = await client.list_surface_subscriptions()
@@ -1368,7 +1374,7 @@ async def test_surface_unsubscribe(running_daemon, make_client):
     await client.unsubscribe_surface("discord:user:123")
 
     assert "discord:user:123" not in [s["surface_ref"] for s in await client.list_surface_subscriptions()]
-    assert "beth-surf-2" not in running_daemon.state.surfaces.subscribers("discord:user:123")
+    assert "beth-surf-2" not in running_daemon.services["gateway"].surfaces.subscribers("discord:user:123")
 
 
 @pytest.mark.asyncio
@@ -1396,14 +1402,14 @@ async def test_surface_cleanup_on_session_gone(running_daemon, make_client):
     client = make_client("beth", "beth-surf-cleanup")
 
     await client.subscribe_surface("discord:user:999")
-    assert "beth-surf-cleanup" in running_daemon.state.surfaces.subscribers("discord:user:999")
+    assert "beth-surf-cleanup" in running_daemon.services["gateway"].surfaces.subscribers("discord:user:999")
 
     # Simulate reconcile pruning the session
     running_daemon.state.presence.deregister("beth-surf-cleanup")
-    running_daemon.state.surfaces.unsubscribe_all("beth-surf-cleanup")
+    running_daemon.services["gateway"].surfaces.unsubscribe_all("beth-surf-cleanup")
 
-    assert "beth-surf-cleanup" not in running_daemon.state.surfaces.subscribers("discord:user:999")
-    assert "discord:user:999" not in running_daemon.state.surfaces.all_surfaces()
+    assert "beth-surf-cleanup" not in running_daemon.services["gateway"].surfaces.subscribers("discord:user:999")
+    assert "discord:user:999" not in running_daemon.services["gateway"].surfaces.all_surfaces()
 
 
 @pytest.mark.asyncio
@@ -1417,7 +1423,7 @@ async def test_surface_multiple_subscribers(running_daemon, make_client):
     count2 = await c2.subscribe_surface("discord:user:116377")
     assert count2 == 2
 
-    subs = running_daemon.state.surfaces.subscribers("discord:user:116377")
+    subs = running_daemon.services["gateway"].surfaces.subscribers("discord:user:116377")
     assert subs == {"beth-multi-1", "beth-multi-2"}
 
 
@@ -1440,7 +1446,7 @@ async def test_deliver_to_surface_subscribers(running_daemon, make_client, daemo
         channel_id="dm-116377",
     )
 
-    delivered = await running_daemon.deliver_to_surface_subscribers(
+    delivered = await running_daemon.services["gateway"].deliver_to_surface_subscribers(
         "discord:user:116377", msg,
     )
     assert delivered == 2
@@ -1464,7 +1470,7 @@ async def test_deliver_to_surface_no_subscribers(running_daemon):
         platform="test",
         content="hello?",
     )
-    delivered = await running_daemon.deliver_to_surface_subscribers(
+    delivered = await running_daemon.services["gateway"].deliver_to_surface_subscribers(
         "test:orphan:surface", msg,
     )
     assert delivered == 0
@@ -1477,7 +1483,7 @@ async def test_surface_in_get_status(running_daemon, make_client):
     await client.subscribe_surface("discord:user:123")
 
     status = await client.get_status()
-    assert status["surfaces"] == 1
+    assert status["services"]["gateway"]["surfaces"] == 1
     assert status["sessions"] == 1
 
 
@@ -1493,7 +1499,7 @@ async def test_surface_validation_rejects_malformed(running_daemon, make_client)
 
     adapter = DiscordAdapter()
     await adapter.start(running_daemon)
-    running_daemon.adapters["discord"] = adapter
+    running_daemon.services["gateway"].adapters["discord"] = adapter
 
     client = make_client("beth", "beth-stat-surf")
 
@@ -1510,7 +1516,7 @@ async def test_surface_validation_rejects_malformed(running_daemon, make_client)
         await client.subscribe_surface("discord:user:")
 
     await adapter.stop()
-    running_daemon.adapters.pop("discord", None)
+    running_daemon.services["gateway"].adapters.pop("discord", None)
 
 
 @pytest.mark.asyncio
@@ -1520,7 +1526,7 @@ async def test_surface_validation_accepts_valid(running_daemon, make_client):
 
     adapter = DiscordAdapter()
     await adapter.start(running_daemon)
-    running_daemon.adapters["discord"] = adapter
+    running_daemon.services["gateway"].adapters["discord"] = adapter
 
     client = make_client("beth", "beth-val-1")
 
@@ -1534,7 +1540,7 @@ async def test_surface_validation_accepts_valid(running_daemon, make_client):
     assert refs == {"discord:user:116377", "discord:channel:999888"}
 
     await adapter.stop()
-    running_daemon.adapters.pop("discord", None)
+    running_daemon.services["gateway"].adapters.pop("discord", None)
 
 
 @pytest.mark.asyncio
@@ -1747,14 +1753,14 @@ class TestFormatOutbound:
 async def test_outbound_bridge_rendering(running_daemon, make_client):
     """Channel message with a bridge triggers outbound formatting and post."""
     from kiln.daemon.adapters.discord import DiscordAdapter
-    from kiln.daemon.state import BridgeRecord
+    from kiln.services.gateway.state import BridgeRecord
     from unittest.mock import AsyncMock
 
     adapter = DiscordAdapter()
     await adapter.start(running_daemon)
 
     # Register a bridge: channel "updates" → Discord thread "99999"
-    running_daemon.state.bridges.bind(BridgeRecord(
+    running_daemon.services["gateway"].bridges.bind(BridgeRecord(
         bridge_id="b1",
         source_kind="channel",
         source_name="updates",
@@ -1805,13 +1811,13 @@ async def test_outbound_no_bridge_no_post(running_daemon):
 async def test_outbound_echo_prevention_with_bridge(running_daemon):
     """Discord-sourced messages are not echoed even when bridge exists."""
     from kiln.daemon.adapters.discord import DiscordAdapter
-    from kiln.daemon.state import BridgeRecord
+    from kiln.services.gateway.state import BridgeRecord
     from unittest.mock import AsyncMock
 
     adapter = DiscordAdapter()
     await adapter.start(running_daemon)
 
-    running_daemon.state.bridges.bind(BridgeRecord(
+    running_daemon.services["gateway"].bridges.bind(BridgeRecord(
         bridge_id="b1", source_kind="channel", source_name="chat",
         adapter_id="discord", platform_target="88888",
     ))
@@ -2122,6 +2128,28 @@ class _MockManagement:
         return None
 
 
+class _MockGateway:
+    """Minimal gateway service mock for adapter routing tests."""
+
+    def __init__(self):
+        self.surfaces = SurfaceSubscriptionRegistry()
+        self.bridges = BridgeRegistry()
+        self.delivered: list[tuple[str, proto.PlatformMessage]] = []
+        self.surface_delivered: list[tuple[str, proto.PlatformMessage]] = []
+
+    @property
+    def name(self):
+        return "gateway"
+
+    async def deliver_platform_message(self, recipient, msg):
+        self.delivered.append((recipient, msg))
+        return Path("/fake/inbox/msg.md")
+
+    async def deliver_to_surface_subscribers(self, surface_ref, msg):
+        self.surface_delivered.append((surface_ref, msg))
+        return 1
+
+
 class _MockDaemon:
     """Minimal daemon mock for adapter routing tests."""
 
@@ -2130,13 +2158,18 @@ class _MockDaemon:
         self.state = DaemonState()
         self.config = DaemonConfig(agents_registry=Path("/fake/agents.yml"))
         self.management = _MockManagement()
-        self.delivered: list[tuple[str, proto.PlatformMessage]] = []
+        self._gateway = _MockGateway()
+        self.services = {"gateway": self._gateway}
         self.published: list[dict] = []
-        self.surface_delivered: list[tuple[str, proto.PlatformMessage]] = []
 
-    async def deliver_platform_message(self, recipient, msg):
-        self.delivered.append((recipient, msg))
-        return Path("/fake/inbox/msg.md")
+    # Convenience accessors mirroring old interface for test assertions
+    @property
+    def delivered(self):
+        return self._gateway.delivered
+
+    @property
+    def surface_delivered(self):
+        return self._gateway.surface_delivered
 
     async def publish_to_channel(self, channel, sender, summary, body,
                                  priority="normal", source="", exclude_sender=True):
@@ -2144,10 +2177,6 @@ class _MockDaemon:
             "channel": channel, "sender": sender,
             "summary": summary, "body": body, "source": source,
         })
-        return 1
-
-    async def deliver_to_surface_subscribers(self, surface_ref, msg):
-        self.surface_delivered.append((surface_ref, msg))
         return 1
 
 
@@ -2229,7 +2258,7 @@ class TestClassifyMessage:
     def test_surface_subscription_dm(self):
         from kiln.daemon.adapters.discord import RouteBucket
         adapter = _make_adapter()
-        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        adapter._gateway.surfaces.subscribe("discord:user:111", "beth-a")
         decision = adapter._classify_message(_msg(is_dm=True, sender_id="111"))
         assert decision is not None
         assert decision.bucket == RouteBucket.SURFACE
@@ -2238,7 +2267,7 @@ class TestClassifyMessage:
     def test_surface_subscription_channel(self):
         from kiln.daemon.adapters.discord import RouteBucket
         adapter = _make_adapter()
-        adapter._daemon.state.surfaces.subscribe("discord:channel:555", "beth-a")
+        adapter._gateway.surfaces.subscribe("discord:channel:555", "beth-a")
         decision = adapter._classify_message(_msg(channel_id="555"))
         assert decision is not None
         assert decision.bucket == RouteBucket.SURFACE
@@ -2253,14 +2282,14 @@ class TestClassifyMessage:
         from kiln.daemon.adapters.discord import RoutingError
         adapter = _make_adapter(branch_threads={"beth-test-1": 9001})
         # Also subscribe a surface for the same thread ID
-        adapter._daemon.state.surfaces.subscribe("discord:channel:9001", "beth-b")
+        adapter._gateway.surfaces.subscribe("discord:channel:9001", "beth-b")
         with pytest.raises(RoutingError, match="invariant violation"):
             adapter._classify_message(_msg(channel_id="9001"))
 
     def test_invariant_violation_bridge_and_surface(self):
         from kiln.daemon.adapters.discord import RoutingError
         adapter = _make_adapter(channel_threads={"refactor": 8001})
-        adapter._daemon.state.surfaces.subscribe("discord:channel:8001", "beth-b")
+        adapter._gateway.surfaces.subscribe("discord:channel:8001", "beth-b")
         with pytest.raises(RoutingError, match="invariant violation"):
             adapter._classify_message(_msg(channel_id="8001"))
 
@@ -2374,7 +2403,7 @@ class TestHandleMessage:
             users={"111": {"name": "Kira", "trust": "full"}},
             dm_access="allowlist",
         )
-        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        adapter._gateway.surfaces.subscribe("discord:user:111", "beth-a")
         result = await adapter.handle_message(
             _msg(is_dm=True, sender_id="111", content="hey beth"),
         )
@@ -2426,7 +2455,7 @@ class TestHandleMessage:
             users={"111": {"name": "Kira", "trust": "full"}},
             dm_access="allowlist",
         )
-        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        adapter._gateway.surfaces.subscribe("discord:user:111", "beth-a")
         await adapter.handle_message(
             _msg(is_dm=True, sender_id="111", sender_display_name="krylea94"),
         )
@@ -2644,7 +2673,7 @@ class TestClientExtraction:
             dm_access="open",
             users={"111": {"name": "Kira", "max_trust": "full"}},
         )
-        adapter._daemon.state.surfaces.subscribe("discord:user:111", "beth-a")
+        adapter._gateway.surfaces.subscribe("discord:user:111", "beth-a")
 
         from kiln.daemon.adapters.discord import _DiscordClient
         client = _DiscordClient(adapter, asyncio.Event())
@@ -4879,7 +4908,7 @@ async def test_resolve_approval_passes_session_id(running_daemon, make_client):
     unit tests on the adapter alone did not cover.
     """
     adapter = _PermissionMockAdapter()
-    running_daemon.adapters["mock-perms"] = adapter
+    running_daemon.services["gateway"].adapters["mock-perms"] = adapter
 
     client = make_client("beth", "beth-resolve-test")
 
@@ -4903,7 +4932,7 @@ async def test_resolve_approval_passes_session_id(running_daemon, make_client):
 async def test_request_approval_passes_agent_id(running_daemon, make_client):
     """Server mgmt request_approval forwards agent_id to the adapter."""
     adapter = _PermissionMockAdapter()
-    running_daemon.adapters["mock-perms"] = adapter
+    running_daemon.services["gateway"].adapters["mock-perms"] = adapter
 
     # Override platform_op to handle request too
     async def handle_op(action, args, context=None):
@@ -4981,122 +5010,116 @@ class _BootstrapFailingAdapter(_BootstrapMockAdapter):
 
 
 def _patch_adapter_registry(monkeypatch, overrides):
-    """Patch the adapter registry on KilnDaemon for one test."""
-    merged = dict(KilnDaemon._adapter_registry)
+    """Patch the adapter registry in the gateway service module."""
+    import kiln.services.gateway.service as gw_mod
+    merged = dict(gw_mod._ADAPTER_REGISTRY)
     merged.update(overrides)
-    monkeypatch.setattr(KilnDaemon, "_adapter_registry", merged)
+    monkeypatch.setattr(gw_mod, "_ADAPTER_REGISTRY", merged)
+
+
+def _gateway_config(adapters_dict):
+    """Build a gateway service config with the given adapters."""
+    return {"enabled": True, "adapters": adapters_dict}
 
 
 class TestAdapterBootstrap:
-    """Tests for adapter loading during daemon startup."""
+    """Tests for adapter loading via gateway service during daemon startup."""
 
     @pytest.mark.asyncio
     async def test_adapter_started_from_config(self, daemon_config, monkeypatch):
         """Configured adapter is instantiated and started."""
-        from kiln.daemon.config import AdapterConfig
-
-        daemon_config.adapters["mock"] = AdapterConfig(
-            adapter_id="mock", platform="mock", enabled=True,
-            config={"key": "value"},
-        )
+        daemon_config.services["gateway"] = _gateway_config({
+            "mock": {"platform": "mock", "enabled": True, "key": "value"},
+        })
         _patch_adapter_registry(monkeypatch, {"mock": _BootstrapMockAdapter})
 
         daemon = KilnDaemon(daemon_config)
         await daemon.start()
 
-        assert "mock" in daemon.adapters
-        adapter = daemon.adapters["mock"]
+        gateway = daemon.services["gateway"]
+        assert "mock" in gateway.adapters
+        adapter = gateway.adapters["mock"]
         assert isinstance(adapter, _BootstrapMockAdapter)
         assert adapter.started
         assert adapter.daemon_ref is daemon
-        assert adapter.config == {"key": "value"}
+        assert adapter.config == {"platform": "mock", "enabled": True, "key": "value"}
 
         await daemon.stop()
 
     @pytest.mark.asyncio
     async def test_disabled_adapter_skipped(self, daemon_config, monkeypatch):
         """Disabled adapter is not instantiated."""
-        from kiln.daemon.config import AdapterConfig
-
-        daemon_config.adapters["mock"] = AdapterConfig(
-            adapter_id="mock", platform="mock", enabled=False, config={},
-        )
+        daemon_config.services["gateway"] = _gateway_config({
+            "mock": {"platform": "mock", "enabled": False},
+        })
         _patch_adapter_registry(monkeypatch, {"mock": _BootstrapMockAdapter})
 
         daemon = KilnDaemon(daemon_config)
         await daemon.start()
-        assert "mock" not in daemon.adapters
+        assert "mock" not in daemon.services["gateway"].adapters
         await daemon.stop()
 
     @pytest.mark.asyncio
     async def test_unknown_platform_skipped(self, daemon_config):
         """Adapter with unrecognized platform is skipped with warning."""
-        from kiln.daemon.config import AdapterConfig
-
-        daemon_config.adapters["mystery"] = AdapterConfig(
-            adapter_id="mystery", platform="nonexistent", enabled=True, config={},
-        )
+        daemon_config.services["gateway"] = _gateway_config({
+            "mystery": {"platform": "nonexistent", "enabled": True},
+        })
 
         daemon = KilnDaemon(daemon_config)
         await daemon.start()
-        assert "nonexistent" not in daemon.adapters
+        assert "nonexistent" not in daemon.services["gateway"].adapters
         await daemon.stop()
 
     @pytest.mark.asyncio
     async def test_adapter_start_failure_does_not_crash_daemon(self, daemon_config, monkeypatch):
         """If an adapter's start() raises, the daemon continues."""
-        from kiln.daemon.config import AdapterConfig
-
-        daemon_config.adapters["failing"] = AdapterConfig(
-            adapter_id="failing", platform="failing", enabled=True, config={},
-        )
+        daemon_config.services["gateway"] = _gateway_config({
+            "failing": {"platform": "failing", "enabled": True},
+        })
         _patch_adapter_registry(monkeypatch, {"failing": _BootstrapFailingAdapter})
 
         daemon = KilnDaemon(daemon_config)
         await daemon.start()
 
-        assert "failing" not in daemon.adapters
+        assert "failing" not in daemon.services["gateway"].adapters
         assert daemon._server is not None
 
         await daemon.stop()
 
     @pytest.mark.asyncio
     async def test_adapters_stopped_on_daemon_stop(self, daemon_config, monkeypatch):
-        """Adapters are stopped when the daemon stops."""
-        from kiln.daemon.config import AdapterConfig
-
-        daemon_config.adapters["mock"] = AdapterConfig(
-            adapter_id="mock", platform="mock", enabled=True, config={},
-        )
+        """Adapters are stopped when the gateway service stops."""
+        daemon_config.services["gateway"] = _gateway_config({
+            "mock": {"platform": "mock", "enabled": True},
+        })
         _patch_adapter_registry(monkeypatch, {"mock": _BootstrapMockAdapter})
 
         daemon = KilnDaemon(daemon_config)
         await daemon.start()
 
-        adapter = daemon.adapters["mock"]
+        adapter = daemon.services["gateway"].adapters["mock"]
         assert not adapter.stopped
 
         await daemon.stop()
         assert adapter.stopped
-        assert len(daemon.adapters) == 0
+        assert len(daemon.services) == 0
 
     @pytest.mark.asyncio
     async def test_no_adapters_configured(self, daemon_config):
-        """Daemon starts fine with no adapters configured."""
+        """Daemon starts fine with no services configured."""
         daemon = KilnDaemon(daemon_config)
         await daemon.start()
-        assert len(daemon.adapters) == 0
+        assert len(daemon.services) == 0
         assert daemon._server is not None
         await daemon.stop()
 
     @pytest.mark.asyncio
     async def test_adapter_receives_platform_op(self, daemon_config, make_client, monkeypatch):
-        """Platform ops route to the bootstrapped adapter."""
-        from kiln.daemon.config import AdapterConfig
-
-        daemon_config.adapters["mock"] = AdapterConfig(
-            adapter_id="mock", platform="mock", enabled=True, config={},
-        )
+        """Platform ops route to the bootstrapped adapter via gateway."""
+        daemon_config.services["gateway"] = _gateway_config({
+            "mock": {"platform": "mock", "enabled": True},
+        })
         _patch_adapter_registry(monkeypatch, {"mock": _BootstrapMockAdapter})
 
         daemon = KilnDaemon(daemon_config)
@@ -5113,17 +5136,17 @@ class TestAdapterBootstrap:
     @pytest.mark.asyncio
     async def test_resolve_adapter_class_dotted_path(self, monkeypatch):
         """_resolve_adapter_class handles dotted string paths."""
-        _patch_adapter_registry(monkeypatch, {
-            "test_resolve": "kiln.daemon.server.KilnDaemon",
-        })
-        cls = KilnDaemon._resolve_adapter_class("test_resolve")
+        import kiln.services.gateway.service as gw_mod
+        monkeypatch.setitem(gw_mod._ADAPTER_REGISTRY, "test_resolve", "kiln.daemon.server.KilnDaemon")
+        cls = gw_mod._resolve_adapter_class("test_resolve")
         assert cls is KilnDaemon
 
     @pytest.mark.asyncio
     async def test_resolve_adapter_class_direct_type(self, monkeypatch):
         """_resolve_adapter_class handles direct class references."""
-        _patch_adapter_registry(monkeypatch, {"mock": _BootstrapMockAdapter})
-        cls = KilnDaemon._resolve_adapter_class("mock")
+        import kiln.services.gateway.service as gw_mod
+        monkeypatch.setitem(gw_mod._ADAPTER_REGISTRY, "mock", _BootstrapMockAdapter)
+        cls = gw_mod._resolve_adapter_class("mock")
         assert cls is _BootstrapMockAdapter
 
 

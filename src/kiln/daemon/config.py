@@ -67,7 +67,7 @@ class DaemonConfig:
     subscriptions_dir: Path = field(default_factory=lambda: SUBSCRIPTIONS_DIR)
 
     users: dict[str, UserConfig] = field(default_factory=dict)
-    adapters: dict[str, AdapterConfig] = field(default_factory=dict)
+    services: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def load_daemon_config(path: Path | None = None) -> DaemonConfig:
@@ -101,15 +101,26 @@ def load_daemon_config(path: Path | None = None) -> DaemonConfig:
                 default_platform=user_raw.get("default_platform", ""),
             )
 
-    # Adapters
-    for adapter_id, adapter_raw in raw.get("adapters", {}).items():
-        if isinstance(adapter_raw, dict):
-            config.adapters[adapter_id] = AdapterConfig(
-                adapter_id=adapter_id,
-                platform=adapter_raw.get("platform", adapter_id),
-                enabled=adapter_raw.get("enabled", True),
-                config=adapter_raw,
-            )
+    # Services — each service gets its raw config dict
+    for svc_name, svc_raw in raw.get("services", {}).items():
+        if isinstance(svc_raw, dict):
+            config.services[svc_name] = svc_raw
+
+    # Backward compat: top-level 'adapters' key implies gateway service
+    if "adapters" in raw and "services" not in raw:
+        import warnings
+        warnings.warn(
+            "Top-level 'adapters' in daemon config is deprecated. "
+            "Move adapter config under 'services.gateway.adapters'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        config.services["gateway"] = {
+            "enabled": True,
+            "adapters": raw["adapters"],
+            # Preserve top-level users for gateway's use
+            "users": raw.get("users", {}),
+        }
 
     return config
 
