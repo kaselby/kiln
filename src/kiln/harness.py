@@ -629,7 +629,9 @@ class KilnHarness:
             "mode": self._initial_mode.value,
             "heartbeat": self.config.heartbeat,
             "stream_timeout": self.config.stream_timeout,
+            "tags": list(self.config.tags),
         }
+
 
         if saved_state and saved_state.get("session_config"):
             config_defaults.update(saved_state["session_config"])

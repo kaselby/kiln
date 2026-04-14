@@ -704,6 +704,7 @@ class KilnDaemon:
         self.events = EventBus()
         self.management = ManagementActions(self.state, self.config)
         self.adapters: dict[str, Any] = {}  # platform_name -> adapter instance
+        self._services: dict[str, Any] = {}  # service_name -> Service instance
         self._server: asyncio.Server | None = None
         self._reconcile_task: asyncio.Task | None = None
 
@@ -956,12 +957,16 @@ class KilnDaemon:
                 session_id=session_id,
             ))
 
+        # Start optional services
+        await self._start_services()
+
         # Start periodic reconciliation
         self._reconcile_task = asyncio.create_task(self._reconcile_loop())
 
         log.info(
-            "Daemon started on %s (PID %d, %d adapter(s))",
-            self.config.socket_path, os.getpid(), len(self.adapters),
+            "Daemon started on %s (PID %d, %d adapter(s), %d service(s))",
+            self.config.socket_path, os.getpid(),
+            len(self.adapters), len(self._services),
         )
 
     async def _start_adapters(self) -> None:
@@ -1002,8 +1007,39 @@ class KilnDaemon:
         module = importlib.import_module(module_path)
         return getattr(module, class_name)
 
+    # Service registry — maps service name to factory callable.
+    # Deferred imports avoid pulling in deps unless the service is enabled.
+    _service_registry: dict[str, str] = {
+        "scheduler": "kiln.services.scheduler.service.SchedulerService",
+    }
+
+    async def _start_services(self) -> None:
+        """Instantiate and start enabled services from daemon config."""
+        for svc_name, svc_cfg in self.config.services.items():
+            if not svc_cfg.enabled:
+                log.info("Service '%s' disabled, skipping", svc_name)
+                continue
+
+            ref = self._service_registry.get(svc_name)
+            if ref is None:
+                log.warning("Unknown service '%s' in config, skipping", svc_name)
+                continue
+
+            try:
+                module_path, class_name = ref.rsplit(".", 1)
+                import importlib
+                module = importlib.import_module(module_path)
+                cls = getattr(module, class_name)
+                service = cls(**{k: v for k, v in svc_cfg.config.items()
+                                 if k != "enabled"})
+                await service.start(self)
+                self._services[svc_name] = service
+                log.info("Started service '%s'", svc_name)
+            except Exception:
+                log.exception("Failed to start service '%s'", svc_name)
+
     async def stop(self) -> None:
-        """Stop the daemon server and all adapters."""
+        """Stop the daemon server, services, and adapters."""
         # Cancel reconcile loop
         if self._reconcile_task:
             self._reconcile_task.cancel()
@@ -1011,6 +1047,15 @@ class KilnDaemon:
                 await self._reconcile_task
             except asyncio.CancelledError:
                 pass
+
+        # Stop services first (they may depend on daemon state)
+        for name, service in self._services.items():
+            try:
+                await service.stop()
+                log.info("Stopped service '%s'", name)
+            except Exception:
+                log.exception("Error stopping service '%s'", name)
+        self._services.clear()
 
         # Stop adapters
         for name, adapter in self.adapters.items():

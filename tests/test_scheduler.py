@@ -268,14 +268,26 @@ class TestParseEntry:
         assert entry is None
         assert errors
 
-    def test_deliver_target_preserves_extra(self):
-        """Extra fields on target (e.g. future tag spec) are preserved, not rejected."""
+    def test_deliver_target_with_tags(self):
+        """Tags, match, and fallback are parsed as typed fields."""
         data = self._deliver_entry()
         data["action"]["target"]["tags"] = ["canonical"]
         data["action"]["target"]["match"] = "any"
+        data["action"]["target"]["fallback"] = "drop"
         entry, errors = parse_entry(data)
         assert errors == []
-        assert entry.action.target.extra == {"tags": ["canonical"], "match": "any"}
+        assert entry.action.target.tags == ("canonical",)
+        assert entry.action.target.match == "any"
+        assert entry.action.target.fallback == "drop"
+
+    def test_deliver_target_defaults(self):
+        """Tags default to empty, match to 'any', fallback to 'inbox'."""
+        data = self._deliver_entry()
+        entry, errors = parse_entry(data)
+        assert errors == []
+        assert entry.action.target.tags == ()
+        assert entry.action.target.match == "any"
+        assert entry.action.target.fallback == "inbox"
 
 
 class TestLoadSchedule:

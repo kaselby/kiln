@@ -50,6 +50,13 @@ class AdapterConfig:
 
 
 @dataclass
+class ServiceConfig:
+    """Configuration for an optional daemon service."""
+    enabled: bool = True
+    config: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class DaemonConfig:
     """Top-level daemon configuration.
 
@@ -68,6 +75,11 @@ class DaemonConfig:
 
     users: dict[str, UserConfig] = field(default_factory=dict)
     adapters: dict[str, AdapterConfig] = field(default_factory=dict)
+    services: dict[str, ServiceConfig] = field(default_factory=dict)
+
+    @property
+    def kiln_home(self) -> Path:
+        return KILN_ROOT
 
 
 def load_daemon_config(path: Path | None = None) -> DaemonConfig:
@@ -110,6 +122,16 @@ def load_daemon_config(path: Path | None = None) -> DaemonConfig:
                 enabled=adapter_raw.get("enabled", True),
                 config=adapter_raw,
             )
+
+    # Services
+    for svc_name, svc_raw in raw.get("services", {}).items():
+        if isinstance(svc_raw, dict):
+            config.services[svc_name] = ServiceConfig(
+                enabled=svc_raw.get("enabled", True),
+                config=svc_raw,
+            )
+        elif isinstance(svc_raw, bool):
+            config.services[svc_name] = ServiceConfig(enabled=svc_raw)
 
     return config
 

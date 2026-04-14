@@ -108,10 +108,9 @@ Trigger = CronTrigger | AtTrigger
 class DeliverTarget:
     kind: str = "agent"
     agent: str = ""
-    # Target resolution — details TBD (tags design in progress).
-    # For now, the target spec carries whatever fields the executor needs.
-    # Unrecognized fields are preserved in `extra`.
-    extra: dict[str, Any] = field(default_factory=dict)
+    tags: tuple[str, ...] = ()
+    match: Literal["any", "all"] = "any"
+    fallback: Literal["inbox", "drop", "error"] = "inbox"
 
     def validate(self) -> list[str]:
         errors = []
@@ -119,6 +118,10 @@ class DeliverTarget:
             errors.append(f"unsupported target kind: {self.kind!r}")
         if not self.agent:
             errors.append("deliver target missing 'agent'")
+        if self.match not in ("any", "all"):
+            errors.append(f"unsupported match mode: {self.match!r}")
+        if self.fallback not in ("inbox", "drop", "error"):
+            errors.append(f"unsupported fallback mode: {self.fallback!r}")
         return errors
 
 
@@ -187,7 +190,7 @@ _KNOWN_TOP_KEYS = {"id", "enabled", "trigger", "action", "catchup"}
 _KNOWN_TRIGGER_KEYS = {"kind", "expr", "timezone", "time"}
 _KNOWN_SPAWN_KEYS = {"kind", "agent", "template", "mode", "prompt"}
 _KNOWN_DELIVER_KEYS = {"kind", "target", "summary", "body", "priority"}
-_KNOWN_TARGET_KEYS = {"kind", "agent"}
+_KNOWN_TARGET_KEYS = {"kind", "agent", "tags", "match", "fallback"}
 
 
 def _check_unknown_keys(data: dict, known: set[str], context: str) -> list[str]:
@@ -215,15 +218,21 @@ def _parse_trigger(data: Any) -> tuple[Trigger | None, list[str]]:
 def _parse_target(data: Any) -> tuple[DeliverTarget | None, list[str]]:
     if not isinstance(data, dict):
         return None, ["target must be a mapping"]
-    known = _KNOWN_TARGET_KEYS
-    extra_keys = set(data.keys()) - known
-    extra = {k: data[k] for k in extra_keys}
+    errors = _check_unknown_keys(data, _KNOWN_TARGET_KEYS, "target")
+    raw_tags = data.get("tags", [])
+    if isinstance(raw_tags, list):
+        tags = tuple(str(t) for t in raw_tags if t)
+    else:
+        tags = ()
+        errors.append("target 'tags' must be a list")
     target = DeliverTarget(
         kind=data.get("kind", "agent"),
         agent=data.get("agent", ""),
-        extra=extra,
+        tags=tags,
+        match=data.get("match", "any"),
+        fallback=data.get("fallback", "inbox"),
     )
-    return target, []
+    return target, errors
 
 
 def _parse_action(data: Any) -> tuple[Action | None, list[str]]:

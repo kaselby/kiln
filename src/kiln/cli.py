@@ -126,6 +126,14 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
         metavar="KEY=VALUE",
         help="Extra template variable for orientation/cleanup (repeatable)",
     )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        metavar="TAG",
+        help="Seed a startup tag into the session's live session-config (repeatable)",
+    )
+
 
 
 def _parse_init_args(parser: argparse.ArgumentParser) -> None:
@@ -170,6 +178,10 @@ def parse_args() -> argparse.Namespace:
     daemon_logs = daemon_sub.add_parser("logs", help="View daemon logs")
     daemon_logs.add_argument("--follow", "-f", action="store_true",
                              help="Follow log output")
+
+    schedule_parser = sub.add_parser("schedule", help="Manage scheduled entries")
+    schedule_sub = schedule_parser.add_subparsers(dest="schedule_command")
+    schedule_sub.add_parser("list", help="List scheduled entries and state")
 
     args = parser.parse_args()
     if not args.command:
@@ -219,7 +231,10 @@ def _build_inner_command(args: argparse.Namespace, agent_id: str, spec_path: Pat
         cmd_parts += ["--template", args.template]
     for var_str in getattr(args, "var", []):
         cmd_parts += ["--var", var_str]
+    for tag in getattr(args, "tag", []):
+        cmd_parts += ["--tag", tag]
     return shlex.join(cmd_parts)
+
 
 
 def _launch_in_tmux(args: argparse.Namespace, config: AgentConfig, spec_path: Path) -> None:
@@ -355,7 +370,10 @@ def _rebuild_run_args(args: argparse.Namespace, *, omit_spec: bool = False) -> l
         parts += ["--template", args.template]
     for var_str in getattr(args, "var", []):
         parts += ["--var", var_str]
+    for tag in getattr(args, "tag", []):
+        parts += ["--tag", tag]
     return parts
+
 
 
 def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
@@ -419,6 +437,12 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
             sys.exit(1)
         key, _, value = var_str.partition("=")
         config.template_vars[key] = value
+
+    # CLI tags append to any agent/template defaults.
+    for tag in getattr(args, "tag", []):
+        if tag and tag not in config.tags:
+            config.tags.append(tag)
+
 
     # Resolve prompt
     if args.prompt and getattr(args, "prompt_file", None):
@@ -757,6 +781,64 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# kiln schedule
+# ---------------------------------------------------------------------------
+
+def cmd_schedule(args: argparse.Namespace) -> None:
+    """Manage scheduled entries."""
+    from .daemon.config import STATE_DIR
+    from .services.scheduler.models import load_schedule, load_state
+
+    subcmd = args.schedule_command
+    if not subcmd:
+        print("Usage: kiln schedule <list>")
+        return
+
+    if subcmd == "list":
+        schedule_path = STATE_DIR / "schedule.yml"
+        state_path = STATE_DIR / "scheduler-state.json"
+
+        entries = load_schedule(schedule_path)
+        state = load_state(state_path)
+
+        if not entries:
+            print("No scheduled entries.")
+            if not schedule_path.exists():
+                print(f"  (schedule file not found: {schedule_path})")
+            return
+
+        for entry in entries:
+            es = state.get_entry(entry.id)
+            status_parts = []
+            if not entry.enabled:
+                status_parts.append("disabled")
+            elif es.completed:
+                status_parts.append("completed")
+            else:
+                status_parts.append("active")
+
+            if es.last_fired:
+                status_parts.append(f"last fired: {es.last_fired.isoformat()}")
+            if es.fire_count:
+                status_parts.append(f"fires: {es.fire_count}")
+
+            trigger_desc = ""
+            if hasattr(entry.trigger, "expr"):
+                trigger_desc = f"cron: {entry.trigger.expr}"
+            elif hasattr(entry.trigger, "time"):
+                trigger_desc = f"at: {entry.trigger.time}"
+
+            action_desc = entry.action.kind
+            if hasattr(entry.action, "agent"):
+                action_desc += f" → {entry.action.agent}"
+            elif hasattr(entry.action, "target"):
+                action_desc += f" → {entry.action.target.agent}"
+
+            print(f"  {entry.id}")
+            print(f"    {trigger_desc} | {action_desc} | {', '.join(status_parts)}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -885,6 +967,8 @@ def main():
         cmd_list(args)
     elif args.command == "daemon":
         cmd_daemon(args)
+    elif args.command == "schedule":
+        cmd_schedule(args)
 
 
 if __name__ == "__main__":

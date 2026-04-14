@@ -130,6 +130,38 @@ class ManagementActions:
         sessions.sort(key=lambda s: s.first_seen_at, reverse=True)
         return sessions[0].session_id
 
+    def resolve_by_tags(
+        self,
+        agent: str,
+        tags: list[str] | tuple[str, ...],
+        match: str = "any",
+    ) -> list["SessionRecord"]:
+        """Resolve live sessions for an agent matching the given tags.
+
+        Args:
+            agent: Agent name to filter by.
+            tags: Tags to match against session tags.
+            match: "any" — session has at least one of the tags.
+                   "all" — session has all of the tags.
+
+        Returns refreshed SessionRecords for matching sessions.
+        If tags is empty, returns all live sessions for the agent.
+        """
+        sessions = self._refresh_presence_for_agent(agent)
+        if not tags:
+            return sessions
+        matched = []
+        tag_set = set(tags)
+        for s in sessions:
+            session_tags = set(s.tags)
+            if match == "all":
+                if tag_set <= session_tags:
+                    matched.append(s)
+            else:  # "any"
+                if tag_set & session_tags:
+                    matched.append(s)
+        return matched
+
     def list_historical_sessions(self, agent: str) -> set[str]:
         """List all historical session IDs for an agent.
 
@@ -272,6 +304,7 @@ class ManagementActions:
         mode: str = "yolo",
         prompt: str | None = None,
         resume_id: str | None = None,
+        template: str | None = None,
     ) -> list[str] | None:
         """Build the command to launch/resume an agent session.
 
@@ -294,6 +327,8 @@ class ManagementActions:
             cmd.extend(["--prompt", prompt])
         if resume_id:
             cmd.extend(["--resume", resume_id])
+        if template:
+            cmd.extend(["--template", template])
         return cmd
 
 
@@ -322,10 +357,11 @@ class ManagementActions:
         agent: str,
         prompt: str | None = None,
         mode: str | None = None,
+        template: str | None = None,
         requested_by: str | None = None,
     ) -> ActionResult:
         """Spawn a new agent session."""
-        cmd = self._build_launch_cmd(agent, mode=mode or "yolo", prompt=prompt)
+        cmd = self._build_launch_cmd(agent, mode=mode or "yolo", prompt=prompt, template=template)
         if not cmd:
             return ActionResult(False, f"Cannot find '{agent}' on PATH")
         log.info("Spawning %s session (by %s)", agent, requested_by or "daemon")
