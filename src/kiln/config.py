@@ -87,13 +87,12 @@ class AgentConfig:
     # None means infer from model name. Explicit setting overrides inference.
 
 
-    # Heartbeat
-    heartbeat: bool = False
-    heartbeat_max: float = 1800.0       # cap for exponential backoff (seconds)
-    heartbeat_override: float = 0.0     # fixed interval bypassing backoff (seconds, 0 = disabled)
+    # Heartbeat interval in seconds (0 = disabled)
+    heartbeat: float = 0.0
 
     # Idle nudge: send a message after prolonged inactivity (seconds, 0 = disabled)
     idle_nudge_timeout: float = 0.0
+
 
     # Stream stall timeout: if no SDK message arrives for this many seconds during
     # a model turn, interrupt the stalled generation and auto-retry. Mitigates
@@ -320,15 +319,15 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
     if "hooks" in raw:
         config.hooks = raw["hooks"]
 
-    # Heartbeat — bool or dict with enabled/max/override
+    # Heartbeat — interval in minutes (0 = disabled)
     if "heartbeat" in raw:
         hb = raw["heartbeat"]
-        if isinstance(hb, dict):
-            config.heartbeat = hb.get("enabled", False)
-            config.heartbeat_max = hb.get("max", hb.get("interval", 1800.0))
-            config.heartbeat_override = hb.get("override", 0.0)
+        if isinstance(hb, (int, float)) and not isinstance(hb, bool):
+            config.heartbeat = max(float(hb) * 60, 0.0)
         else:
-            config.heartbeat = bool(hb)
+            config.heartbeat = 0.0
+
+
 
     # Idle nudge — value in minutes
     idle_key = "idle_nudge" if "idle_nudge" in raw else "idle-nudge" if "idle-nudge" in raw else None
