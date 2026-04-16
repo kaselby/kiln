@@ -685,11 +685,19 @@ def _accumulate_usage(total: Usage, turn: Usage) -> Usage:
 
 
 def _map_thinking_level(effort: str) -> dict[str, Any] | None:
-    """Map Kiln effort level to OpenAI reasoning config."""
+    """Map Kiln effort level to OpenAI reasoning config.
+
+    OpenAI's reasoning effort tops out at 'xhigh', so both Kiln 'xhigh' and
+    Kiln 'max' map to OpenAI 'xhigh' (degenerate but the best available).
+    On the Claude backend, 'xhigh' and 'max' are distinct tiers — 'xhigh' is
+    Anthropic's recommended starting point for agentic work on Opus 4.7+,
+    'max' is reserved for frontier problems and can overthink on simpler tasks.
+    """
     mapping = {
         "low": {"effort": "low", "summary": "auto"},
         "medium": {"effort": "medium", "summary": "auto"},
         "high": {"effort": "high", "summary": "auto"},
+        "xhigh": {"effort": "xhigh", "summary": "auto"},
         "max": {"effort": "xhigh", "summary": "auto"},
     }
     return mapping.get(effort)

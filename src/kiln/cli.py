@@ -110,9 +110,9 @@ def _parse_run_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--effort",
-        choices=["low", "medium", "high"],
+        choices=["low", "medium", "high", "xhigh", "max"],
         default=None,
-        help="Thinking effort level (low, medium, high). Default: high.",
+        help="Thinking effort level (low, medium, high, xhigh, max). Default: high.",
     )
     parser.add_argument(
         "--template",
