@@ -110,9 +110,19 @@ TUI_STYLE = Style.from_dict({
 
 
 # ANSI/VT100 escape sequences (e.g. color codes from grep --color).
-# \x1b (ESC, 0x1B) is invalid in XML 1.0 and crashes prompt_toolkit's
-# HTML/expat parser with "not well-formed (invalid token)".
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+# XML 1.0 forbids all ASCII control characters in content except \t (0x09),
+# \n (0x0A), and \r (0x0D). Any other control char — NUL, BEL, VT, FF, bare
+# ESC, etc. — crashes prompt_toolkit's HTML/expat parser with
+# "not well-formed (invalid token)". Tool output (Bash, Read) commonly
+# contains BEL and stray control chars; strip them defensively.
+_XML_INVALID_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def _sanitize_for_html(s: str) -> str:
+    """Strip ANSI escape sequences and XML-invalid control chars."""
+    return _XML_INVALID_RE.sub("", _ANSI_ESCAPE_RE.sub("", s))
 
 
 def _tprint(html_str: str, *args, **kwargs) -> None:
@@ -122,10 +132,10 @@ def _tprint(html_str: str, *args, **kwargs) -> None:
     run_in_terminal coordination. HTML.format() auto-escapes arguments.
     """
     if args or kwargs:
-        # Strip ANSI escape sequences from string args before HTML.format()
-        # inserts them into the XML template — expat rejects \x1b as invalid.
-        args = tuple(_ANSI_ESCAPE_RE.sub("", a) if isinstance(a, str) else a for a in args)
-        kwargs = {k: _ANSI_ESCAPE_RE.sub("", v) if isinstance(v, str) else v for k, v in kwargs.items()}
+        # Sanitize string args before HTML.format() inserts them into the
+        # XML template — expat rejects most ASCII control chars as invalid.
+        args = tuple(_sanitize_for_html(a) if isinstance(a, str) else a for a in args)
+        kwargs = {k: _sanitize_for_html(v) if isinstance(v, str) else v for k, v in kwargs.items()}
     html = HTML(html_str)
     if args or kwargs:
         html = html.format(*args, **kwargs)
@@ -211,7 +221,7 @@ def _render_block_tokens(tokens: list, result: _StyleTuples) -> None:
                 list_stack[-1] = (kind, count)
                 indent = "  " * len(list_stack)
                 if kind == "bullet":
-                    result.append(("class:text", f"{indent}\u2022 "))
+                    result.append(("class:text", f"{indent}• "))
                 else:
                     result.append(("class:text", f"{indent}{count}. "))
         elif tok.type == "list_item_close":
@@ -226,7 +236,7 @@ def _render_block_tokens(tokens: list, result: _StyleTuples) -> None:
 
         # --- Horizontal rules ---
         elif tok.type == "hr":
-            result.append(("class:dim", "\u2500" * 40 + "\n"))
+            result.append(("class:dim", "─" * 40 + "\n"))
 
         # --- Tables ---
         elif tok.type == "table_open":
