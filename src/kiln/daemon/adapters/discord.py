@@ -2605,17 +2605,26 @@ class DiscordAdapter:
         attachments = attachments or []
         sent_ids: list[str] = []
 
-        for i, chunk in enumerate(chunks):
-            is_first = (i == 0)
-            send_kwargs: dict[str, Any] = {}
-            if chunk:
-                send_kwargs["content"] = chunk
-            if is_first and attachments:
-                send_kwargs["files"] = _build_discord_files(attachments)
-            if not send_kwargs:
-                continue
-            msg = await channel.send(**send_kwargs)
-            sent_ids.append(str(msg.id))
+        discord_files: list[discord.File] | None = None
+        if attachments:
+            discord_files = _build_discord_files(attachments)
+
+        try:
+            for i, chunk in enumerate(chunks):
+                is_first = (i == 0)
+                send_kwargs: dict[str, Any] = {}
+                if chunk:
+                    send_kwargs["content"] = chunk
+                if is_first and discord_files:
+                    send_kwargs["files"] = discord_files
+                if not send_kwargs:
+                    continue
+                msg = await channel.send(**send_kwargs)
+                sent_ids.append(str(msg.id))
+        finally:
+            if discord_files:
+                for f in discord_files:
+                    f.close()
 
         return sent_ids
 
