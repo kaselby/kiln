@@ -830,7 +830,7 @@ class _DiscordClient(discord.Client):
             return self._voice_fallback(audio_path, existing_content, "no credentials configured")
 
         try:
-            from voice.openai import WhisperSTT
+            from kiln.voice.openai import WhisperSTT
         except ImportError:
             return self._voice_fallback(audio_path, existing_content, "transcription unavailable")
 
@@ -2711,8 +2711,8 @@ class DiscordAdapter:
         creds_path = Path(creds_dir).expanduser()
 
         try:
-            from voice.openai import generate_speech
-            from voice.discord import send_voice_message
+            from kiln.voice.openai import generate_speech
+            from kiln.voice.discord import send_voice_message
         except ImportError:
             return {"ok": False, "error": "Voice service not available (import failed)"}
 
@@ -2725,7 +2725,7 @@ class DiscordAdapter:
 
         audio_path = Path(tempfile.mktemp(suffix=".ogg"))
         try:
-            tts_kwargs: dict[str, Any] = {"agent_home": creds_path}
+            tts_kwargs: dict[str, Any] = {"credentials_dir": creds_path}
             if voice:
                 tts_kwargs["voice"] = voice
             if instructions:
@@ -2736,7 +2736,7 @@ class DiscordAdapter:
                 return {"ok": False, "error": "TTS generation failed"}
 
             ok = await send_voice_message(
-                str(channel.id), audio_path, agent_home=creds_path,
+                str(channel.id), audio_path, credentials_dir=creds_path,
             )
             return {"ok": ok}
         finally:
