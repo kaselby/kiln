@@ -2786,6 +2786,253 @@ class TestPlatformOps:
 
 
 # ---------------------------------------------------------------------------
+# File upload (outbound attachments on send/branch_post)
+# ---------------------------------------------------------------------------
+
+class TestFileUpload:
+    """Tests for outbound file attachment support on send/branch_post.
+
+    The RPC contract takes ``attachments: [{path, filename?}]``. Files are
+    attached to the *first* chunk of a split message.
+    """
+
+    @staticmethod
+    def _mock_channel():
+        """Build a channel-like mock that records send() calls."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+        channel = MagicMock(spec=[])  # spec=[] → hasattr(channel, anything) is False
+        channel.send = AsyncMock(return_value=SimpleNamespace(id=1234567890))
+        return channel
+
+    @staticmethod
+    def _close_sent_files(mock_channel):
+        """Close all discord.File handles passed to the mock channel's send."""
+        for call in mock_channel.send.call_args_list:
+            for f in call.kwargs.get("files", []) or []:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+    def test_prepare_rejects_non_dict_descriptor(self):
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        with pytest.raises(ValueError, match="must be an object"):
+            _prepare_attachments(["/not/a/dict.txt"])  # type: ignore[arg-type]
+
+    def test_prepare_rejects_missing_path(self):
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        with pytest.raises(ValueError, match="missing path"):
+            _prepare_attachments([{"filename": "x.txt"}])
+
+    def test_prepare_rejects_nonexistent(self):
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        with pytest.raises(ValueError, match="not found"):
+            _prepare_attachments([{"path": "/nonexistent/path.dat"}])
+
+    def test_prepare_rejects_empty_file(self, tmp_path):
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        empty = tmp_path / "empty.txt"
+        empty.write_bytes(b"")
+        with pytest.raises(ValueError, match="empty"):
+            _prepare_attachments([{"path": str(empty)}])
+
+    def test_prepare_rejects_directory(self, tmp_path):
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        with pytest.raises(ValueError, match="regular file"):
+            _prepare_attachments([{"path": str(tmp_path)}])
+
+    def test_prepare_rejects_too_many(self, tmp_path):
+        from kiln.daemon.adapters.discord import (
+            _prepare_attachments, MAX_FILES_PER_MESSAGE,
+        )
+        f = tmp_path / "one.txt"
+        f.write_bytes(b"x")
+        with pytest.raises(ValueError, match="Too many"):
+            _prepare_attachments(
+                [{"path": str(f)}] * (MAX_FILES_PER_MESSAGE + 1)
+            )
+
+    def test_prepare_rejects_oversize(self, tmp_path, monkeypatch):
+        """File larger than MAX_FILE_SIZE is rejected with MB-formatted message."""
+        from kiln.daemon.adapters import discord as mod
+        monkeypatch.setattr(mod, "MAX_FILE_SIZE", 1024)  # 1 KB for the test
+        big = tmp_path / "big.bin"
+        big.write_bytes(b"x" * 2048)
+        with pytest.raises(ValueError, match="too large"):
+            mod._prepare_attachments([{"path": str(big)}])
+
+    def test_prepare_filename_override(self, tmp_path):
+        """Explicit filename overrides the path's basename."""
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        f = tmp_path / "original.bin"
+        f.write_bytes(b"data")
+        result = _prepare_attachments(
+            [{"path": str(f), "filename": "renamed.txt"}]
+        )
+        assert len(result) == 1
+        assert result[0][1] == "renamed.txt"
+
+    def test_prepare_sanitizes_filename(self, tmp_path):
+        """Filename override is sanitized (path separators/control chars stripped)."""
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        f = tmp_path / "good.txt"
+        f.write_bytes(b"data")
+        result = _prepare_attachments(
+            [{"path": str(f), "filename": "../evil/name.txt"}]
+        )
+        assert "/" not in result[0][1]
+        assert ".." not in result[0][1]
+
+    def test_prepare_resolves_valid_file(self, tmp_path):
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        good = tmp_path / "good.txt"
+        good.write_bytes(b"content")
+        result = _prepare_attachments([{"path": str(good)}])
+        assert len(result) == 1
+        path, name = result[0]
+        assert path.exists()
+        assert name == "good.txt"
+
+    @pytest.mark.asyncio
+    async def test_op_send_rejects_empty_content_no_attachments(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_send(
+            {"target": "#general", "content": ""}, None,
+        )
+        assert result["ok"] is False
+        assert "content or attachments" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_op_send_rejects_missing_target(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_send(
+            {"target": "", "content": "hi"}, None,
+        )
+        assert result["ok"] is False
+        assert "target is required" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_op_send_rejects_missing_file(self):
+        adapter = _make_adapter(channel_access="open")
+        result = await adapter._op_send({
+            "target": "#general", "content": "hi",
+            "attachments": [{"path": "/nonexistent/file.txt"}],
+        }, None)
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_op_send_with_attachment(self, tmp_path):
+        from unittest.mock import AsyncMock
+        adapter = _make_adapter(channel_access="open")
+        channel = self._mock_channel()
+        adapter._resolve_target = AsyncMock(return_value=channel)
+
+        f = tmp_path / "doc.txt"
+        f.write_bytes(b"hello\n")
+
+        result = await adapter._op_send({
+            "target": "#general", "content": "with attachment",
+            "attachments": [{"path": str(f)}],
+        }, None)
+        assert result["ok"] is True
+        assert result["attachments_sent"] == 1
+        call = channel.send.call_args
+        assert call.kwargs["content"] == "with attachment"
+        assert len(call.kwargs["files"]) == 1
+        self._close_sent_files(channel)
+
+    @pytest.mark.asyncio
+    async def test_op_send_attachment_only_empty_content(self, tmp_path):
+        from unittest.mock import AsyncMock
+        adapter = _make_adapter(channel_access="open")
+        channel = self._mock_channel()
+        adapter._resolve_target = AsyncMock(return_value=channel)
+
+        f = tmp_path / "img.png"
+        f.write_bytes(b"fake-png" * 100)
+
+        result = await adapter._op_send({
+            "target": "#general", "content": "",
+            "attachments": [{"path": str(f)}],
+        }, None)
+        assert result["ok"] is True
+        assert result["attachments_sent"] == 1
+        call = channel.send.call_args
+        assert "content" not in call.kwargs  # no empty-string content
+        assert len(call.kwargs["files"]) == 1
+        self._close_sent_files(channel)
+
+    @pytest.mark.asyncio
+    async def test_op_send_attaches_files_to_first_chunk(self, tmp_path):
+        """Long content splits into multiple messages; files go on the *first* one."""
+        from unittest.mock import AsyncMock
+        adapter = _make_adapter(channel_access="open")
+        channel = self._mock_channel()
+        adapter._resolve_target = AsyncMock(return_value=channel)
+
+        f = tmp_path / "x.txt"
+        f.write_bytes(b"x")
+
+        # Long enough to force splitting (DISCORD_MAX_LENGTH - SPLIT_MARGIN ≈ 1900)
+        long_content = "a" * 4500
+        result = await adapter._op_send({
+            "target": "#general", "content": long_content,
+            "attachments": [{"path": str(f)}],
+        }, None)
+        assert result["ok"] is True
+        assert result["chunks"] >= 2
+
+        calls = channel.send.call_args_list
+        for i, call in enumerate(calls):
+            if i == 0:
+                assert "files" in call.kwargs
+            else:
+                assert "files" not in call.kwargs
+        self._close_sent_files(channel)
+
+    @pytest.mark.asyncio
+    async def test_op_branch_post_rejects_empty_content_no_attachments(self):
+        adapter = _make_adapter(
+            channel_access="open",
+            branch_threads={"beth-test": 9001},
+        )
+        result = await adapter._op_branch_post(
+            {"session_id": "beth-test", "content": ""}, None,
+        )
+        assert result["ok"] is False
+        assert "content or attachments" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_op_branch_post_with_attachment(self, tmp_path):
+        from unittest.mock import AsyncMock, MagicMock
+        adapter = _make_adapter(
+            channel_access="open",
+            branch_threads={"beth-test": 9001},
+        )
+        thread = self._mock_channel()
+        mock_client = MagicMock()
+        mock_client.get_channel = MagicMock(return_value=thread)
+        adapter._client = mock_client
+
+        f = tmp_path / "log.txt"
+        f.write_bytes(b"log content")
+
+        result = await adapter._op_branch_post({
+            "session_id": "beth-test",
+            "content": "see attached",
+            "attachments": [{"path": str(f)}],
+        }, None)
+        assert result["ok"] is True
+        assert result["attachments_sent"] == 1
+        call = thread.send.call_args
+        assert call.kwargs["content"] == "see attached"
+        assert len(call.kwargs["files"]) == 1
+        self._close_sent_files(thread)
+
+
+# ---------------------------------------------------------------------------
 # Voice receive (inbound transcription)
 # ---------------------------------------------------------------------------
 
