@@ -821,7 +821,7 @@ class KilnHarness:
             stderr_callback=_stderr_callback,
             supplemental=self._supplemental,
             base_tools=base_tools,
-            extra_args={"setting-sources": ""},
+            extra_args={"setting-sources": "", "strict-mcp-config": None},
         )
 
     def _agent_hooks(self) -> dict[str, list[HookMatcher]]:
@@ -1169,14 +1169,29 @@ class KilnHarness:
             return None
         warning = (
             f"Model mismatch: expected '{self._expected_model}' "
-            f"but got '{actual_model}'. Update MODEL_ALIASES in prompt.py."
+            f"but got '{actual_model}'."
         )
+        synthetic_like = actual_model.startswith("<") and actual_model.endswith(">")
+        if synthetic_like:
+            warning += (
+                " The backend reported a placeholder/synthetic model label rather than "
+                "a stable model ID, so this is probably a provider/runtime reporting issue, "
+                "not a stale MODEL_ALIASES entry."
+            )
+        else:
+            warning += " Update MODEL_ALIASES in prompt.py if this is a new real model name."
         cutoff = get_knowledge_cutoff(actual_model)
         if cutoff == "unknown":
-            warning += (
-                f" Knowledge cutoff for '{actual_model}' is also unknown — "
-                f"update KNOWLEDGE_CUTOFFS too."
-            )
+            if synthetic_like:
+                warning += (
+                    f" Knowledge cutoff for '{actual_model}' is also unknown, but that is "
+                    "expected for placeholder labels."
+                )
+            else:
+                warning += (
+                    f" Knowledge cutoff for '{actual_model}' is also unknown — "
+                    f"update KNOWLEDGE_CUTOFFS too."
+                )
         return warning
 
     async def interrupt(self):
