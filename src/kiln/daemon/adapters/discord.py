@@ -35,6 +35,10 @@ log = logging.getLogger(__name__)
 DISCORD_MAX_LENGTH = 2000
 SPLIT_MARGIN = 100  # room for (1/N) prefix
 
+# Discord file upload limits
+MAX_FILES_PER_MESSAGE = 10             # Discord API hard limit
+MAX_FILE_SIZE = 10 * 1024 * 1024       # 10 MB — Discord free tier default
+
 
 # ---------------------------------------------------------------------------
 # Filename sanitization
@@ -61,6 +65,76 @@ def _sanitize_filename(name: str) -> str:
         else:
             name = name[:200]
     return name or "attachment"
+
+
+# ---------------------------------------------------------------------------
+# Outbound file upload helpers
+# ---------------------------------------------------------------------------
+
+def _prepare_attachments(
+    attachments: list[str | dict[str, Any]],
+) -> list[tuple[Path, str]]:
+    """Validate attachment descriptors and return ``(path, filename)`` pairs.
+
+    Each descriptor is either a bare string path or a dict
+    ``{"path": str, "filename"?: str}``. Bare strings are treated as
+    ``{"path": <string>}``, so callers can mix:
+    ``["/abs/a.png", {"path": "/abs/b.pdf", "filename": "report.pdf"}]``.
+
+    The ``path`` is resolved and checked (exists, is a regular file,
+    non-empty, ``<= MAX_FILE_SIZE``). ``filename`` overrides the display
+    name; if absent, the path's basename is used. All filenames are
+    sanitized.
+
+    Raises ``ValueError`` with a user-facing message on any failure;
+    callers map this to an RPC error response.
+    """
+    if len(attachments) > MAX_FILES_PER_MESSAGE:
+        raise ValueError(
+            f"Too many attachments: {len(attachments)} (max "
+            f"{MAX_FILES_PER_MESSAGE} per message)"
+        )
+
+    prepared: list[tuple[Path, str]] = []
+    for i, item in enumerate(attachments, start=1):
+        if isinstance(item, str):
+            item = {"path": item}
+        elif not isinstance(item, dict):
+            raise ValueError(
+                f"attachment {i} must be a string path or object with a path"
+            )
+        raw_path = str(item.get("path") or "").strip()
+        if not raw_path:
+            raise ValueError(f"attachment {i} is missing path")
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            raise ValueError(f"Attachment not found: {raw_path}")
+        if not path.is_file():
+            raise ValueError(f"Not a regular file: {raw_path}")
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            raise ValueError(f"Cannot read {raw_path}: {e}") from e
+        if size == 0:
+            raise ValueError(f"File is empty: {raw_path}")
+        if size > MAX_FILE_SIZE:
+            mb = size / (1024 * 1024)
+            raise ValueError(
+                f"File too large: {raw_path} ({mb:.1f} MB; max "
+                f"{MAX_FILE_SIZE // (1024 * 1024)} MB)"
+            )
+        display_name = _sanitize_filename(str(item.get("filename") or path.name))
+        prepared.append((path.resolve(), display_name))
+    return prepared
+
+
+def _build_discord_files(prepared: list[tuple[Path, str]]) -> list[discord.File]:
+    """Open prepared ``(path, filename)`` pairs as ``discord.File`` objects.
+
+    discord.py owns the lifecycle of these handles — ``channel.send(files=...)``
+    closes them. Construct these lazily right before the send call.
+    """
+    return [discord.File(str(p), filename=name) for p, name in prepared]
 
 
 # ---------------------------------------------------------------------------
@@ -2515,18 +2589,69 @@ class DiscordAdapter:
     # Platform ops (D2)
     # ------------------------------------------------------------------
 
+    async def _send_chunked(
+        self,
+        channel: Any,
+        content: str,
+        attachments: list[tuple[Path, str]] | None = None,
+    ) -> list[str]:
+        """Send ``content`` to a Discord channel, splitting as needed.
+
+        Attachments, if any, are attached to the *first* chunk — matching
+        how humans typically share files (file at the top, explanation
+        follows). Returns the list of sent message IDs.
+        """
+        chunks = split_message(content) if content else [""]
+        attachments = attachments or []
+        sent_ids: list[str] = []
+
+        discord_files: list[discord.File] | None = None
+        if attachments:
+            discord_files = _build_discord_files(attachments)
+
+        try:
+            for i, chunk in enumerate(chunks):
+                is_first = (i == 0)
+                send_kwargs: dict[str, Any] = {}
+                if chunk:
+                    send_kwargs["content"] = chunk
+                if is_first and discord_files:
+                    send_kwargs["files"] = discord_files
+                if not send_kwargs:
+                    continue
+                msg = await channel.send(**send_kwargs)
+                sent_ids.append(str(msg.id))
+        finally:
+            if discord_files:
+                for f in discord_files:
+                    f.close()
+
+        return sent_ids
+
     async def _op_send(self, args: dict, ctx: RequestContext | None) -> dict:
         """Send a message to a Discord target.
 
         Args:
             target: channel name (#general), user (@name), or numeric ID
-            content: message text
+            content: message text (may be empty if ``attachments`` provided)
             thread: optional thread name (find-or-create within target)
+            attachments: optional list of attachment descriptors — each item
+                is either a bare string path or a ``{path, filename?}`` dict.
+                Attached to the first chunk of a split message.
         """
         target = args.get("target", "")
         content = args.get("content", "")
-        if not target or not content:
-            return {"ok": False, "error": "target and content are required"}
+        attachments: list[str | dict[str, Any]] = args.get("attachments") or []
+
+        if not target:
+            return {"ok": False, "error": "target is required"}
+        if not content and not attachments:
+            return {"ok": False, "error": "content or attachments are required"}
+
+        try:
+            prepared = _prepare_attachments(attachments) if attachments else []
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
 
         channel = await self._resolve_target(target)
         if not channel:
@@ -2539,13 +2664,17 @@ class DiscordAdapter:
             if thread:
                 channel = thread
 
-        chunks = split_message(content)
-        sent_ids = []
-        for chunk in chunks:
-            msg = await channel.send(chunk)
-            sent_ids.append(str(msg.id))
+        try:
+            sent_ids = await self._send_chunked(channel, content, prepared)
+        except discord.HTTPException as e:
+            return {"ok": False, "error": f"Discord send failed: {e}"}
 
-        return {"ok": True, "message_ids": sent_ids, "chunks": len(chunks)}
+        return {
+            "ok": True,
+            "message_ids": sent_ids,
+            "chunks": len(sent_ids),
+            "attachments_sent": len(prepared),
+        }
 
     async def _op_read_history(self, args: dict, ctx: RequestContext | None) -> dict:
         """Read recent message history from a Discord target."""
@@ -2571,11 +2700,27 @@ class DiscordAdapter:
         return {"ok": True, "messages": messages}
 
     async def _op_branch_post(self, args: dict, ctx: RequestContext | None) -> dict:
-        """Post a message to a session's branch thread."""
+        """Post a message to a session's branch thread.
+
+        Args:
+            session_id: target session (branch thread owner)
+            content: message text (may be empty if ``attachments`` provided)
+            attachments: optional list of attachment descriptors — each item
+                is either a bare string path or a ``{path, filename?}`` dict.
+        """
         session_id = args.get("session_id", "")
         content = args.get("content", "")
-        if not session_id or not content:
-            return {"ok": False, "error": "session_id and content are required"}
+        attachments: list[str | dict[str, Any]] = args.get("attachments") or []
+
+        if not session_id:
+            return {"ok": False, "error": "session_id is required"}
+        if not content and not attachments:
+            return {"ok": False, "error": "content or attachments are required"}
+
+        try:
+            prepared = _prepare_attachments(attachments) if attachments else []
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
 
         thread_id = self._branch_threads.get(session_id)
         if not thread_id:
@@ -2591,10 +2736,17 @@ class DiscordAdapter:
             except discord.NotFound:
                 return {"ok": False, "error": f"Branch thread {thread_id} not found"}
 
-        chunks = split_message(content)
-        for chunk in chunks:
-            await thread.send(chunk)
-        return {"ok": True}
+        try:
+            sent_ids = await self._send_chunked(thread, content, prepared)
+        except discord.HTTPException as e:
+            return {"ok": False, "error": f"Discord send failed: {e}"}
+
+        return {
+            "ok": True,
+            "message_ids": sent_ids,
+            "chunks": len(sent_ids),
+            "attachments_sent": len(prepared),
+        }
 
     async def _op_thread_create(self, args: dict, ctx: RequestContext | None) -> dict:
         """Create a thread in a Discord channel."""
