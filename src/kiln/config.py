@@ -7,26 +7,16 @@ from pathlib import Path
 import yaml
 
 
-# Known tool namespaces. Tools in the agent spec are namespaced as
+# Tool namespaces. Tools in the agent spec are namespaced as
 # "Source::ToolName" to make the source explicit.
 #
-#   Base::<name>    — Claude Code built-in tools (passed via --tools flag)
+#   Base::<name>    — Claude Code built-in tools (passed via SDK --tools flag).
+#                     SDK treats tools=[] as "no built-ins"; tools=None as
+#                     "CC default set". Kiln always passes an explicit list.
 #   Kiln::<name>    — Kiln's standard MCP server tools
 #   <Agent>::<name> — Agent's custom MCP server tools
 #
-NAMESPACE_BASE = "Base"
 NAMESPACE_KILN = "Kiln"
-
-# Claude Code built-in tools that can be referenced as Base::<name>.
-KNOWN_BUILTINS = {
-    "Read",        # built-in Read (images, PDFs, notebooks)
-    "Write",       # built-in Write (replaced by MCP in standard library)
-    "Edit",        # built-in Edit (replaced by MCP in standard library)
-    "Bash",        # built-in Bash (replaced by MCP in standard library)
-    "WebSearch",   # built-in web search
-    "WebFetch",    # built-in web fetch (Haiku summary)
-    "TodoWrite",   # built-in todo/planning
-}
 
 # Default tool set when agent spec doesn't specify.
 DEFAULT_TOOLS = [

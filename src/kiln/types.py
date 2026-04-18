@@ -453,7 +453,11 @@ class BackendConfig:
     # Permission mode (ClaudeBackend-specific, but harmless to carry generically)
     permission_mode: str = "bypassPermissions"
 
-    # Base tools (ClaudeBackend-specific — CC built-in tools passed to SDK)
+    # Base tools (ClaudeBackend-specific — CC built-in tools passed to SDK).
+    # [] means no CC built-ins. The harness always sets this explicitly from
+    # the resolved agent config; the default here is a safety net, not a
+    # source of truth. Do NOT add tool defaults here — put them in
+    # DEFAULT_TOOLS in config.py.
     base_tools: list[str] = field(default_factory=list)
 
     # Extra SDK args (ClaudeBackend-specific passthrough)
