@@ -72,14 +72,19 @@ def _sanitize_filename(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _prepare_attachments(
-    attachments: list[dict[str, Any]],
+    attachments: list[str | dict[str, Any]],
 ) -> list[tuple[Path, str]]:
     """Validate attachment descriptors and return ``(path, filename)`` pairs.
 
-    Each descriptor is a dict ``{"path": str, "filename"?: str}``. The
-    ``path`` is resolved and checked (exists, is a regular file, non-empty,
-    ``<= MAX_FILE_SIZE``). ``filename`` overrides the display name; if
-    absent, the path's basename is used. All filenames are sanitized.
+    Each descriptor is either a bare string path or a dict
+    ``{"path": str, "filename"?: str}``. Bare strings are treated as
+    ``{"path": <string>}``, so callers can mix:
+    ``["/abs/a.png", {"path": "/abs/b.pdf", "filename": "report.pdf"}]``.
+
+    The ``path`` is resolved and checked (exists, is a regular file,
+    non-empty, ``<= MAX_FILE_SIZE``). ``filename`` overrides the display
+    name; if absent, the path's basename is used. All filenames are
+    sanitized.
 
     Raises ``ValueError`` with a user-facing message on any failure;
     callers map this to an RPC error response.
@@ -92,8 +97,12 @@ def _prepare_attachments(
 
     prepared: list[tuple[Path, str]] = []
     for i, item in enumerate(attachments, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"attachment {i} must be an object with a path")
+        if isinstance(item, str):
+            item = {"path": item}
+        elif not isinstance(item, dict):
+            raise ValueError(
+                f"attachment {i} must be a string path or object with a path"
+            )
         raw_path = str(item.get("path") or "").strip()
         if not raw_path:
             raise ValueError(f"attachment {i} is missing path")
@@ -2617,12 +2626,13 @@ class DiscordAdapter:
             target: channel name (#general), user (@name), or numeric ID
             content: message text (may be empty if ``attachments`` provided)
             thread: optional thread name (find-or-create within target)
-            attachments: optional list of ``{path, filename?}`` dicts;
-                attached to the first chunk of a split message.
+            attachments: optional list of attachment descriptors — each item
+                is either a bare string path or a ``{path, filename?}`` dict.
+                Attached to the first chunk of a split message.
         """
         target = args.get("target", "")
         content = args.get("content", "")
-        attachments: list[dict[str, Any]] = args.get("attachments") or []
+        attachments: list[str | dict[str, Any]] = args.get("attachments") or []
 
         if not target:
             return {"ok": False, "error": "target is required"}
@@ -2686,11 +2696,12 @@ class DiscordAdapter:
         Args:
             session_id: target session (branch thread owner)
             content: message text (may be empty if ``attachments`` provided)
-            attachments: optional list of ``{path, filename?}`` dicts
+            attachments: optional list of attachment descriptors — each item
+                is either a bare string path or a ``{path, filename?}`` dict.
         """
         session_id = args.get("session_id", "")
         content = args.get("content", "")
-        attachments: list[dict[str, Any]] = args.get("attachments") or []
+        attachments: list[str | dict[str, Any]] = args.get("attachments") or []
 
         if not session_id:
             return {"ok": False, "error": "session_id is required"}

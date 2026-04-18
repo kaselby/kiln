@@ -2815,10 +2815,44 @@ class TestFileUpload:
                 except Exception:
                     pass
 
-    def test_prepare_rejects_non_dict_descriptor(self):
+    def test_prepare_rejects_non_str_non_dict_descriptor(self):
+        """Descriptors must be either string paths or dicts — anything else rejected."""
         from kiln.daemon.adapters.discord import _prepare_attachments
-        with pytest.raises(ValueError, match="must be an object"):
-            _prepare_attachments(["/not/a/dict.txt"])  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="string path or object"):
+            _prepare_attachments([None])  # type: ignore[list-item]
+        with pytest.raises(ValueError, match="string path or object"):
+            _prepare_attachments([42])  # type: ignore[list-item]
+
+    def test_prepare_accepts_bare_string(self, tmp_path):
+        """Bare string path is treated as {"path": string}."""
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        f = tmp_path / "bare.txt"
+        f.write_bytes(b"data")
+        result = _prepare_attachments([str(f)])
+        assert len(result) == 1
+        path, name = result[0]
+        assert path.exists()
+        assert name == "bare.txt"
+
+    def test_prepare_accepts_mixed_list(self, tmp_path):
+        """Can mix bare string paths and dict descriptors in one list."""
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        a = tmp_path / "a.txt"
+        a.write_bytes(b"aaa")
+        b = tmp_path / "b.bin"
+        b.write_bytes(b"bbb")
+        result = _prepare_attachments(
+            [str(a), {"path": str(b), "filename": "renamed.txt"}]
+        )
+        assert len(result) == 2
+        assert result[0][1] == "a.txt"
+        assert result[1][1] == "renamed.txt"
+
+    def test_prepare_bare_string_nonexistent(self):
+        """Bare string pointing at a missing file still hits the not-found check."""
+        from kiln.daemon.adapters.discord import _prepare_attachments
+        with pytest.raises(ValueError, match="not found"):
+            _prepare_attachments(["/nonexistent/path.dat"])
 
     def test_prepare_rejects_missing_path(self):
         from kiln.daemon.adapters.discord import _prepare_attachments
