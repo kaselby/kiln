@@ -30,7 +30,6 @@ KNOWN_BUILTINS = {
 
 # Default tool set when agent spec doesn't specify.
 DEFAULT_TOOLS = [
-    "Base::WebSearch",
     "Kiln::Bash",
     "Kiln::Read",
     "Kiln::Write",
@@ -234,9 +233,9 @@ class AgentConfig:
 
         Returns a dict mapping namespace → list of tool names:
             {
-                "Base": ["Read", "WebSearch"],
+                "Base": ["Read"],                    # CC built-in tools
                 "Kiln": ["Bash", "Read", "Write", ...],
-                "MyAgent": ["Bash", "CustomTool"],  # agent-specific
+                "MyAgent": ["Bash", "CustomTool"],   # agent-specific
             }
 
         The harness uses this to:

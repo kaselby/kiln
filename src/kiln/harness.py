@@ -697,7 +697,7 @@ class KilnHarness:
 
         # Resolve tools from agent spec
         resolved = self.config.resolve_tools()
-        base_tools = resolved.get("Base", ["WebSearch"])
+        base_tools = resolved.get("Base", [])
 
         # Environment
         venv_path = self.config.home / "venv"

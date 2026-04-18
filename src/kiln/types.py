@@ -453,8 +453,8 @@ class BackendConfig:
     # Permission mode (ClaudeBackend-specific, but harmless to carry generically)
     permission_mode: str = "bypassPermissions"
 
-    # Base tools (ClaudeBackend-specific — e.g. ["WebSearch"])
-    base_tools: list[str] = field(default_factory=lambda: ["WebSearch"])
+    # Base tools (ClaudeBackend-specific — CC built-in tools passed to SDK)
+    base_tools: list[str] = field(default_factory=list)
 
     # Extra SDK args (ClaudeBackend-specific passthrough)
     extra_args: dict[str, Any] = field(default_factory=dict)
