@@ -4641,33 +4641,21 @@ class TestLiveSessionStatePersistence:
 
 class TestConclaveMembership:
 
-
-    def test_parses_briefing(self, tmp_path):
+    def test_reads_conclave_tags(self, tmp_path):
         from kiln.daemon.state import SessionRecord
         adapter = _make_adapter(channel_access="open")
 
-        # Create conclave briefing
-        briefing_dir = tmp_path / "conclaves" / "test-research"
-        briefing_dir.mkdir(parents=True)
-        (briefing_dir / "briefing.md").write_text(
-            "# Briefing\n\n## Members\n"
-            "- **Facilitator:** beth-lead\n"
-            "- **Collaborator:** beth-helper\n"
-            "\n## Goals\nDo stuff\n"
-        )
-
         s = SessionRecord(session_id="beth-lead", agent_name="beth",
-                          agent_home=str(tmp_path), pid=1)
+                          agent_home=str(tmp_path), pid=1,
+                          tags=["conclave:test-research"])
         adapter._daemon.state.presence.register(s)
 
         membership = adapter._get_conclave_membership()
         assert "beth-lead" in membership
-        assert membership["beth-lead"]["role"] == "facilitator"
         assert membership["beth-lead"]["conclave"] == "test-research"
-        assert "beth-helper" in membership
-        assert membership["beth-helper"]["role"] == "collaborator"
+        assert membership["beth-lead"]["role"] == "member"
 
-    def test_empty_when_no_conclaves(self, tmp_path):
+    def test_empty_when_no_tags(self, tmp_path):
         from kiln.daemon.state import SessionRecord
         adapter = _make_adapter(channel_access="open")
         s = SessionRecord(session_id="beth-fox", agent_name="beth",
@@ -4676,21 +4664,34 @@ class TestConclaveMembership:
 
         assert adapter._get_conclave_membership() == {}
 
-    def test_deduplicates_homes(self, tmp_path):
+    def test_multiple_sessions_different_conclaves(self, tmp_path):
         from kiln.daemon.state import SessionRecord
         adapter = _make_adapter(channel_access="open")
 
-        # Two sessions from same home
         s1 = SessionRecord(session_id="beth-fox", agent_name="beth",
-                           agent_home=str(tmp_path), pid=1)
+                           agent_home=str(tmp_path), pid=1,
+                           tags=["conclave:research-a"])
         s2 = SessionRecord(session_id="beth-owl", agent_name="beth",
-                           agent_home=str(tmp_path), pid=2)
+                           agent_home=str(tmp_path), pid=2,
+                           tags=["conclave:research-b"])
         adapter._daemon.state.presence.register(s1)
         adapter._daemon.state.presence.register(s2)
 
-        # Should not crash or double-count
         membership = adapter._get_conclave_membership()
-        assert isinstance(membership, dict)
+        assert len(membership) == 2
+        assert membership["beth-fox"]["conclave"] == "research-a"
+        assert membership["beth-owl"]["conclave"] == "research-b"
+
+    def test_ignores_non_conclave_tags(self, tmp_path):
+        from kiln.daemon.state import SessionRecord
+        adapter = _make_adapter(channel_access="open")
+
+        s = SessionRecord(session_id="beth-fox", agent_name="beth",
+                          agent_home=str(tmp_path), pid=1,
+                          tags=["canonical", "other:thing"])
+        adapter._daemon.state.presence.register(s)
+
+        assert adapter._get_conclave_membership() == {}
 
 
 class TestUsageCaching:

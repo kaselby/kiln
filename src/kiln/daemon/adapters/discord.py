@@ -1844,44 +1844,22 @@ class DiscordAdapter:
         return count
 
     def _get_conclave_membership(self) -> dict[str, dict]:
-        """Parse conclave briefings for display grouping. Soft-fail.
+        """Read conclave membership from live session tags. Soft-fail.
 
         Returns {session_id: {"conclave": name, "role": role}}.
-        Reads from all known agent homes with connected sessions.
+        Looks for ``conclave:<name>`` tags on session records.
+        Tags are scoped to the live session — no stale membership from
+        old briefing files.
         """
-        import re
-        pattern = re.compile(r"\*\*(Facilitator|Collaborator):\*\*\s+(\S+)")
         membership: dict[str, dict] = {}
-
-        seen_homes: set[str] = set()
         for s in self._daemon.state.presence.all_sessions():
-            if s.agent_home in seen_homes:
-                continue
-            seen_homes.add(s.agent_home)
-
-            conclaves_dir = Path(s.agent_home) / "conclaves"
-            if not conclaves_dir.exists():
-                continue
-
-            for briefing in conclaves_dir.glob("*/briefing.md"):
-                name = briefing.parent.name
-                try:
-                    text = briefing.read_text()
-                except OSError:
-                    continue
-                in_members = False
-                for line in text.splitlines():
-                    if line.strip() == "## Members":
-                        in_members = True
-                        continue
-                    if in_members:
-                        if line.startswith("## "):
-                            break
-                        m = pattern.search(line)
-                        if m:
-                            membership[m.group(2)] = {
-                                "conclave": name, "role": m.group(1).lower(),
-                            }
+            for tag in (s.tags or []):
+                if isinstance(tag, str) and tag.startswith("conclave:"):
+                    conclave_name = tag[len("conclave:"):]
+                    membership[s.session_id] = {
+                        "conclave": conclave_name, "role": "member",
+                    }
+                    break  # one conclave per session
         return membership
 
     async def _collect_usage_data(self) -> dict | None:
