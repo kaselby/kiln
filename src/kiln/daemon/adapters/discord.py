@@ -1853,13 +1853,18 @@ class DiscordAdapter:
         """
         membership: dict[str, dict] = {}
         for s in self._daemon.state.presence.all_sessions():
-            for tag in (s.tags or []):
+            session_tags = s.tags or []
+            conclave_name = None
+            role = "member"
+            for tag in session_tags:
                 if isinstance(tag, str) and tag.startswith("conclave:"):
                     conclave_name = tag[len("conclave:"):]
-                    membership[s.session_id] = {
-                        "conclave": conclave_name, "role": "member",
-                    }
-                    break  # one conclave per session
+                elif tag == "conclave-role:facilitator":
+                    role = "facilitator"
+            if conclave_name:
+                membership[s.session_id] = {
+                    "conclave": conclave_name, "role": role,
+                }
         return membership
 
     async def _collect_usage_data(self) -> dict | None:
