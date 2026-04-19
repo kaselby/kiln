@@ -418,18 +418,43 @@ class KilnHarness:
                 ch for ch in self._desired_subscriptions if ch != channel
             ]
 
-    def _cleanup_stale_session_configs(self) -> None:
+    def _clean_stale_agent_state(self, inbox: Path) -> None:
+        """Remove plan and inbox left by a prior session with the same agent name.
 
-        """Remove session config files for sessions that are no longer running.
+        Agent names can collide across days (the namespace is ~2,400 names and
+        collision avoidance only checks the current day).  Without cleanup, a
+        new session inherits stale plans and inbox messages from its namesake.
 
+        Skipped for continuation sessions (they legitimately inherit state from
+        their parent).
+        """
+        plan_file = self.config.plans_path / f"{self.agent_id}.yml"
+        if plan_file.exists():
+            log.info("Removing stale plan from prior session: %s", plan_file.name)
+            try:
+                plan_file.unlink()
+            except OSError:
+                pass
+
+        if inbox.exists() and any(inbox.iterdir()):
+            stale_count = sum(1 for f in inbox.iterdir() if f.suffix == ".md")
+            if stale_count:
+                log.info(
+                    "Removing %d stale inbox message(s) from prior session: %s",
+                    stale_count, inbox.name,
+                )
+            shutil.rmtree(inbox, ignore_errors=True)
+
+    def _cleanup_stale_sessions(self) -> None:
+        """Remove session artifacts for sessions that are no longer running.
+
+        Sweeps session configs, session-state snapshots, and stderr logs.
         Catches orphans left behind by crashes or hard kills where stop()
         never ran.  Uses tmux session list as the source of truth for
         what's alive.
         """
         import subprocess
 
-        config_dir = self.config.home / "state"
-        prefix = "session-config-"
         try:
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}"],
@@ -439,8 +464,29 @@ class KilnHarness:
         except Exception:
             return  # Can't determine live sessions — skip cleanup
 
-        for path in config_dir.glob(f"{prefix}*.yml"):
-            agent_id = path.stem.removeprefix(prefix)
+        config_dir = self.config.home / "state"
+        config_prefix = "session-config-"
+        for path in config_dir.glob(f"{config_prefix}*.yml"):
+            agent_id = path.stem.removeprefix(config_prefix)
+            if agent_id != self.agent_id and agent_id not in live:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+        state_dir = self.config.home / "logs" / "session-state"
+        if state_dir.is_dir():
+            for path in state_dir.glob("*.yml"):
+                agent_id = path.stem
+                if agent_id != self.agent_id and agent_id not in live:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+        logs_dir = self.config.home / "logs"
+        for path in logs_dir.glob("stderr-*.log"):
+            agent_id = path.stem.removeprefix("stderr-")
             if agent_id != self.agent_id and agent_id not in live:
                 try:
                     path.unlink()
@@ -595,8 +641,10 @@ class KilnHarness:
         )
 
 
-        # Set up inbox
+        # Set up inbox — clean stale state from prior sessions with the same name
         inbox = self.config.agent_inbox(self.agent_id)
+        if not self.config.continuation:
+            self._clean_stale_agent_state(inbox)
         inbox.mkdir(parents=True, exist_ok=True)
 
         # Transfer unread messages on self-continuation
@@ -640,8 +688,8 @@ class KilnHarness:
             defaults=config_defaults,
         )
 
-        # Clean up stale session config files from dead sessions
-        self._cleanup_stale_session_configs()
+        # Clean up stale session artifacts from dead sessions
+        self._cleanup_stale_sessions()
 
         # Record desired subscriptions for async restore in start()
         if saved_state and saved_state.get("channel_subscriptions"):
@@ -1220,15 +1268,39 @@ class KilnHarness:
             await self._backend.interrupt()
 
     async def force_stop(self):
-        """Force-kill the backend."""
+        """Force-kill the backend and clean up session-scoped state."""
         if self._shell_cleanup:
             await self._shell_cleanup()
             self._shell_cleanup = None
         if self._backend:
             await self._backend.stop()
             self._backend = None
+        self._close_stderr()
         if self.session_config:
             self.session_config.cleanup()
+        self._cleanup_agent_state()
+
+    def _close_stderr(self) -> None:
+        """Close the stderr log file handle and remove if empty."""
+        if self._stderr_fh:
+            self._stderr_fh.close()
+            self._stderr_fh = None
+        if self._stderr_log and self._stderr_log.exists() and self._stderr_log.stat().st_size == 0:
+            self._stderr_log.unlink()
+            self._stderr_log = None
+
+    def _cleanup_agent_state(self) -> None:
+        """Remove session-scoped state (plan, inbox) so it doesn't leak
+        into a future session that gets the same agent name."""
+        plan_file = self.config.plans_path / f"{self.agent_id}.yml"
+        try:
+            plan_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        inbox = self.config.agent_inbox(self.agent_id)
+        if inbox.exists():
+            shutil.rmtree(inbox, ignore_errors=True)
 
     def commit_memory(self) -> str | None:
         """Commit changed files to git. Returns summary or None."""
@@ -1391,15 +1463,11 @@ class KilnHarness:
         if self._backend:
             await self._backend.stop()
             self._backend = None
-        if self._stderr_fh:
-            self._stderr_fh.close()
-            self._stderr_fh = None
-        if self._stderr_log and self._stderr_log.exists() and self._stderr_log.stat().st_size == 0:
-            self._stderr_log.unlink()
-            self._stderr_log = None
+        self._close_stderr()
         if self.session_config:
             self._continuation_state = self.session_config.all
             self.session_config.cleanup()
+        self._cleanup_agent_state()
 
     async def __aenter__(self):
         await self.start()
