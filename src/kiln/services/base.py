@@ -35,6 +35,21 @@ class DaemonHost(Protocol):
         """Daemon configuration."""
         ...
 
+    @property
+    def management(self) -> Any:
+        """Session lifecycle and introspection actions."""
+        ...
+
+    @property
+    def services(self) -> dict[str, Any]:
+        """Registry of running services (name -> instance).
+
+        Services can look up siblings through this — e.g. a handler
+        registered by the gateway service uses ``daemon.services.get("gateway")``
+        to access the service instance holding surface state.
+        """
+        ...
+
     def register_handler(self, msg_type: str, handler: Any) -> None:
         """Register an RPC handler for a message type."""
         ...

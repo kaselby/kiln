@@ -106,8 +106,11 @@ def load_daemon_config(path: Path | None = None) -> DaemonConfig:
             # Shorthand: `services: { scheduler: true }` enables with defaults.
             config.services[svc_name] = {"enabled": svc_raw}
 
-    # Backward compat: top-level 'adapters' key implies gateway service
-    if "adapters" in raw and "services" not in raw:
+    # Backward compat: top-level 'adapters' key implies gateway service.
+    # Fires whenever top-level adapters is present and gateway isn't already
+    # configured under services — covers partial migrations where the user
+    # added services.scheduler but hasn't moved adapters yet.
+    if "adapters" in raw and "gateway" not in config.services:
         import warnings
         warnings.warn(
             "Top-level 'adapters' in daemon config is deprecated. "
@@ -118,8 +121,6 @@ def load_daemon_config(path: Path | None = None) -> DaemonConfig:
         config.services["gateway"] = {
             "enabled": True,
             "adapters": raw["adapters"],
-            # Preserve top-level users for gateway's use
-            "users": raw.get("users", {}),
         }
 
     return config
