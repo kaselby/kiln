@@ -96,6 +96,7 @@ class TestProtocol:
 class TestPresenceRegistry:
     def test_register_and_lookup(self):
         reg = PresenceRegistry()
+
         record = SessionRecord(
             session_id="beth-swift-crane",
             agent_name="beth",
@@ -131,8 +132,19 @@ class TestPresenceRegistry:
         assert len(reg.by_agent("beth")) == 2
         assert len(reg.by_agent("dalet")) == 1
 
+    def test_summary_includes_tags(self):
+        record = SessionRecord(
+            session_id="beth-tagged-owl",
+            agent_name="beth",
+            agent_home="/home/test/.beth",
+            tags=["canonical", "manager"],
+        )
+        summary = record.to_summary()
+        assert summary["tags"] == ["canonical", "manager"]
+
 
 class TestChannelRegistry:
+
     def test_subscribe_and_query(self):
         reg = ChannelRegistry()
         count = reg.subscribe("test-channel", "beth-a")
@@ -993,7 +1005,51 @@ class TestManagementQueries:
         # "beth-storm" prefixes both — ambiguous
         assert mgmt.resolve_session_ref("beth-storm") is None
 
+    def test_resolve_dm_target_prefers_canonical_tag(self):
+        from kiln.daemon.management import ManagementActions
+        state = DaemonState()
+        config = DaemonConfig()
+        mgmt = ManagementActions(state, config)
+
+        state.presence.register(SessionRecord(
+            session_id="beth-older-owl", agent_name="beth",
+            agent_home="/tmp/beth", pid=100,
+        ))
+        state.presence.register(SessionRecord(
+            session_id="beth-canonical-fox", agent_name="beth",
+            agent_home="/tmp/beth", pid=101, tags=["canonical"],
+        ))
+
+        assert mgmt.resolve_dm_target("beth") == "beth-canonical-fox"
+
+    def test_resolve_dm_target_refreshes_tags_from_session_config(self, tmp_path):
+        from kiln.daemon.management import ManagementActions
+        state = DaemonState()
+        config = DaemonConfig()
+        mgmt = ManagementActions(state, config)
+
+        agent_home = tmp_path / ".beth"
+        state_dir = agent_home / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "session-config-beth-fresh-owl.yml").write_text(
+            yaml.dump({"mode": "supervised", "tags": ["canonical"]})
+        )
+
+        state.presence.register(SessionRecord(
+            session_id="beth-fresh-owl", agent_name="beth",
+            agent_home=str(agent_home), pid=100, tags=[],
+        ))
+        state.presence.register(SessionRecord(
+            session_id="beth-stale-fox", agent_name="beth",
+            agent_home=str(agent_home), pid=101, tags=[],
+        ))
+
+        assert mgmt.resolve_dm_target("beth") == "beth-fresh-owl"
+        assert state.presence.get("beth-fresh-owl").tags == ["canonical"]
+
     def test_resolve_session_ref_with_candidates(self):
+
+
         """resolve_session_ref accepts external candidate set for resume."""
         from kiln.daemon.management import ManagementActions
         state = DaemonState()
@@ -1111,8 +1167,68 @@ async def test_management_set_session_mode(tmp_path):
     assert data["mode"] == "yolo"
 
 
+def test_load_live_session_metadata_reads_mode_and_tags(tmp_path):
+
+    from kiln.daemon.state import _load_live_session_metadata
+
+    agent_home = tmp_path / ".beth"
+    state_dir = agent_home / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "session-config-beth-tagged-owl.yml").write_text(
+        yaml.dump({"mode": "yolo", "tags": ["canonical", "manager"]})
+    )
+
+    mode, tags = _load_live_session_metadata(agent_home, "beth-tagged-owl")
+    assert mode == "yolo"
+    assert tags == ["canonical", "manager"]
+
+
+def test_load_live_session_metadata_soft_fails_on_bad_tags(tmp_path):
+    from kiln.daemon.state import _load_live_session_metadata
+
+    agent_home = tmp_path / ".beth"
+    state_dir = agent_home / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "session-config-beth-tagged-owl.yml").write_text(
+        yaml.dump({"mode": 123, "tags": "canonical"})
+    )
+
+    mode, tags = _load_live_session_metadata(agent_home, "beth-tagged-owl")
+    assert mode == "supervised"
+    assert tags == []
+
+
+def test_list_sessions_refreshes_mode_and_tags_from_session_config(tmp_path):
+    from kiln.daemon.management import ManagementActions
+
+    agent_home = tmp_path / ".beth"
+    state_dir = agent_home / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "session-config-beth-fresh-owl.yml").write_text(
+        yaml.dump({"mode": "yolo", "tags": ["canonical", "manager"]})
+    )
+
+    state = DaemonState()
+    config = DaemonConfig()
+    mgmt = ManagementActions(state, config)
+    state.presence.register(SessionRecord(
+        session_id="beth-fresh-owl",
+        agent_name="beth",
+        agent_home=str(agent_home),
+        mode="supervised",
+        tags=[],
+    ))
+
+    sessions = mgmt.list_sessions(agent="beth")
+    assert sessions[0]["mode"] == "yolo"
+    assert sessions[0]["tags"] == ["canonical", "manager"]
+
+
 @pytest.mark.asyncio
 async def test_management_set_invalid_mode():
+
+
+
     from kiln.daemon.management import ManagementActions
     state = DaemonState()
     config = DaemonConfig()

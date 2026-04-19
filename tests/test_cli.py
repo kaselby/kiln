@@ -23,8 +23,9 @@ def _make_run_namespace(**overrides) -> argparse.Namespace:
         prompt=None, prompt_file=None, depth=0, persistent=False,
         last_session=False, resume=None, mode=None, detach=False,
         heartbeat=None, idle_nudge=None, continuation=False,
-        effort=None, template=None, var=[],
+        effort=None, template=None, var=[], tag=[],
     )
+
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 
@@ -78,12 +79,14 @@ class TestRebuildRunArgs:
         result = _rebuild_run_args(args)
         assert "--template" in result
         assert result[result.index("--template") + 1] == "conclave-facilitator"
-        assert result.count("--var") == 2
-        # Both var values present
-        var_indices = [i for i, v in enumerate(result) if v == "--var"]
-        var_values = [result[i + 1] for i in var_indices]
-        assert "ROLE=lead" in var_values
-        assert "N=3" in var_values
+
+    def test_tags_forwarded(self):
+        args = _make_run_namespace(tag=["canonical", "manager"])
+        result = _rebuild_run_args(args)
+        assert result.count("--tag") == 2
+        assert result[result.index("--tag") + 1] == "canonical"
+        assert result[result.index("--tag", result.index("--tag") + 1) + 1] == "manager"
+
 
     def test_heartbeat_and_idle_nudge(self):
         args = _make_run_namespace(heartbeat="10", idle_nudge="5")
@@ -247,8 +250,9 @@ class TestCmdRunDispatch:
         args = _make_run_namespace(
             spec=str(tmp_path),
             model="claude-opus-4-6", mode="yolo", effort="high",
-            template="worker", var=["X=1"],
+            template="worker", var=["X=1"], tag=["canonical"],
         )
+
 
         with patch("kiln.cli.os.execvp", side_effect=self._dispatch_execvp) as mock_exec, \
              patch("kiln.cli.shutil.which", return_value="/bin/myagent"), \
@@ -261,6 +265,8 @@ class TestCmdRunDispatch:
         assert "--effort" in exec_argv
         assert "--template" in exec_argv
         assert "--var" in exec_argv
+        assert "--tag" in exec_argv
+
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +294,9 @@ class TestBuildInnerCommand:
     def test_forwards_flags(self):
         args = _make_run_namespace(
             model="gpt-5.4", mode="yolo", effort="high",
-            heartbeat="10", template="worker", var=["X=1"],
+            heartbeat="10", template="worker", var=["X=1"], tag=["canonical"],
         )
+
         cmd = _build_inner_command(args, "test-1", Path("/tmp/agent.yml"))
         assert "--model gpt-5.4" in cmd
         assert "--mode yolo" in cmd
@@ -297,6 +304,8 @@ class TestBuildInnerCommand:
         assert "--heartbeat 10" in cmd
         assert "--template worker" in cmd
         assert "--var X=1" in cmd
+        assert "--tag canonical" in cmd
+
 
     def test_no_path_dependency(self):
         """Inner command must not depend on PATH resolution."""

@@ -1,11 +1,16 @@
-"""Per-session runtime configuration.
+"""Authoritative live per-session configuration.
 
 Each active session gets a YAML config file that the harness reads on
-every access.  The agent can modify the file mid-session (via Bash/Write)
+ every access. The agent can modify the file mid-session (via Bash/Write)
 and changes take effect immediately — no restart needed.
 
-Kiln defines core tunables (heartbeat, show_thinking).  Agent harnesses
-extend with their own defaults (e.g. worklog_interval).
+This file is the authoritative live source for mutable per-session state
+(mode, heartbeat, and similar session-scoped settings). Other artifacts,
+such as ``logs/session-state/<agent-id>.yml``, may snapshot values from it
+for resume, status, or observability, but they are derivative copies rather
+than a second source of truth.
+
+Kiln defines core defaults. Agent harnesses extend with their own defaults.
 
 File location: ``state/session-config-{agent-id}.yml``
 """
@@ -16,13 +21,18 @@ import yaml
 
 
 class SessionConfig:
-    """Per-session runtime config backed by a YAML file.
+    """Authoritative live per-session state backed by a YAML file.
 
     Reads from disk on every ``get()`` call so agent-side writes take
-    effect immediately.  Writes are atomic (write-then-rename) to avoid
+    effect immediately. Writes are atomic (write-then-rename) to avoid
     partial reads.
 
+    This surface is intended for runtime-editable session state. Snapshot
+    artifacts may copy values from it, but should not be treated as an
+    independent authority.
+
     Usage::
+
 
         config = SessionConfig(
             path=home / "state" / f"session-config-{agent_id}.yml",
@@ -33,12 +43,13 @@ class SessionConfig:
 
     """
 
-    # Core tunables with kiln-level defaults.
-    # Agent harnesses extend with their own (e.g. a harness might add show_thinking,
-    # worklog_interval).
+    # Core defaults for live mutable session state.
+    # Agent harnesses extend with their own defaults.
     CORE_DEFAULTS: dict[str, object] = {
         "heartbeat": 0,  # seconds — fixed interval, 0 = disabled
+        "tags": [],      # routing/presence tags for this live session
     }
+
 
 
     def __init__(self, path: Path, defaults: dict | None = None):

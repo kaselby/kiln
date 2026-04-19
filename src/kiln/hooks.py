@@ -45,6 +45,16 @@ def create_inbox_check_hook(
         if not inbox_path.exists():
             return {}
 
+        # Promote durable scheduler fallback messages to main inbox
+        scheduled_dir = inbox_path / "_scheduled"
+        if scheduled_dir.is_dir():
+            for sf in sorted(scheduled_dir.iterdir()):
+                if sf.is_file() and sf.suffix == ".md":
+                    try:
+                        sf.rename(inbox_path / sf.name)
+                    except OSError:
+                        pass
+
         summaries = []
         for msg_file in sorted(inbox_path.iterdir()):
             if not msg_file.is_file() or msg_file.suffix != ".md":

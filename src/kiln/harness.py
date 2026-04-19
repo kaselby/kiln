@@ -337,24 +337,33 @@ class KilnHarness:
         """Register TUI callbacks for permission handling."""
         self._permission_callbacks = (get_mode, request_permission)
 
-    # -- Session state persistence -----------------------------------------
+    # -- Session snapshot persistence --------------------------------------
+
 
     @property
     def _session_state_path(self) -> Path:
         return self.config.home / "logs" / "session-state" / f"{self.agent_id}.yml"
 
-    def _save_session_state(
+    def _save_session_state_snapshot(
         self,
         system_prompt: str,
-        session_config: dict | None = None,
-        channel_subscriptions: list[str] | None = None,
+        session_config_snapshot: dict | None = None,
+        channel_subscriptions_snapshot: list[str] | None = None,
         context_tokens: int | None = None,
     ) -> None:
+        """Write the derived session snapshot used for resume/status surfaces.
+
+        This file is not authoritative live state. Mutable per-session settings
+        live in ``state/session-config-<agent_id>.yml`` and may be copied here
+        only as a snapshot for resume, continuation, or observability.
+        """
         state: dict = {"system_prompt": system_prompt}
-        if session_config is not None:
-            state["session_config"] = session_config
-        if channel_subscriptions is not None:
-            state["channel_subscriptions"] = channel_subscriptions
+
+        if session_config_snapshot is not None:
+            state["session_config"] = session_config_snapshot
+        if channel_subscriptions_snapshot is not None:
+            state["channel_subscriptions"] = channel_subscriptions_snapshot
+
         if context_tokens is not None:
             state["context_tokens"] = context_tokens
 
@@ -368,8 +377,10 @@ class KilnHarness:
         tmp.write_text(yaml.dump(state, Dumper=_BlockDumper, default_flow_style=False, sort_keys=False, allow_unicode=True))
         tmp.rename(path)
 
-    def _load_session_state(self) -> dict | None:
+    def _load_session_state_snapshot(self) -> dict | None:
+        """Load the derived session snapshot used for resume/continuation."""
         path = self._session_state_path
+
         if not path.exists():
             return None
         try:
@@ -379,11 +390,12 @@ class KilnHarness:
             return None
 
     def _snapshot_channel_subscriptions(self) -> list[str]:
-        """Snapshot channel subscriptions for session state persistence.
+        """Return a derived snapshot of desired channel subscriptions.
 
         Uses the harness's desired subscriptions list, which is kept in
         sync with daemon state on subscribe/unsubscribe operations.
         """
+
         return list(self._desired_subscriptions)
 
     async def _restore_channel_subscriptions(self, subscriptions: list[str]) -> None:
@@ -504,8 +516,10 @@ class KilnHarness:
 
     def _build_backend_config(self) -> BackendConfig:
         """Build backend-agnostic config from agent spec."""
-        # Restore saved state if resuming (--resume and --last both set resume_session).
-        saved_state = self._load_session_state() if self.config.resume_session else None
+        # Restore the derived session snapshot when resuming.
+        # Live mutable session state still comes from session-config.
+        saved_state = self._load_session_state_snapshot() if self.config.resume_session else None
+
 
         # On self-continuation, carry over channel subscriptions from parent session.
         # The parent's state file has them, but we can't use resume_session (different
@@ -571,13 +585,15 @@ class KilnHarness:
                 full_prompt += "\n\n" + tool_docs
             full_prompt += session_ctx + "".join(context_parts)
 
-        # Save session state — on resume, preserve saved config + channels so a crash
-        # between here and shutdown doesn't lose them. Updated again at shutdown.
-        self._save_session_state(
+        # Write an initial derived session snapshot so resume/status surfaces exist
+        # even if the session exits early. Values copied here are snapshots, not
+        # authoritative live state.
+        self._save_session_state_snapshot(
             full_prompt,
-            session_config=saved_state.get("session_config") if saved_state else None,
-            channel_subscriptions=saved_state.get("channel_subscriptions") if saved_state else None,
+            session_config_snapshot=saved_state.get("session_config") if saved_state else None,
+            channel_subscriptions_snapshot=saved_state.get("channel_subscriptions") if saved_state else None,
         )
+
 
         # Set up inbox
         inbox = self.config.agent_inbox(self.agent_id)
@@ -605,13 +621,17 @@ class KilnHarness:
         self.session_control = SessionControl()
         self._supplemental = SupplementalContent()
 
-        # Per-session runtime config — seeded from harness config, agent-writable.
-        # On resume, saved values override harness defaults so state is restored.
+        # Authoritative live per-session config — seeded from harness config,
+        # agent-writable at runtime. On resume, the prior snapshot provides seed
+        # values so live session-config can be reconstructed.
+
         config_defaults = {
             "mode": self._initial_mode.value,
             "heartbeat": self.config.heartbeat,
             "stream_timeout": self.config.stream_timeout,
+            "tags": list(self.config.tags),
         }
+
 
         if saved_state and saved_state.get("session_config"):
             config_defaults.update(saved_state["session_config"])
@@ -1331,12 +1351,18 @@ class KilnHarness:
     # No daemon deregistration needed — tmux reconciliation handles cleanup.
 
     def _snapshot_session_state(self) -> None:
-        """Update the session state file with final config, channels, and context."""
+        """Refresh the derived session snapshot from live session state.
+
+        The session snapshot supports resume, continuation, and status surfaces.
+        It may copy live config values, but the authoritative mutable session
+        state remains the session-config file.
+        """
+
 
         path = self._session_state_path
         if not path.exists():
             return
-        state = self._load_session_state() or {}
+        state = self._load_session_state_snapshot() or {}
         if self.session_config:
             state["session_config"] = self.session_config.all
         state["channel_subscriptions"] = self._snapshot_channel_subscriptions()
@@ -1351,8 +1377,9 @@ class KilnHarness:
             pass
 
     def persist_live_session_state(self) -> None:
-        """Persist the current session state so external status surfaces can read it live."""
+        """Persist the current derived session snapshot for external readers."""
         self._snapshot_session_state()
+
 
     async def stop(self):
         """Disconnect the agent session and clean up resources."""

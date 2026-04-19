@@ -26,13 +26,41 @@ import yaml
 log = logging.getLogger(__name__)
 
 
+def _load_live_session_metadata(agent_home: Path, session_id: str) -> tuple[str, list[str]]:
+    """Read live mutable session metadata from session-config.
+
+    Returns ``(mode, tags)``. Missing files or malformed data soft-fail to
+    defaults so presence discovery stays robust.
+    """
+    config_path = agent_home / "state" / f"session-config-{session_id}.yml"
+    if not config_path.exists():
+        return "supervised", []
+    try:
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return "supervised", []
+
+    mode = data.get("mode", "supervised")
+    if not isinstance(mode, str) or not mode:
+        mode = "supervised"
+
+    raw_tags = data.get("tags", [])
+    if isinstance(raw_tags, list):
+        tags = [t for t in raw_tags if isinstance(t, str) and t]
+    else:
+        tags = []
+
+    return mode, tags
+
+
+
 # ---------------------------------------------------------------------------
 # Session presence
 # ---------------------------------------------------------------------------
 
 @dataclass
 class SessionRecord:
-    """A known live agent session (derived from tmux + files)."""
+    """A known live agent session (derived from tmux + live session state files)."""
 
     session_id: str
     agent_name: str
@@ -43,7 +71,9 @@ class SessionRecord:
     mode: str = "supervised"
     status: str = "running"
     thread_ids: dict[str, str] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
 
     def touch(self) -> None:
         self.last_seen_at = datetime.now(timezone.utc)
@@ -58,7 +88,9 @@ class SessionRecord:
             "mode": self.mode,
             "status": self.status,
             "thread_ids": self.thread_ids,
+            "tags": list(self.tags),
         }
+
 
 
 class PresenceRegistry:
@@ -356,11 +388,15 @@ class DaemonState:
                 parts = tmux_name.split("-")
                 if len(parts) >= 3 and parts[0] in agents_registry:
                     agent_home = agents_registry[parts[0]]
+                    mode, tags = _load_live_session_metadata(agent_home, tmux_name)
                     record = SessionRecord(
                         session_id=tmux_name,
                         agent_name=parts[0],
                         agent_home=str(agent_home),
+                        mode=mode,
+                        tags=tags,
                     )
+
                     self.presence.register(record)
                     discovered.append(tmux_name)
 

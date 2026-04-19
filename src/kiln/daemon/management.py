@@ -1,4 +1,4 @@
-"""Daemon management actions — session lifecycle, status, bridges.
+"""Daemon management actions — session lifecycle, status, queries.
 
 These are the platform-agnostic management semantics that live in the
 daemon, not in any adapter. Adapters consume management events and
@@ -23,7 +23,7 @@ import yaml
 
 from . import protocol as proto
 from .config import DaemonConfig, load_agents_registry
-from .state import DaemonState
+from .state import DaemonState, _load_live_session_metadata
 
 log = logging.getLogger(__name__)
 
@@ -56,12 +56,39 @@ class ManagementActions:
 
     # ----- Session queries -----
 
+    def _refresh_session_record(self, record) -> None:
+        """Refresh cached live session metadata from session-config.
+
+        Presence is a cache. The authoritative live mutable session state lives
+        in the session-config file, so tag- or mode-sensitive reads should
+        refresh from disk before making routing/status decisions.
+        """
+        if not record or not record.agent_home:
+            return
+        mode, tags = _load_live_session_metadata(Path(record.agent_home), record.session_id)
+        record.mode = mode
+        record.tags = tags
+
+    def _refresh_presence_for_agent(self, agent: str) -> list:
+        sessions = self._state.presence.by_agent(agent)
+        for record in sessions:
+            self._refresh_session_record(record)
+        return sessions
+
+    def _refresh_session_summary(self, session_id: str):
+        record = self._state.presence.get(session_id)
+        if record:
+            self._refresh_session_record(record)
+        return record
+
     def list_sessions(
         self,
         agent: str | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         sessions = self._state.presence.all_sessions()
+        for record in sessions:
+            self._refresh_session_record(record)
         if agent:
             sessions = [s for s in sessions if s.agent_name == agent]
         if status:
@@ -69,10 +96,11 @@ class ManagementActions:
         return [s.to_summary() for s in sessions]
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
-        record = self._state.presence.get(session_id)
+        record = self._refresh_session_summary(session_id)
         if record:
             return record.to_summary()
         return None
+
 
     def resolve_dm_target(self, agent: str) -> str | None:
         """Resolve the single session that should receive platform DMs for an agent.
@@ -82,21 +110,56 @@ class ManagementActions:
         2. Most-recently-connected session for the agent.
         3. None if no sessions are connected.
 
-        Canonical detection: checks session metadata for ``canonical=True``.
-        Set during registration if the agent claims canonical status.
+        Canonical detection currently checks the live session tag set for
+        ``canonical``.
+
         """
-        sessions = self._state.presence.by_agent(agent)
+        sessions = self._refresh_presence_for_agent(agent)
         if not sessions:
             return None
 
-        # Prefer canonical
+
+        # Prefer canonical-tagged sessions
         for s in sessions:
-            if s.metadata.get("canonical"):
+            if "canonical" in s.tags:
                 return s.session_id
+
 
         # Fallback: most recently seen
         sessions.sort(key=lambda s: s.first_seen_at, reverse=True)
         return sessions[0].session_id
+
+    def resolve_by_tags(
+        self,
+        agent: str,
+        tags: list[str] | tuple[str, ...],
+        match: str = "any",
+    ) -> list["SessionRecord"]:
+        """Resolve live sessions for an agent matching the given tags.
+
+        Args:
+            agent: Agent name to filter by.
+            tags: Tags to match against session tags.
+            match: "any" — session has at least one of the tags.
+                   "all" — session has all of the tags.
+
+        Returns refreshed SessionRecords for matching sessions.
+        If tags is empty, returns all live sessions for the agent.
+        """
+        sessions = self._refresh_presence_for_agent(agent)
+        if not tags:
+            return sessions
+        matched = []
+        tag_set = set(tags)
+        for s in sessions:
+            session_tags = set(s.tags)
+            if match == "all":
+                if tag_set <= session_tags:
+                    matched.append(s)
+            else:  # "any"
+                if tag_set & session_tags:
+                    matched.append(s)
+        return matched
 
     def list_historical_sessions(self, agent: str) -> set[str]:
         """List all historical session IDs for an agent.
@@ -194,6 +257,7 @@ class ManagementActions:
         mode: str = "yolo",
         prompt: str | None = None,
         resume_id: str | None = None,
+        template: str | None = None,
     ) -> list[str] | None:
         """Build the command to launch/resume an agent session.
 
@@ -216,6 +280,8 @@ class ManagementActions:
             cmd.extend(["--prompt", prompt])
         if resume_id:
             cmd.extend(["--resume", resume_id])
+        if template:
+            cmd.extend(["--template", template])
         return cmd
 
 
@@ -244,10 +310,11 @@ class ManagementActions:
         agent: str,
         prompt: str | None = None,
         mode: str | None = None,
+        template: str | None = None,
         requested_by: str | None = None,
     ) -> ActionResult:
         """Spawn a new agent session."""
-        cmd = self._build_launch_cmd(agent, mode=mode or "yolo", prompt=prompt)
+        cmd = self._build_launch_cmd(agent, mode=mode or "yolo", prompt=prompt, template=template)
         if not cmd:
             return ActionResult(False, f"Cannot find '{agent}' on PATH")
         log.info("Spawning %s session (by %s)", agent, requested_by or "daemon")

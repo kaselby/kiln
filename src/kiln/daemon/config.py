@@ -41,15 +41,6 @@ class UserConfig:
 
 
 @dataclass
-class AdapterConfig:
-    """Configuration for a single platform adapter."""
-    adapter_id: str
-    platform: str
-    enabled: bool = True
-    config: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class DaemonConfig:
     """Top-level daemon configuration.
 
@@ -68,6 +59,11 @@ class DaemonConfig:
 
     users: dict[str, UserConfig] = field(default_factory=dict)
     services: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def kiln_home(self) -> Path:
+        """Root kiln directory — services use this to locate their state files."""
+        return KILN_ROOT
 
 
 def load_daemon_config(path: Path | None = None) -> DaemonConfig:
@@ -101,10 +97,14 @@ def load_daemon_config(path: Path | None = None) -> DaemonConfig:
                 default_platform=user_raw.get("default_platform", ""),
             )
 
-    # Services — each service gets its raw config dict
+    # Services — each service gets its raw config dict (services
+    # parse their own config; daemon stays out of their schemas).
     for svc_name, svc_raw in raw.get("services", {}).items():
         if isinstance(svc_raw, dict):
             config.services[svc_name] = svc_raw
+        elif isinstance(svc_raw, bool):
+            # Shorthand: `services: { scheduler: true }` enables with defaults.
+            config.services[svc_name] = {"enabled": svc_raw}
 
     # Backward compat: top-level 'adapters' key implies gateway service
     if "adapters" in raw and "services" not in raw:

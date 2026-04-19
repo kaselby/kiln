@@ -143,7 +143,12 @@ class AgentConfig:
     # programmatic config.template_vars["key"] = "value" both land here.
     template_vars: dict[str, str] = field(default_factory=dict)
 
+    # Startup/default tags for the live session-config file. These seed the
+    # session's own mutable state at launch time.
+    tags: list[str] = field(default_factory=list)
+
     # --- Derived paths ---
+
 
     @property
     def identity_path(self) -> Path:
@@ -285,12 +290,17 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
         "scripts_dir", "skills_dir", "worklogs_dir", "sessions_dir",
         "inbox_dir", "plans_dir", "mcp_server", "hook_visibility",
         "orientation", "cleanup", "initial_mode", "cli",
+
     ]:
         if field_name in raw:
             setattr(config, field_name, raw[field_name])
 
     if "startup" in raw:
         config.startup = raw["startup"]
+
+    if "tags" in raw and isinstance(raw["tags"], list):
+        config.tags = [t for t in raw["tags"] if isinstance(t, str) and t]
+
 
     # Tools — flat namespaced list or structured dict
     tools_raw = raw.get("tools")
