@@ -25,6 +25,7 @@ MODEL_ALIASES = {
 # Model ID prefix → knowledge cutoff date. Prefixes are matched in order,
 # so more specific prefixes should come first.
 KNOWLEDGE_CUTOFFS = {
+    "claude-opus-4-7": "Jan 2026",
     "claude-opus-4-6": "May 2025",
     "claude-opus-4-5": "May 2025",
     "claude-opus-4": "May 2025",
@@ -35,6 +36,13 @@ KNOWLEDGE_CUTOFFS = {
     "claude-haiku-4": "May 2025",
     "claude-3-5": "Early 2024",
     "claude-3": "Early 2024",
+    "gpt-5.4": "August 31, 2025",
+    "gpt-5": "unknown",
+    "gpt-4.1": "unknown",
+    "gpt-4o": "unknown",
+    "o4-mini": "unknown",
+    "o3": "unknown",
+    "o1": "unknown",
 }
 
 
