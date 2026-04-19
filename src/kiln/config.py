@@ -89,6 +89,18 @@ class AgentConfig:
     # 0 = disabled.
     stream_timeout: float = 0.0
 
+    # Context limit — behavioral ceiling on context tokens.
+    #   "off"  — no enforcement; nothing fires.
+    #   "soft" — at the limit: warn in TUI, disable auto-firing (inbox,
+    #            heartbeat, idle-nudge), interrupt current turn, ping owner
+    #            on Discord. User/agent can still interact.
+    #   "hard" — same as soft, plus refuse to send further turns.
+    # Default applies regardless of the model's true max context — raising
+    # the cap is an explicit opt-in. Both values are runtime-mutable via
+    # session_config.
+    context_limit_mode: str = "soft"
+    context_limit_tokens: int = 200_000
+
     # Tools — namespaced list: "Base::Read", "Kiln::Bash", "MyAgent::CustomTool"
     tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
     mcp_server: str | None = None     # path to custom MCP server module (relative to home)
@@ -341,6 +353,16 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
         val = raw[st_key]
         if isinstance(val, (int, float)) and not isinstance(val, bool):
             config.stream_timeout = max(float(val), 0.0)
+
+    # Context limit — mode + cap in tokens
+    if "context_limit_mode" in raw:
+        mode = str(raw["context_limit_mode"]).lower()
+        if mode in ("off", "soft", "hard"):
+            config.context_limit_mode = mode
+    if "context_limit_tokens" in raw:
+        val = raw["context_limit_tokens"]
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            config.context_limit_tokens = int(val)
 
 
 def load_agent_spec(spec_path: Path) -> AgentConfig:

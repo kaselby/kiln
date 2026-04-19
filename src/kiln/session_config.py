@@ -48,6 +48,8 @@ class SessionConfig:
     CORE_DEFAULTS: dict[str, object] = {
         "heartbeat": 0,  # seconds — fixed interval, 0 = disabled
         "tags": [],      # routing/presence tags for this live session
+        "context_limit_mode": "soft",     # "off" | "soft" | "hard"
+        "context_limit_tokens": 200_000,  # behavioral cap; applies to all modes
     }
 
 

@@ -217,9 +217,28 @@ STATUS_REFRESH_INTERVAL = 60  # seconds between periodic refreshes
 STATUS_REFRESH_DEBOUNCE = 5   # minimum seconds between event-triggered refreshes
 USAGE_CACHE_TTL = 600         # 10 min cache for subscription usage data
 
-# Max context tokens — used by old CC JSONL context% calculation.
-# This is a Beth/Claude-specific assumption; other backends may differ.
-MAX_CONTEXT_TOKENS = 200_000
+# Fallback context-limit denominator for status % display when the session
+# config can't be read. The authoritative value lives in each session's
+# session-config-<id>.yml under `context_limit_tokens` and is read per-call.
+_DEFAULT_CONTEXT_LIMIT = 200_000
+
+
+def _read_context_limit(agent_home: Path, session_id: str) -> int:
+    """Read the session's configured context limit, falling back to the default."""
+    if not agent_home:
+        return _DEFAULT_CONTEXT_LIMIT
+    config_path = agent_home / "state" / f"session-config-{session_id}.yml"
+    if not config_path.exists():
+        return _DEFAULT_CONTEXT_LIMIT
+    try:
+        import yaml
+        data = yaml.safe_load(config_path.read_text()) or {}
+        val = data.get("context_limit_tokens")
+        if isinstance(val, (int, float)) and val > 0:
+            return int(val)
+    except Exception:
+        pass
+    return _DEFAULT_CONTEXT_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +1773,7 @@ class DiscordAdapter:
                 state = yaml.safe_load(session_state_path.read_text()) or {}
                 context_tokens = state.get("context_tokens")
                 if isinstance(context_tokens, int) and context_tokens > 0:
-                    return (context_tokens, MAX_CONTEXT_TOKENS)
+                    return (context_tokens, _read_context_limit(agent_home, session_id))
             except Exception:
                 pass
 
@@ -1807,7 +1826,7 @@ class DiscordAdapter:
                 + last_usage.get("cache_read_input_tokens", 0)
                 + last_usage.get("cache_creation_input_tokens", 0)
             )
-            return (total, MAX_CONTEXT_TOKENS)
+            return (total, _read_context_limit(agent_home, session_id))
         except OSError:
             return None
 

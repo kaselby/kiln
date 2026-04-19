@@ -76,9 +76,6 @@ from ..permissions import (
 # Max lines of tool result output to show inline
 TOOL_RESULT_MAX_LINES = 10
 
-# Context token threshold for pausing auto-delivery and heartbeats
-CONTEXT_PAUSE_THRESHOLD = 180_000
-
 
 # Semantic style map for the TUI
 TUI_STYLE = Style.from_dict({
@@ -600,6 +597,16 @@ class KilnApp:
         # Clipboard image paste: queued images sent with the next message
         self._pending_images: list[Path] = []
 
+        # Context limit: tracks the last limit value that fired the crossing
+        # handler. Stored as an int (not bool) so that raising the cap mid-session
+        # re-arms the trigger at the new limit. None means the handler has never
+        # fired this session. Compared against current limit on every usage update.
+        self._last_fired_context_limit: int | None = None
+        # Persistent red banner shown once the limit is crossed, dismissed on
+        # drop-back below limit only if still not-yet-rearmed (i.e. banner stays
+        # until someone raises the cap past tokens or the session ends).
+        self._context_limit_banner_active: bool = False
+
         # Build the prompt_toolkit Application
         self._input_buffer = Buffer(multiline=True)
         kb = self._build_keybindings()
@@ -825,11 +832,17 @@ class KilnApp:
         if getattr(self._harness.config, "ephemeral", False):
             parts.append("<err>ephemeral</err>")
         if self._context_tokens:
-            parts.append(f"{_fmt_tokens(self._context_tokens)} / 200k")
+            limit_mode = self._get_context_limit_mode()
+            if limit_mode == "off":
+                parts.append(f"{_fmt_tokens(self._context_tokens)} / \u221e")
+            else:
+                parts.append(
+                    f"{_fmt_tokens(self._context_tokens)} / {_fmt_tokens(self._get_context_limit())}"
+                )
 
-        # Context budget warning
-        if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
-            parts.append("<err>\u26a0 auto-delivery paused</err>")
+        # Context limit banner — persistent once crossed
+        if self._context_limit_banner_active:
+            parts.append("<err>\u26a0 CONTEXT LIMIT REACHED \u2014 WRAP UP SESSION SOON</err>")
 
         # Pending message count
         if not self._receiving:
@@ -1207,6 +1220,24 @@ class KilnApp:
         images: list[Path] | None = None,
     ) -> asyncio.Task:
         """Start a new turn task and make it the active dispatcher-owned turn."""
+        # Hard-mode context limit: refuse to dispatch new turns past the cap.
+        # This replaces the unrecoverable CLI pre-flight crash with a clean
+        # in-TUI error. Soft mode only gates auto-firing (handled elsewhere).
+        if (
+            self._get_context_limit_mode() == "hard"
+            and self._context_tokens >= self._get_context_limit()
+        ):
+            _tprint(
+                "\n<err>\u26a0 CONTEXT LIMIT EXCEEDED \u2014 turn blocked "
+                "({} / {}). Raise `context_limit_tokens` in session config to continue.</err>",
+                _fmt_tokens(self._context_tokens),
+                _fmt_tokens(self._get_context_limit()),
+            )
+            # Return a done task so callers that await it don't hang.
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            fut.set_result(None)
+            return fut  # type: ignore[return-value]
+
         self._active_turn_generation += 1
         generation = self._active_turn_generation
         self._receiving = True
@@ -1400,7 +1431,7 @@ class KilnApp:
         min_wait = 2.0 if self._last_turn_source == "user" else 1.0
         if elapsed < min_wait:
             return False
-        if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
+        if self._context_limit_exceeded():
             return False
         if not inbox.exists():
             return False
@@ -1485,6 +1516,37 @@ class KilnApp:
         except (ValueError, TypeError):
             pass
 
+    # ---- Context limit ----
+
+    def _get_context_limit_mode(self) -> str:
+        """Read context limit mode from session config. Lives per-call for
+        live polling — changes take effect immediately."""
+        sc = self._harness.session_config
+        if sc is None:
+            return "soft"
+        mode = str(sc.get("context_limit_mode", "soft")).lower()
+        if mode not in ("off", "soft", "hard"):
+            return "soft"
+        return mode
+
+    def _get_context_limit(self) -> int:
+        """Read context limit (tokens) from session config. Lives per-call
+        for live polling."""
+        sc = self._harness.session_config
+        if sc is None:
+            return 200_000
+        try:
+            val = int(sc.get("context_limit_tokens", 200_000))
+            return max(val, 1)
+        except (TypeError, ValueError):
+            return 200_000
+
+    def _context_limit_exceeded(self) -> bool:
+        """True if we're at or over the configured cap AND mode is not off."""
+        if self._get_context_limit_mode() == "off":
+            return False
+        return self._context_tokens >= self._get_context_limit()
+
 
 
     async def _heartbeat_watcher(self) -> None:
@@ -1494,6 +1556,10 @@ class KilnApp:
             if self._receiving or self._pending_permission:
                 continue
             if self._input_buffer.text:
+                continue
+
+            # Context limit gate — covers both idle-nudge and heartbeat
+            if self._context_limit_exceeded():
                 continue
 
             # --- Idle nudge check ---
@@ -1519,8 +1585,6 @@ class KilnApp:
             # --- Regular heartbeat ---
             self._sync_heartbeat_from_config()
             if self._heartbeat_interval <= 0:
-                continue
-            if self._context_tokens > CONTEXT_PAUSE_THRESHOLD:
                 continue
             elapsed = time.monotonic() - self._last_auto_delivery
             if elapsed < self._heartbeat_interval:
@@ -1649,8 +1713,63 @@ class KilnApp:
         persist = getattr(self._harness, "persist_live_session_state", None)
         if persist:
             persist()
+        # Context limit crossing check — fires once per (limit-value, crossing)
+        # pair. Raising the cap mid-session re-arms the trigger.
+        self._check_context_limit_crossing()
         if self._app:
             self._app.invalidate()
+
+    def _check_context_limit_crossing(self) -> None:
+        """Fire soft/hard mode actions when crossing the current cap.
+
+        Re-arms when the limit is raised (last_fired < new_limit) so
+        raising the cap mid-turn produces a fresh crossing at the new value.
+        """
+        mode = self._get_context_limit_mode()
+        if mode == "off":
+            return
+        limit = self._get_context_limit()
+        if self._context_tokens < limit:
+            return
+        # Already fired at this limit or higher — don't re-fire until cap raised
+        if self._last_fired_context_limit is not None and self._last_fired_context_limit >= limit:
+            return
+        self._last_fired_context_limit = limit
+        self._context_limit_banner_active = True
+        # Kick off the async crossing handler (interrupt + ping)
+        asyncio.ensure_future(self._on_context_limit_crossed(mode, limit))
+
+    async def _on_context_limit_crossed(self, mode: str, limit: int) -> None:
+        """Async actions triggered by a context-limit crossing."""
+        tokens = self._context_tokens
+        _tprint(
+            "\n<err>\u26a0 CONTEXT LIMIT REACHED \u2014 {} / {} ({}) \u2014 WRAP UP SESSION SOON</err>",
+            _fmt_tokens(tokens),
+            _fmt_tokens(limit),
+            mode,
+        )
+        # Interrupt current turn if one is in flight
+        if self._receiving:
+            try:
+                await self._do_interrupt()
+            except Exception:
+                pass
+        # Ping Kira via daemon. Soft-fail — daemon may not be connected.
+        client = getattr(self._harness, "_daemon_client", None)
+        if client is not None:
+            owner = self._harness.config.owner_name or "kira"
+            summary = f"[{self._harness.agent_id}] context limit reached ({_fmt_tokens(tokens)}/{_fmt_tokens(limit)})"
+            body = (
+                f"Session `{self._harness.agent_id}` has crossed its context "
+                f"limit ({tokens:,} / {limit:,} tokens, mode={mode}). "
+                f"Auto-firing (inbox, heartbeat, idle-nudge) is now paused. "
+                f"Consider wrapping up or raising the cap via "
+                f"`context_limit_tokens` in session config."
+            )
+            try:
+                await client.send_user(owner.lower(), summary, body)
+            except Exception:
+                pass
 
 
     def _handle_event(self, event: Event) -> None:

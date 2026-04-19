@@ -213,71 +213,7 @@ def create_read_tracking_hook(inbox_path: Path, file_state=None):
 
 
 
-def create_context_warning_hook(session_control, max_tokens: int = 200_000):
-    """Create a PostToolUse hook that warns when context usage crosses thresholds.
 
-    Fires at 50% (100k), then every 10% after that. Each threshold fires
-    only once. The warning includes the current usage and a suggestion to
-    consider handoffs at higher levels.
-
-    Args:
-        session_control: SessionControl instance with context_tokens field.
-        max_tokens: Maximum context window size (default 200k).
-    """
-    # Thresholds as fractions: 0.50, 0.60, 0.70, 0.80, 0.90
-    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
-    fired: set[float] = set()
-
-    async def context_warning_hook(
-        input_data: HookInput, tool_use_id: str | None, context: HookContext
-    ) -> HookJSONOutput:
-        if session_control is None:
-            return {}
-
-        tokens = session_control.context_tokens
-        if tokens <= 0:
-            return {}
-
-        fraction = tokens / max_tokens
-
-        # Find all thresholds crossed that haven't fired yet.
-        # Mark all as fired in one call — prevents stale lower-threshold
-        # messages firing on subsequent calls when context jumps multiple
-        # levels at once.
-        newly_crossed = [t for t in thresholds if fraction >= t and t not in fired]
-        if not newly_crossed:
-            return {}
-
-        fired.update(newly_crossed)
-        crossed = max(newly_crossed)
-        pct = int(crossed * 100)
-        token_k = f"{tokens // 1000}k"
-
-        if crossed >= 0.8:
-            urgency = (
-                "Context is getting tight. If you're working autonomously, "
-                "prepare to self-continue: update volatile and call "
-                "exit_session(continue=true, handoff='...')."
-            )
-        elif crossed >= 0.6:
-            urgency = (
-                "If this is a long task, start thinking about wrapping up "
-                "and self-continuing."
-            )
-        else:
-            urgency = "No action needed yet — this is informational."
-
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": (
-                    f"[Context: {pct}%] Using ~{token_k} of {max_tokens // 1000}k tokens. "
-                    f"{urgency}"
-                ),
-            }
-        }
-
-    return context_warning_hook
 
 
 def create_supplemental_content_hook(supplemental):
@@ -347,7 +283,14 @@ def create_session_state_hook(
         # Context usage
         sc = getattr(harness, "session_control", None)
         if sc and sc.context_tokens > 0:
-            max_tokens = getattr(harness.config, "max_context_tokens", 200_000)
+            # Read live cap from session config; fall back to AgentConfig default.
+            session_cfg = getattr(harness, "session_config", None)
+            max_tokens = 200_000
+            if session_cfg is not None:
+                try:
+                    max_tokens = int(session_cfg.get("context_limit_tokens", 200_000))
+                except (TypeError, ValueError):
+                    pass
             used_k = sc.context_tokens // 1000
             max_k = max_tokens // 1000
             parts.append(f"context: {used_k}k/{max_k}k")
