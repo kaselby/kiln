@@ -407,6 +407,9 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
         config.agent_id = args.id
     if args.model:
         config.model = args.model
+        # Mark CLI as the model source so resume doesn't clobber an explicit
+        # --model with the saved-state value. See harness.py resume restore.
+        config._model_explicit = True
     if args.parent:
         config.parent = args.parent
     if args.depth:

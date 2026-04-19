@@ -367,6 +367,13 @@ class KilnHarness:
         if context_tokens is not None:
             state["context_tokens"] = context_tokens
 
+        # Always persist model so resume can restore it without --model.
+        # Without this, `kiln run X --model Y` then `kiln run X --resume` falls
+        # back to the agent.yml default instead of Y. CLI --model still wins on
+        # resume (see _model_explicit handling in _build_backend_config).
+        if self.config.model:
+            state["model"] = self.config.model
+
         if self.config.template:
             state["template"] = self.config.template
         if self.config.template_vars:
@@ -586,17 +593,31 @@ class KilnHarness:
 
         # Re-apply template from saved state so cleanup, hooks, and other
         # runtime config fields are restored.  CLI --template wins if set.
+        template_was_restored = False
         if saved_state and not self.config.template:
             saved_template = saved_state.get("template")
             if saved_template:
                 try:
                     from .config import apply_template
                     apply_template(self.config, saved_template)
+                    template_was_restored = True
                 except FileNotFoundError:
                     log.warning("Saved template '%s' not found — skipping", saved_template)
             saved_vars = saved_state.get("template_vars")
             if saved_vars and not self.config.template_vars:
                 self.config.template_vars.update(saved_vars)
+
+        # Restore model from saved state. Precedence (highest first):
+        #   1. CLI --model (marked via _model_explicit in cli.py)
+        #   2. Template's model (already applied above if template_was_restored)
+        #   3. Saved raw model (this restore — fixes raw --model not persisting)
+        #   4. agent.yml default
+        if (saved_state
+            and not getattr(self.config, "_model_explicit", False)
+            and not template_was_restored):
+            saved_model = saved_state.get("model")
+            if saved_model:
+                self.config.model = saved_model
 
         cwd = str(self.config.home)
 
@@ -668,6 +689,13 @@ class KilnHarness:
         file_state = FileState()
         self.session_control = SessionControl()
         self._supplemental = SupplementalContent()
+
+        # Restore context_tokens from saved state so status surfaces (Discord,
+        # sessions tool, hook output) report the right value between session
+        # start and the first API response. Self-corrects on next turn either
+        # way; this just removes the brief 0-token window on resume.
+        if saved_state and isinstance(saved_state.get("context_tokens"), int):
+            self.session_control.context_tokens = saved_state["context_tokens"]
 
         # Authoritative live per-session config — seeded from harness config,
         # agent-writable at runtime. On resume, the prior snapshot provides seed
