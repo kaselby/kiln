@@ -1258,12 +1258,21 @@ class KilnHarness:
         ))
         return blocks
 
+    @staticmethod
+    def _strip_model_flags(model: str) -> str:
+        """Strip CLI flags like [1m] from model names for comparison."""
+        # CC CLI uses bracket suffixes (e.g. [1m]) for context window config
+        # but reports the bare model ID back. Strip for comparison.
+        idx = model.find("[")
+        return model[:idx] if idx != -1 else model
+
     def check_model(self, actual_model: str) -> str | None:
         """Check actual model against expected. Returns warning or None."""
         if self._model_verified:
             return None
         self._model_verified = True
-        if actual_model == self._expected_model:
+        expected_bare = self._strip_model_flags(self._expected_model)
+        if actual_model == expected_bare or actual_model == self._expected_model:
             return None
         warning = (
             f"Model mismatch: expected '{self._expected_model}' "
