@@ -486,13 +486,20 @@ def cmd_run(args: argparse.Namespace, *, harness_class=None) -> None:
                      "run", str(spec_path.resolve()),
                      "--mode", "yolo",
                      "--parent", harness.agent_id, "--continuation"]
-        heartbeat = cont.get('heartbeat', 0)
-        try:
-            heartbeat = float(heartbeat)
-        except (TypeError, ValueError):
-            heartbeat = 0
-        if heartbeat > 0:
-            exec_args += ["--heartbeat", str(int(heartbeat / 60))]
+
+        # Heartbeat is operational config (tied to session role, not agent
+        # identity), so we don't carry it across continuations by default.
+        # A canonical-hold session shouldn't inherit a work-session heartbeat.
+        # Flip this flag if autonomous chains need inheritance back.
+        _INHERIT_HEARTBEAT = False
+        if _INHERIT_HEARTBEAT:
+            heartbeat = cont.get('heartbeat', 0)
+            try:
+                heartbeat = float(heartbeat)
+            except (TypeError, ValueError):
+                heartbeat = 0
+            if heartbeat > 0:
+                exec_args += ["--heartbeat", str(int(heartbeat / 60))]
 
         if args.model:
             exec_args += ["--model", args.model]
