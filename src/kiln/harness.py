@@ -678,6 +678,8 @@ class KilnHarness:
             "heartbeat": self.config.heartbeat,
             "stream_timeout": self.config.stream_timeout,
             "tags": list(self.config.tags),
+            "context_limit_mode": self.config.context_limit_mode,
+            "context_limit_tokens": self.config.context_limit_tokens,
         }
 
 
