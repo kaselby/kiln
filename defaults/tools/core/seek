@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# ---
+# name: seek
+# brief: Fast file search — use this instead of find
+# description: |
+#   Smart file/directory search that avoids the timeout trap of raw `find`.
+#   Uses fd if available (fast, .gitignore-aware), falls back to find with
+#   automatic pruning of caches, venvs, node_modules, and .git dirs.
+#
+#   USE THIS INSTEAD OF `find` for any search that touches ~ or large trees.
+#   Raw `find ~` will time out — the home directory has 1M+ files.
+#
+#   For name lookups specifically, consider `mdfind -name X -onlyin ~`
+#   which uses Spotlight's pre-built index and returns in <1s.
+# arguments: "<pattern> [directory] [-- extra args]"
+# ---
+#
+# Usage:
+#   seek claude-code              # search current dir
+#   seek claude-code ~            # search home dir (hidden dirs included)
+#   seek '*.py' ~/Git             # glob pattern
+#   seek -t d venv ~/Git          # directories only (-t d)
+#   seek -t f '*.md' ~            # files only (-t f)
+#   seek -e py handler            # filter by extension
+#   seek --hidden pattern         # include hidden files (fd default skips them)
+#   seek pattern ~/Git -- --max-depth 3  # extra args passed through
+#
+# When searching from ~, automatically includes hidden dirs (so agent homes
+# like .kiln, .<agent>, etc. are searched) but prunes known-heavy directories
+# like .cache, .Trash, and Library/Caches.
+
+set -euo pipefail
+
+# Directories to always prune (massive file counts, never useful to search)
+PRUNE_DIRS=(
+    .cache
+    .Trash
+    node_modules
+    __pycache__
+    .venv
+    venv
+    site-packages
+    Caches        # Library/Caches
+    huggingface
+)
+
+usage() {
+    sed -n '/^# Usage:/,/^[^#]/p' "$0" | grep '^#' | sed 's/^# \?//'
+    exit "${1:-0}"
+}
+
+if [[ $# -eq 0 ]]; then
+    usage 1
+fi
+
+# Parse our arguments
+type_flag=""
+pattern=""
+directory=""
+declare -a extra_args=()
+search_hidden=false
+extension=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t)
+            type_flag="$2"
+            shift 2
+            ;;
+        -e)
+            extension="$2"
+            shift 2
+            ;;
+        --hidden|-H)
+            search_hidden=true
+            shift
+            ;;
+        -h|--help)
+            usage 0
+            ;;
+        --)
+            shift
+            extra_args=("$@")
+            break
+            ;;
+        -*)
+            extra_args+=("$1")
+            shift
+            ;;
+        *)
+            if [[ -z "$pattern" ]]; then
+                pattern="$1"
+            elif [[ -z "$directory" ]]; then
+                directory="$1"
+            else
+                extra_args+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+directory="${directory:-.}"
+
+# Resolve ~ and check if we're searching from home or a hidden dir
+resolved_dir=$(cd "$directory" 2>/dev/null && pwd || echo "$directory")
+home_dir=$(echo ~)
+
+# Auto-enable hidden search when searching from ~ or from inside a hidden dir
+if [[ "$resolved_dir" == "$home_dir" ]] || [[ "$(basename "$resolved_dir")" == .* ]]; then
+    search_hidden=true
+fi
+
+# --- fd path ---
+if command -v fd &>/dev/null; then
+    fd_args=()
+
+    if [[ "$search_hidden" == true ]]; then
+        fd_args+=(--hidden)
+    fi
+
+    if [[ -n "$type_flag" ]]; then
+        fd_args+=(-t "$type_flag")
+    fi
+
+    if [[ -n "$extension" ]]; then
+        fd_args+=(-e "$extension")
+    fi
+
+    # Add prune exclusions
+    for dir in "${PRUNE_DIRS[@]}"; do
+        fd_args+=(--exclude "$dir")
+    done
+
+    # Add extra args
+    if [[ ${#extra_args[@]} -gt 0 ]]; then
+        fd_args+=("${extra_args[@]}")
+    fi
+
+    # Pattern and directory
+    fd_args+=("$pattern" "$directory")
+
+    exec fd "${fd_args[@]}"
+fi
+
+# --- find fallback ---
+find_args=("$directory")
+
+# Build prune expression
+prune_expr=()
+first=true
+for dir in "${PRUNE_DIRS[@]}"; do
+    if [[ "$first" == true ]]; then
+        first=false
+    else
+        prune_expr+=(-o)
+    fi
+    prune_expr+=(-name "$dir" -type d)
+done
+
+find_args+=(\( "${prune_expr[@]}" \) -prune -o)
+
+# Type filter
+if [[ -n "$type_flag" ]]; then
+    case "$type_flag" in
+        f) find_args+=(-type f) ;;
+        d) find_args+=(-type d) ;;
+        l) find_args+=(-type l) ;;
+    esac
+fi
+
+# Extension filter
+if [[ -n "$extension" ]]; then
+    find_args+=(-name "*.${extension}")
+elif [[ -n "$pattern" ]]; then
+    # fd uses regex by default, find uses glob — approximate with glob wrapping
+    find_args+=(-name "*${pattern}*")
+fi
+
+if [[ ${#extra_args[@]} -gt 0 ]]; then
+    find_args+=("${extra_args[@]}")
+fi
+find_args+=(-print)
+
+exec find "${find_args[@]}"
