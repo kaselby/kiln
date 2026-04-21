@@ -10,7 +10,7 @@ Modules:
     kiln.hooks      — Infrastructure hook factories
     kiln.names      — Agent name generation
     kiln.permissions — Permission system
-    kiln.prompt     — Tool/skill discovery, session context builder
+    kiln.prompt     — Prompt assembly (PromptBuilder) + tool/skill discovery
     kiln.registry   — Session tracking
     kiln.shell      — Persistent shell management
     kiln.tools      — MCP tool functions + schemas
@@ -19,17 +19,17 @@ Modules:
 from .config import AgentConfig, load_agent_spec
 from .harness import KilnHarness
 from .names import generate_agent_name
-from .prompt import load_tool_docs
+from .prompt import PromptBuilder
 from .registry import lookup_session, register_session
 from .session_config import SessionConfig
 
 __all__ = [
     "AgentConfig",
     "KilnHarness",
+    "PromptBuilder",
     "SessionConfig",
     "generate_agent_name",
     "load_agent_spec",
-    "load_tool_docs",
     "lookup_session",
     "register_session",
 ]

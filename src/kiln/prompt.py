@@ -70,145 +70,6 @@ def get_knowledge_cutoff(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool documentation
-# ---------------------------------------------------------------------------
-
-# Built-in tool docs shipped with kiln (for Kiln:: and Base:: tools).
-_KILN_TOOL_DOCS_DIR = Path(__file__).parent / "tool_docs"
-
-# Map tool names to doc filenames. Handles both namespaced ("Kiln::Edit")
-# and bare ("Edit") names. Case-insensitive lookup.
-_TOOL_DOC_NAMES = {
-    "bash": "bash",
-    "read": "read",
-    "write": "write",
-    "edit": "edit",
-    "plan": "plan",
-    "websearch": "websearch",
-    "message": "message",
-    "exit_session": "exit_session",
-    "activate_skill": "activate_skill",
-}
-
-_TOOL_GUIDE_SECTIONS = [
-    ("Shell and Execution", {"bash"}),
-    ("File Tools", {"read", "write", "edit"}),
-    ("Workflow Tools", {"plan", "activate_skill"}),
-    ("Coordination and Session Tools", {"message", "exit_session"}),
-    ("Research Tools", {"websearch"}),
-]
-
-
-_TOOL_GUIDE_SECTION_BY_KEY = {
-    key: title
-    for title, keys in _TOOL_GUIDE_SECTIONS
-    for key in keys
-}
-
-
-def _tool_doc_key(tool_name: str) -> str:
-    """Extract the base tool name from a possibly namespaced name.
-
-    'Kiln::Edit' → 'edit', 'Base::WebSearch' → 'websearch', 'Read' → 'read'
-    """
-    # Strip namespace prefix
-    if "::" in tool_name:
-        tool_name = tool_name.split("::", 1)[1]
-    return tool_name.lower()
-
-
-def _bump_markdown_headings(text: str, levels: int = 1) -> str:
-    """Increase markdown heading levels so sections can be nested cleanly."""
-    bumped_lines = []
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            prefix_len = len(line) - len(stripped)
-            original_hashes = len(stripped) - len(stripped.lstrip("#"))
-            if original_hashes > 0 and len(stripped) > original_hashes and stripped[original_hashes] == " ":
-                new_hashes = min(6, original_hashes + levels)
-                line = (" " * prefix_len) + ("#" * new_hashes) + stripped[original_hashes:]
-        bumped_lines.append(line)
-    return "\n".join(bumped_lines)
-
-
-
-def load_tool_docs(
-    tool_names: list[str],
-    *,
-    extra_dirs: list[Path] | None = None,
-) -> str:
-    """Load built-in tool docs and render them as a coherent guide.
-
-    Searches kiln's built-in tool_docs/ first, then any extra directories
-    (e.g. an agent's own tool_docs/ for agent-namespaced tools).
-
-    Args:
-        tool_names: List of tool names, possibly namespaced
-            (e.g. ["Kiln::Edit", "MyAgent::Bash", "Base::Read"]).
-        extra_dirs: Additional directories to search for tool doc files.
-            Searched after kiln's built-in docs, so agent docs can override.
-
-    Returns:
-        Built-in tool documentation as a string, suitable for injection into
-        the system prompt. Empty string if no docs found.
-    """
-    search_dirs = [_KILN_TOOL_DOCS_DIR]
-    if extra_dirs:
-        search_dirs.extend(extra_dirs)
-
-    seen = set()
-    grouped_docs: dict[str, list[str]] = {title: [] for title, _ in _TOOL_GUIDE_SECTIONS}
-    other_docs = []
-
-    for name in tool_names:
-        key = _tool_doc_key(name)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        # Search directories in order — last match wins (agent overrides kiln)
-        doc_content = None
-        doc_name = _TOOL_DOC_NAMES.get(key, key)
-        for d in search_dirs:
-            doc_file = d / f"{doc_name}.md"
-            if doc_file.exists():
-                doc_content = doc_file.read_text().strip()
-
-        if not doc_content:
-            continue
-
-        section_title = _TOOL_GUIDE_SECTION_BY_KEY.get(key)
-
-        rendered_doc = _bump_markdown_headings(doc_content, levels=1)
-        if section_title:
-            grouped_docs[section_title].append(rendered_doc)
-        else:
-            other_docs.append(rendered_doc)
-
-    if not any(grouped_docs.values()) and not other_docs:
-        return ""
-
-    parts = [
-        "## Built-In Tool Guide",
-        "",
-        "This guide covers Kiln's built-in API tools. Shell and custom tools are listed separately in the session context.",
-    ]
-
-    for section_title, _keys in _TOOL_GUIDE_SECTIONS:
-        section_docs = grouped_docs[section_title]
-        if not section_docs:
-            continue
-        parts.extend(["", f"### {section_title}", "", "\n\n".join(section_docs)])
-
-    if other_docs:
-        parts.extend(["", "### Other built-in tools", "", "\n\n".join(other_docs)])
-
-    return "\n".join(parts) + "\n"
-
-
-
-# ---------------------------------------------------------------------------
 # Tool and skill discovery
 # ---------------------------------------------------------------------------
 
@@ -602,10 +463,10 @@ def build_session_context(
 
 
 # Short one-liners for each built-in tool, rendered as the `{builtins}`
-# placeholder value inside the Kiln reference. Hand-written here (not
-# parsed from tool_docs/*.md) so the summary text stays tight and is
-# independent of the full-doc shape. Long-form detail lives in
-# ``reference/docs/builtins.md`` — agents can read it on demand.
+# placeholder value inside the Kiln reference. Hand-written here so the
+# summary text stays tight and independent of any full-doc shape.
+# Long-form detail lives in ``reference/docs/builtins.md`` — agents can
+# read it on demand.
 BUILTIN_TOOL_SUMMARIES: dict[str, str] = {
     "Bash": "Executes a command in a persistent shell. File ops, tool invocations, git, and most actions flow through Bash.",
     "Read": "Reads a file from the local filesystem. Handles text, images, Jupyter notebooks, and PDFs.",
