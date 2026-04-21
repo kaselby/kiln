@@ -115,10 +115,10 @@ def create_inbox_check_hook(
 
 
 def create_skill_context_hook(skills_path: Path):
-    """Create a PostToolUse hook (matcher="mcp__kiln__activate_skill") that injects
+    """Create a PostToolUse hook (matcher="mcp__kiln__ActivateSkill") that injects
     skill content as system-level context.
 
-    When the activate_skill MCP tool runs, this hook replaces its output with a short
+    When the ActivateSkill MCP tool runs, this hook replaces its output with a short
     confirmation (via updatedMCPToolOutput) and injects the full skill content as
     additionalContext so it appears as a system message rather than a tool result.
     """
@@ -481,7 +481,7 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
 
     Logs two categories:
     - Custom tools: Bash calls to tools/bin/* (e.g. exa, tavily)
-    - Skill activations: mcp__kiln__activate_skill calls
+    - Skill activations: mcp__kiln__ActivateSkill calls
     Built-in tools (Read, Write, Bash, etc.) are skipped.
     """
     log_file = logs_path / "tool-usage.jsonl"
@@ -503,7 +503,7 @@ def create_usage_log_hook(logs_path: Path, agent_id: str, tools_bin: Path | None
             is_error = bool(tool_output.get("is_error"))
 
         # Skill activations
-        if tool_name == "mcp__kiln__activate_skill" or tool_name.endswith("__activate_skill"):
+        if tool_name == "mcp__kiln__ActivateSkill" or tool_name.endswith("__ActivateSkill"):
             skill = tool_input.get("name", "unknown")
             _append({
                 "ts": datetime.now().isoformat(),
@@ -743,7 +743,7 @@ def create_queued_message_hook(queue: list[str], ui_events: list[dict]):
 
 
 def create_message_sent_hook(ui_events: list[dict]):
-    """Create a PostToolUse hook (matcher="mcp__kiln__message") that pushes
+    """Create a PostToolUse hook (matcher="mcp__kiln__Message") that pushes
     a UI event when the agent sends a message.
 
     Purely cosmetic — lets the TUI show outbound messages to the user.

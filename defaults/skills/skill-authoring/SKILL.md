@@ -131,7 +131,7 @@ Include feedback loops for quality-critical operations: run validator → fix er
 
 ## Our Harness Integration
 
-Skills in Kiln are activated via the `activate_skill` MCP tool. A PostToolUse hook strips the frontmatter and injects the body as `additionalContext` (system-level message), so it persists better than a tool result during context compression.
+Skills in Kiln are activated via the `ActivateSkill` MCP tool. A PostToolUse hook strips the frontmatter and injects the body as `additionalContext` (system-level message), so it persists better than a tool result during context compression.
 
 At startup, the harness scans `<agent_home>/skills/`, extracts frontmatter, and lists available skills in the session context.
 

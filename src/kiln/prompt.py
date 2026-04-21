@@ -515,7 +515,7 @@ def _render_skill_listing(skills: list[dict] | dict | None) -> str:
             ctx += f"- **{s['name']}** ({s['path']}): {s['description']}\n"
 
     if ctx:
-        ctx += "\nUse `activate_skill` to load a skill before using it.\n"
+        ctx += "\nUse `ActivateSkill` to load a skill before using it.\n"
 
     return ctx
 

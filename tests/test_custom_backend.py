@@ -207,7 +207,7 @@ class TestHookDispatcher:
             HookRule(pattern=None, hook=replace_hook),
         ])
         result = asyncio.get_event_loop().run_until_complete(
-            dispatcher.post_tool("activate_skill", {"name": "test"}, "original"),
+            dispatcher.post_tool("ActivateSkill", {"name": "test"}, "original"),
         )
         assert result.updated_tool_output == "replaced output"
         assert result.additional_context == "context here"

@@ -763,8 +763,8 @@ class KilnHarness:
                     session_state, usage_log, plan_nudge,
                 ]),
                 HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker, supplemental_hook]),
-                HookMatcher(matcher="mcp__kiln__activate_skill", hooks=[skill_context]),
-                HookMatcher(matcher="mcp__kiln__message", hooks=[message_sent]),
+                HookMatcher(matcher="mcp__kiln__ActivateSkill", hooks=[skill_context]),
+                HookMatcher(matcher="mcp__kiln__Message", hooks=[message_sent]),
             ],
             "Stop": [],
         }

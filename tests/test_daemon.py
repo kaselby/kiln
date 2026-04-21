@@ -499,7 +499,7 @@ def message_tool_fn(daemon_config, make_client):
         agent_id="beth-tool-test",
         daemon_client=client,
     )
-    msg_tool = next(t for t in mcp_tools if t.name == "message")
+    msg_tool = next(t for t in mcp_tools if t.name == "Message")
     return msg_tool.handler, client
 
 
@@ -547,7 +547,7 @@ async def test_message_tool_subscribe_tracks_desired_subscriptions(running_daemo
         daemon_client=client,
         on_channel_subscriptions_changed=harness._on_channel_subscriptions_changed,
     )
-    handler = next(t for t in mcp_tools if t.name == "message").handler
+    handler = next(t for t in mcp_tools if t.name == "Message").handler
 
     await handler({"action": "subscribe", "channel": "alpha"})
     await handler({"action": "subscribe", "channel": "beta"})
@@ -627,7 +627,7 @@ async def test_message_tool_dm_filesystem_fallback(daemon_config, monkeypatch):
         agent_id="beth-fallback",
         daemon_client=None,
     )
-    handler = next(t for t in mcp_tools if t.name == "message").handler
+    handler = next(t for t in mcp_tools if t.name == "Message").handler
 
     result = await handler({
         "action": "send",
@@ -654,7 +654,7 @@ async def test_message_tool_channel_requires_daemon():
         agent_id="beth-no-daemon",
         daemon_client=None,
     )
-    handler = next(t for t in mcp_tools if t.name == "message").handler
+    handler = next(t for t in mcp_tools if t.name == "Message").handler
 
     result = await handler({"action": "subscribe", "channel": "test"})
     assert not _tool_ok(result)
