@@ -1,13 +1,20 @@
-"""Persistent bash subprocess with sentinel-based output capture.
+"""Persistent shell subprocess with sentinel-based output capture.
 
-Provides a long-lived bash process that maintains state (env vars, cwd,
+Provides a long-lived shell process that maintains state (env vars, cwd,
 aliases) across commands. Uses a shell stack to support nested contexts
 (SSH, docker exec, etc.) — the sentinel protocol works identically through
-any transport that provides a bash subprocess on the other end of stdin/stdout.
+any transport that provides a POSIX shell on the other end of stdin/stdout.
+
+On macOS, uses zsh instead of bash. The system bash (3.2.57, from 2007)
+has a parsing bug where single quotes and backticks inside heredoc bodies
+are incorrectly treated as shell quoting characters even when the heredoc
+delimiter is quoted — causing the shell to hang when agents use the common
+$(cat <<'EOF'...EOF) pattern with English text containing apostrophes.
 """
 
 import asyncio
 import os
+import platform
 import re
 import shlex
 import uuid
@@ -18,6 +25,16 @@ from time import monotonic
 # SSH options that take an argument (from man ssh).
 # Used to parse ssh commands and distinguish host from remote command.
 _SSH_ARG_FLAGS = set("bcDEeFIiJLlmOopQRSWw")
+
+# macOS ships bash 3.2.57 which has heredoc parsing bugs inside $()
+# substitutions (single quotes and backticks in the body are incorrectly
+# treated as shell metacharacters). zsh handles these correctly and has
+# been the default macOS shell since Catalina.
+_IS_MACOS = platform.system() == "Darwin"
+_LOCAL_SHELL = (
+    ["/bin/zsh", "--no-rcs"] if _IS_MACOS
+    else ["bash", "--norc", "--noprofile"]
+)
 
 
 def safe_getcwd() -> str:
@@ -100,11 +117,11 @@ def _parse_ssh_command(command: str) -> tuple[list[str], str] | None:
 
 
 class PersistentShell:
-    """A persistent bash subprocess that maintains state across commands.
+    """A persistent shell subprocess that maintains state across commands.
 
     Supports a stack of shell contexts for nested sessions (SSH, docker,
     etc.). The sentinel protocol works identically at every level since
-    it just needs a bash process on the other end of stdin/stdout.
+    it just needs a POSIX shell on the other end of stdin/stdout.
     """
 
     def __init__(self, cwd: str | None = None, env: dict[str, str] | None = None):
@@ -151,7 +168,7 @@ class PersistentShell:
         Falls back to ~ if the requested cwd has been deleted.
         """
         if spawn_args is None:
-            spawn_args = ["bash", "--norc", "--noprofile"]
+            spawn_args = list(_LOCAL_SHELL)
         # Only set cwd for local processes — remote shells ignore it
         effective_cwd = cwd if spawn_args[0] != "ssh" else None
         # Validate cwd exists before spawning — deleted dirs cause FileNotFoundError
