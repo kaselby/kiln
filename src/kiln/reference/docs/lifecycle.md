@@ -110,6 +110,10 @@ commit_memory()                          # git add -A && git commit if repo and 
 
 If `ExitSession(continue=True)` was called, the CLI notices `continue_requested` and `exec`s a new `kiln run` invocation with `--continuation --parent <old-id>` — a fresh session that reuses the parent's subscriptions, transfers unread inbox messages, and receives the handoff as its first inbox message.
 
+#### Session summary (convention)
+
+The `config.cleanup` prompt is where the session-end summary gets written. The conventional target is `<home>/memory/sessions/<YYYY-MM-DD>-<agent-id>.md`, covering what was worked on, key decisions, and anything the next session should know. That directory is also the canonical input to cross-session search tools like `recall`. See `memory.md` for the full convention and the canonical cleanup hook.
+
 Crash path: a SIGHUP handler in `cli.py` runs `session_config.cleanup()` and exits 1. Stale state from crashed sessions is swept by the *next* session's `_cleanup_stale_sessions()` (uses tmux as source of truth for what's alive).
 
 ## Reference

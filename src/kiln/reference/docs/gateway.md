@@ -93,6 +93,22 @@ Two Discord-specific bookkeeping structures, persisted alongside adapter state:
 
 Both maps are persisted to JSON so restarts don't orphan threads.
 
+### Discord server layout
+
+The Discord adapter expects a guild organized around five conventional channel roles. Channel *names* are config (`services.gateway.adapters.discord.channels`) — the adapter resolves each role to a concrete channel/thread ID at startup — but the *roles* themselves are baked into the adapter's behavior:
+
+| Role       | Purpose                                                          |
+|------------|------------------------------------------------------------------|
+| `general`  | Ambient chat with the owner — human-to-human, no automation.     |
+| `branches` | Host channel for per-session threads. The adapter creates one thread per running session and binds inbound messages in that thread to that session (`BRANCH` bucket). |
+| `channels` | Host channel for Kiln-channel mirror threads. Each bound Kiln channel gets a two-way bridged thread here (`BRIDGE` bucket). |
+| `docs`     | Target for `gateway discord paste` file uploads. Readable text gets posted as a thread rooted here. |
+| `status`   | Automated session-status updates — lightweight lifecycle signals emitted by the adapter. |
+
+The adapter configures itself off this layout: it posts branch threads under `branches`, bridge threads under `channels`, document drops under `docs`, etc. Renaming the Discord channels is fine; changing the role semantics isn't — the adapter code treats these five as primitives.
+
+This layout is the current Discord adapter convention. Future platform adapters may structure their equivalent surfaces differently, and future Discord-adapter versions may evolve it — but within a given deployment, the five roles are a stable contract.
+
 ## Reference
 
 ### Daemon config — `services.gateway`
