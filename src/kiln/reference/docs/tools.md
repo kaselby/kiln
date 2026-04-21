@@ -29,7 +29,7 @@ A flat layout (no `core/` or `library/` subdirectory) is also supported — all 
   bin/                        # (optional) manually managed scripts, on PATH only
 ```
 
-Tool discovery happens once per session, in `prompt.py:discover_tool_layout()`, called from `harness.py:_build_backend_config()`. The result is passed to `build_session_context()` which renders it into the `{tool_index}` placeholder in `kiln.md`.
+Tool discovery happens once per session, in `prompt.py:discover_tool_layout()`, called from `harness.py:_build_backend_config()` via `PromptBuilder`. The result is rendered as the `{tool_index}` placeholder inside the Kiln reference chunk of the system prompt.
 
 At startup the harness also prepends `tools/`, `tools/core/`, `tools/library/`, and `tools/bin/` to the session's `PATH`, so tools are callable by bare name from Bash.
 

@@ -458,8 +458,12 @@ def build_session_context(
 # ``src/kiln/reference/kiln.md`` alongside deep-dive docs at
 # ``src/kiln/reference/docs/*.md``. Agents can override the default via
 # a ``kiln-doc/`` subdirectory in their home — see spec for the override
-# mechanism. See ``scratch/kiln-doc-spec.md`` (in beth's scratch) for the
-# full design.
+# mechanism.
+#
+# Placeholder vocabulary: ``{kiln_path}`` is the *Kiln reference root*
+# (the directory containing ``kiln.md`` and ``docs/``), not the overall
+# Kiln install root or package dir. That's why ``kiln.md`` can use
+# ``{kiln_path}/docs/tools.md`` and have it resolve to a real file.
 
 
 # Short one-liners for each built-in tool, rendered as the `{builtins}`

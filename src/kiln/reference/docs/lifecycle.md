@@ -53,7 +53,7 @@ _build_backend_config()
   ├─ _load_session_state_snapshot()      # if resuming
   ├─ (continuation only) copy parent subscriptions
   ├─ apply_template / restore model
-  ├─ build prompt (identity + tool_docs + session_context + extras) OR reuse saved
+  ├─ build prompt via PromptBuilder (identity + kiln reference + session context + memory) OR reuse saved
   ├─ _save_session_state_snapshot()      # initial snapshot
   ├─ _clean_stale_agent_state()          # unless continuation
   ├─ (continuation) transfer unread inbox from parent
