@@ -532,68 +532,60 @@ def build_session_context(
     agent_id: str,
     model: str | None = None,
     *,
-    tools: list[dict] | dict | None = None,
-    skills: list[dict] | dict | None = None,
     parent: str | None = None,
     depth: int = 0,
     cwd: str | None = None,
     extra_lines: list[str] | None = None,
 ) -> str:
-    """Build the dynamic session context block for the system prompt.
+    """Build the dynamic session context chunk for the system prompt.
 
-    This is the runtime-dependent part of the prompt: agent ID, model info,
-    platform details, tool/skill listings, date. Identity and memory are
-    NOT included — those are agent-owned and composed by the harness.
+    Runtime-dependent fields only — agent ID, parent/depth, model info,
+    platform, cwd, date, and any trailing lines the harness wants to
+    append (e.g. inbox path). Tool and skill listings live in the Kiln
+    reference section as the ``{tool_index}`` and ``{skill_index}``
+    placeholders, so they do NOT appear here.
+
+    The returned string starts with ``## Session Context`` (no leading
+    separator — callers like ``PromptBuilder`` join chunks with their
+    own separator).
 
     Args:
         agent_id: The agent's session ID.
         model: Model name or alias (resolved internally).
-        tools: Tool data — flat list[dict] from discover_tools(), or tiered
-            dict from discover_tool_layout() with "core" and "library" keys.
-        skills: Skill data — flat list[dict] from discover_skills(), or tiered
-            dict from discover_skill_layout().
         parent: Parent agent ID if spawned.
         depth: Spawn depth.
-        cwd: Working directory.
-        extra_lines: Additional lines to append (e.g. role info).
+        cwd: Working directory. Defaults to ``os.getcwd()``.
+        extra_lines: Additional lines to append (e.g. ``["Inbox: …"]``).
 
     Returns:
-        The session context block as a string, starting with a section header.
+        The session context chunk as a string.
     """
     resolved = resolve_model(model)
     cutoff = get_knowledge_cutoff(resolved)
 
-    ctx = "\n\n---\n## Session Context\n\n"
-    ctx += f"Agent ID: {agent_id}\n"
-
+    lines: list[str] = ["## Session Context", ""]
+    lines.append(f"Agent ID: {agent_id}")
     if parent:
-        ctx += f"Parent: {parent}\n"
-        ctx += f"Depth: {depth}\n"
-
-    ctx += f"\nModel: {resolved}\n"
+        lines.append(f"Parent: {parent}")
+        lines.append(f"Depth: {depth}")
+    lines.append("")
+    lines.append(f"Model: {resolved}")
     if cutoff == "unknown":
-        ctx += (
+        lines.append(
             f"Knowledge cutoff: **UNKNOWN — the model '{resolved}' doesn't match any "
             f"prefix in KNOWLEDGE_CUTOFFS. Update prompt.py if a new model generation "
-            f"has been released.**\n"
+            f"has been released.**"
         )
     else:
-        ctx += f"Knowledge cutoff: {cutoff}\n"
-    ctx += f"Platform: {platform.system()} {platform.release()}\n"
-    ctx += f"Shell: {os.environ.get('SHELL', 'unknown')}\n"
-    ctx += f"Working directory: {cwd or os.getcwd()}\n"
-
-    ctx += _render_tool_listing(tools)
-    ctx += _render_skill_listing(skills)
-
-    ctx += f"\nToday's date is **{date.today().strftime('%B %d, %Y')}**."
-
-    # Extra lines (role info, inbox path, etc.)
+        lines.append(f"Knowledge cutoff: {cutoff}")
+    lines.append(f"Platform: {platform.system()} {platform.release()}")
+    lines.append(f"Shell: {os.environ.get('SHELL', 'unknown')}")
+    lines.append(f"Working directory: {cwd or os.getcwd()}")
+    lines.append("")
+    lines.append(f"Today's date is **{date.today().strftime('%B %d, %Y')}**.")
     if extra_lines:
-        for line in extra_lines:
-            ctx += f"\n{line}"
-
-    return ctx
+        lines.extend(extra_lines)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1006,13 +998,19 @@ class PromptBuilder:
     # --- Placeholder sources -------------------------------------------------
 
     def _automatic_placeholders(self) -> dict[str, str]:
-        """Kiln-computed placeholders, available everywhere in the reference."""
+        """Kiln-computed placeholders, available everywhere in the reference.
+
+        ``{kiln_path}`` resolves to the reference directory itself — i.e.
+        the parent of ``docs/``. kiln.md uses links like
+        ``{kiln_path}/docs/tools.md`` which must resolve to real files
+        under ``src/kiln/reference/docs/``.
+        """
         tools = discover_tool_layout(self.config.tools_path)
         skills = discover_skill_layout(self.config.skills_path)
         now = datetime.now()
         return {
             "home_dir": str(self.config.home),
-            "kiln_path": str(self.kiln_reference_dir.parent.parent),
+            "kiln_path": str(self.kiln_reference_dir),
             "builtins": render_builtins_summary(list(self.config.tools)),
             "tool_index": _render_tool_listing(tools).strip("\n"),
             "skill_index": _render_skill_listing(skills).strip("\n"),
@@ -1036,34 +1034,16 @@ class PromptBuilder:
         )
 
     def _session_context(self) -> str:
-        """Runtime-dynamic fields only. No tool/skill listings — those live
-        in the Kiln reference via {tool_index} / {skill_index}."""
-        resolved = resolve_model(self.config.model)
-        cutoff = get_knowledge_cutoff(resolved)
-
-        lines: list[str] = ["## Session Context", ""]
-        lines.append(f"Agent ID: {self.agent_id}")
-        if self.config.parent:
-            lines.append(f"Parent: {self.config.parent}")
-            lines.append(f"Depth: {self.config.depth}")
-        lines.append("")
-        lines.append(f"Model: {resolved}")
-        if cutoff == "unknown":
-            lines.append(
-                f"Knowledge cutoff: **UNKNOWN — the model '{resolved}' doesn't match any "
-                f"prefix in KNOWLEDGE_CUTOFFS. Update prompt.py if a new model generation "
-                f"has been released.**"
-            )
-        else:
-            lines.append(f"Knowledge cutoff: {cutoff}")
-        lines.append(f"Platform: {platform.system()} {platform.release()}")
-        lines.append(f"Shell: {os.environ.get('SHELL', 'unknown')}")
-        lines.append(f"Working directory: {self.config.home}")
-        lines.append("")
-        lines.append(f"Today's date is **{date.today().strftime('%B %d, %Y')}**.")
-        for extra in self.extra_lines:
-            lines.append(extra)
-        return "\n".join(lines)
+        """Delegate to build_session_context (single source of truth for the
+        trimmed runtime-fields chunk)."""
+        return build_session_context(
+            self.agent_id,
+            self.config.model,
+            parent=self.config.parent,
+            depth=self.config.depth,
+            cwd=str(self.config.home),
+            extra_lines=self.extra_lines,
+        )
 
     def _memory_files(self) -> list[str]:
         """One chunk per context-injection file, each with its own ## heading."""

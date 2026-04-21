@@ -459,7 +459,7 @@ def test_prompt_builder_automatic_placeholders_wired(tmp_path: Path):
         "# Kiln Reference\n\nIntro.\n\n"
         "## Built-In Tools\n\n{builtins}\n\n"
         "## Session Info\n\n"
-        "Agent: {agent_id}. Home: {home_dir}. Today: {today}.\n"
+        "Agent: {agent_id}. Home: {home_dir}. Today: {today}. Docs: {kiln_path}/docs/.\n"
     )
     config = _make_agent_home(tmp_path)
 
@@ -469,6 +469,11 @@ def test_prompt_builder_automatic_placeholders_wired(tmp_path: Path):
     assert "- **Bash**" in out  # {builtins} expanded
     assert "Agent: aid-42." in out
     assert f"Home: {config.home}." in out
+    # {kiln_path} must resolve to the reference dir itself so that
+    # {kiln_path}/docs/tools.md (as used in the real kiln.md) resolves
+    # to an actual file path. .parent.parent would point at src/kiln
+    # and break all doc links.
+    assert f"Docs: {ref_dir}/docs/." in out
 
 
 def test_prompt_builder_extra_lines_appended_to_session_context(tmp_path: Path):
