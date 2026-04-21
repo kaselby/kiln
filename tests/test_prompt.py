@@ -592,3 +592,29 @@ def test_prompt_builder_identity_and_memory_are_not_substituted(tmp_path: Path):
     out = builder.build()
     assert "Identity says {home_dir}." in out
     assert "Volatile says {agent_id}." in out
+
+
+# ---------------------------------------------------------------------------
+# Reference docs index — drift test for scripts/build_docs_index.py
+# ---------------------------------------------------------------------------
+
+
+def test_docs_index_unchanged():
+    """`src/kiln/reference/docs/index.md` must match what
+    `scripts/build_docs_index.py` would regenerate. If this test fails,
+    run the script to update the committed index."""
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script_path = repo_root / "scripts" / "build_docs_index.py"
+    spec = importlib.util.spec_from_file_location("build_docs_index", script_path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    expected = mod.render_index()
+    actual = (mod.DOCS_DIR / "index.md").read_text()
+    assert actual == expected, (
+        "docs/index.md is out of date. Run "
+        "`python scripts/build_docs_index.py` to regenerate."
+    )
