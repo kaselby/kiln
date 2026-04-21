@@ -157,6 +157,54 @@ async def _handle_send_user(msg: proto.Message, daemon: Any) -> proto.Message:
         return proto.error(msg.ref, f"Adapter error: {e}")
 
 
+def _resolve_user_surface(surface_ref: str, daemon: Any) -> str | None:
+    """Resolve a @user surface reference to a canonical platform ref.
+
+    ``@kira`` → ``discord:user:116377049349881863`` using the daemon's
+    user config. Returns None if the user doesn't exist or has no
+    platform configured.
+    """
+    if not surface_ref.startswith("@"):
+        return None
+    user_name = surface_ref[1:]
+    user = daemon.config.users.get(user_name)
+    if not user:
+        return None
+    platform = user.default_platform or next(iter(user.platforms), "")
+    if not platform:
+        return None
+    platform_id = user.platforms.get(platform)
+    if not platform_id:
+        return None
+    return f"{platform}:user:{platform_id}"
+
+
+def _canonicalize_surface_ref(
+    surface_ref: str, daemon: Any, gateway: GatewayService,
+) -> str:
+    """Resolve user references and validate via the owning adapter.
+
+    Raises ValueError if the ref is unresolvable or invalid.
+    """
+    # Resolve @user shorthand
+    if surface_ref.startswith("@"):
+        resolved = _resolve_user_surface(surface_ref, daemon)
+        if resolved is None:
+            raise ValueError(
+                f"Cannot resolve '{surface_ref}': "
+                f"unknown user or no platform configured"
+            )
+        surface_ref = resolved
+
+    # Validate via the owning adapter
+    platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
+    adapter = gateway.adapters.get(platform) if platform else None
+    if adapter and hasattr(adapter, "validate_surface_ref"):
+        surface_ref = adapter.validate_surface_ref(surface_ref)
+
+    return surface_ref
+
+
 async def _handle_subscribe_surface(msg: proto.Message, daemon: Any) -> proto.Message:
     gateway: GatewayService = daemon.services.get("gateway")
     if not gateway:
@@ -172,16 +220,12 @@ async def _handle_subscribe_surface(msg: proto.Message, daemon: Any) -> proto.Me
 
     await daemon.ensure_session(ctx)
 
-    # Validate and canonicalize via the owning adapter
-    platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
-    adapter = gateway.adapters.get(platform) if platform else None
-    if adapter and hasattr(adapter, "validate_surface_ref"):
-        try:
-            surface_ref = adapter.validate_surface_ref(surface_ref)
-        except ValueError as e:
-            return proto.error(
-                msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
-            )
+    try:
+        surface_ref = _canonicalize_surface_ref(surface_ref, daemon, gateway)
+    except ValueError as e:
+        return proto.error(
+            msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
+        )
 
     count = gateway.surfaces.subscribe(surface_ref, ctx.session_id)
 
@@ -212,16 +256,12 @@ async def _handle_unsubscribe_surface(msg: proto.Message, daemon: Any) -> proto.
     if not ctx:
         return proto.error(msg.ref, "unsubscribe_surface requires requester identity")
 
-    # Canonicalize via adapter
-    platform = surface_ref.split(":", 1)[0] if ":" in surface_ref else ""
-    adapter = gateway.adapters.get(platform) if platform else None
-    if adapter and hasattr(adapter, "validate_surface_ref"):
-        try:
-            surface_ref = adapter.validate_surface_ref(surface_ref)
-        except ValueError as e:
-            return proto.error(
-                msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
-            )
+    try:
+        surface_ref = _canonicalize_surface_ref(surface_ref, daemon, gateway)
+    except ValueError as e:
+        return proto.error(
+            msg.ref, f"Invalid surface ref: {e}", code="invalid_surface",
+        )
 
     gateway.surfaces.unsubscribe(surface_ref, ctx.session_id)
 

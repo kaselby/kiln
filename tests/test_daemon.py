@@ -1696,6 +1696,85 @@ async def test_surface_client_caches_canonical_ref(running_daemon, make_client):
 
 
 # ---------------------------------------------------------------------------
+# User reference resolution (@user → platform:user:id)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_surface_subscribe_resolves_user_ref(running_daemon, make_client):
+    """@user subscribe resolves to canonical platform:user:id via daemon user config."""
+    from kiln.daemon.config import UserConfig
+
+    running_daemon.config.users["kira"] = UserConfig(
+        name="kira",
+        platforms={"discord": "116377049349881863"},
+        default_platform="discord",
+    )
+    client = make_client("beth", "beth-resolve-1")
+
+    count = await client.subscribe_surface("@kira")
+    assert count == 1
+
+    # Verify the canonical ref is stored, not the @user shorthand
+    subs = await client.list_surface_subscriptions()
+    refs = {s["surface_ref"] for s in subs}
+    assert "discord:user:116377049349881863" in refs
+    assert "@kira" not in refs
+
+    # Daemon-side truth uses canonical ref
+    subscribers = running_daemon.services["gateway"].surfaces.subscribers(
+        "discord:user:116377049349881863",
+    )
+    assert "beth-resolve-1" in subscribers
+
+
+@pytest.mark.asyncio
+async def test_surface_unsubscribe_resolves_user_ref(running_daemon, make_client):
+    """@user unsubscribe resolves to canonical ref and removes correctly."""
+    from kiln.daemon.config import UserConfig
+
+    running_daemon.config.users["kira"] = UserConfig(
+        name="kira",
+        platforms={"discord": "116377049349881863"},
+        default_platform="discord",
+    )
+    client = make_client("beth", "beth-resolve-2")
+
+    # Subscribe with canonical form, unsubscribe with @user
+    await client.subscribe_surface("discord:user:116377049349881863")
+    await client.unsubscribe_surface("@kira")
+
+    subs = await client.list_surface_subscriptions()
+    assert len(subs) == 0
+    assert "beth-resolve-2" not in running_daemon.services["gateway"].surfaces.subscribers(
+        "discord:user:116377049349881863",
+    )
+
+
+@pytest.mark.asyncio
+async def test_surface_subscribe_unknown_user_ref_errors(running_daemon, make_client):
+    """@unknown_user subscribe returns an error."""
+    client = make_client("beth", "beth-resolve-3")
+
+    with pytest.raises(DaemonError, match="Cannot resolve"):
+        await client.subscribe_surface("@nonexistent")
+
+
+@pytest.mark.asyncio
+async def test_surface_subscribe_user_no_platform_errors(running_daemon, make_client):
+    """@user with no platform configured returns an error."""
+    from kiln.daemon.config import UserConfig
+
+    running_daemon.config.users["ghost"] = UserConfig(
+        name="ghost", platforms={}, default_platform="",
+    )
+    client = make_client("beth", "beth-resolve-4")
+
+    with pytest.raises(DaemonError, match="Cannot resolve"):
+        await client.subscribe_surface("@ghost")
+
+
+# ---------------------------------------------------------------------------
 # Slice C1 — Event routing skeleton
 # ---------------------------------------------------------------------------
 
