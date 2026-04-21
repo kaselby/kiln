@@ -336,6 +336,134 @@ def test_render_kiln_reference_round_trip_no_overrides(tmp_path: Path):
     assert "## Principles\n\nDefault principles." in out
 
 
+def test_render_kiln_reference_placeholder_override_only(tmp_path: Path):
+    """Placeholders-only override (no skeleton, no content file) should
+    substitute into both default and overridden placeholder values."""
+    ref_dir = tmp_path / "reference"
+    ref_dir.mkdir()
+    (ref_dir / "kiln.md").write_text(
+        "# Kiln Reference\n\n"
+        "Intro.\n\n"
+        "## Greeting\n\n"
+        "Hello from {greeter} at {home_dir}.\n"
+    )
+    home = tmp_path / "home"
+    (home / "kiln-doc").mkdir(parents=True)
+    (home / "kiln-doc" / "placeholders.yml").write_text("greeter: Beth\n")
+
+    out = render_kiln_reference(home, ref_dir, {"home_dir": "/x"})
+    assert "Hello from Beth at /x." in out
+
+
+def test_render_kiln_reference_full_override_combined(tmp_path: Path):
+    """Skeleton + content + placeholder overrides stack together: the
+    section order comes from the skeleton, content from the override
+    file, and values from the agent placeholders."""
+    ref_dir = tmp_path / "reference"
+    _make_default_reference(ref_dir)
+    home = tmp_path / "home"
+    (home / "kiln-doc").mkdir(parents=True)
+    # Reordered; Memory placed first
+    (home / "kiln-doc" / "skeleton.md").write_text("## Memory\n## Principles\n")
+    # Content override on Memory; Principles falls through to Kiln default
+    (home / "kiln-doc" / "Memory.md").write_text(
+        "Agent memory for {agent_name} at {home_dir}.\n"
+    )
+    # Agent-defined placeholder available only in override content
+    (home / "kiln-doc" / "placeholders.yml").write_text("agent_name: test-agent\n")
+
+    out = render_kiln_reference(home, ref_dir, {"home_dir": "/h"})
+    # Ordering from skeleton
+    assert out.index("## Memory") < out.index("## Principles")
+    # Override content with agent placeholder resolved
+    assert "Agent memory for test-agent at /h." in out
+    # Principles falls back to Kiln default body
+    assert "Default principles." in out
+    # Kiln default Memory body is NOT present
+    assert "Default memory (should be rare)." not in out
+
+
+def test_render_kiln_reference_ignores_content_file_not_in_skeleton(
+    tmp_path: Path,
+):
+    """A <Heading>.md file whose heading isn't in the skeleton is
+    silently ignored — only the skeleton-listed sections render."""
+    ref_dir = tmp_path / "reference"
+    _make_default_reference(ref_dir)
+    home = tmp_path / "home"
+    (home / "kiln-doc").mkdir(parents=True)
+    (home / "kiln-doc" / "skeleton.md").write_text("## Principles\n")
+    # This file is loaded by load_kiln_overrides but never referenced
+    # because 'Lurker' isn't in the skeleton.
+    (home / "kiln-doc" / "Lurker.md").write_text("Orphaned content.\n")
+
+    out = render_kiln_reference(home, ref_dir, {"home_dir": "/x"})
+    assert "## Principles" in out
+    assert "Orphaned content." not in out
+    assert "Lurker" not in out
+
+
+# ---------------------------------------------------------------------------
+# Shipped reference — smoke test against the real kiln.md
+# ---------------------------------------------------------------------------
+
+
+def test_shipped_kiln_md_parses_and_renders(tmp_path: Path):
+    """The shipped src/kiln/reference/kiln.md should parse cleanly with
+    the expected H2 sections, render with all ten automatic placeholders
+    substituted, and contain no unresolved {...} tokens. Guards against
+    someone editing kiln.md into a state the parser can't handle."""
+    import kiln as kiln_package
+    from kiln.prompt import default_kiln_reference_dir
+
+    ref_dir = default_kiln_reference_dir()
+    assert (ref_dir / "kiln.md").exists(), "Shipped kiln.md missing"
+
+    parsed = parse_kiln_sections(ref_dir / "kiln.md")
+    assert parsed.preamble.startswith("# Kiln Reference")
+    # Sanity: every section the current default kiln.md ships with
+    expected = {
+        "Principles",
+        "Built-In Tools",
+        "Shell Tools",
+        "Skills",
+        "Communication",
+        "Collaboration",
+        "Lifecycle",
+    }
+    assert expected.issubset(set(parsed.sections.keys()))
+
+    # Render with a fake home and a filled-in placeholder set matching
+    # what PromptBuilder would inject, then confirm no unresolved tokens
+    # linger.
+    home = tmp_path / "home"
+    home.mkdir()
+    placeholders = {
+        "home_dir": "/agent/home",
+        "kiln_path": str(ref_dir),
+        "builtins": "- **Bash** — test",
+        "tool_index": "- **fake-tool** — one-liner",
+        "skill_index": "- **fake-skill** — one-liner",
+        "agent_id": "test-agent-0001",
+        "cwd": "/agent/home",
+        "platform": "Darwin 24.6.0",
+        "today": "April 21, 2026",
+        "now": "2026-04-21T12:00:00",
+    }
+    out = render_kiln_reference(home, ref_dir, placeholders)
+    assert "{home_dir}" not in out
+    assert "{kiln_path}" not in out
+    assert "{builtins}" not in out
+    assert "{tool_index}" not in out
+    assert "{skill_index}" not in out
+    # Each docs/ link should resolve to a real on-disk file
+    import re
+
+    for match in re.finditer(r"`([^`]*/docs/[^`]*\.md)`", out):
+        link_path = Path(match.group(1))
+        assert link_path.exists(), f"Doc link {link_path} does not resolve"
+
+
 # ---------------------------------------------------------------------------
 # PromptBuilder — orchestrator
 # ---------------------------------------------------------------------------
