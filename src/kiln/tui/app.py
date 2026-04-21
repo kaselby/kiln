@@ -25,6 +25,7 @@ from pathlib import Path
 
 import yaml
 from markdown_it import MarkdownIt
+from markdown_it.tree import SyntaxTreeNode
 
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
@@ -141,169 +142,221 @@ def _tprint(html_str: str, *args, **kwargs) -> None:
 
 # ---- Markdown rendering ----
 #
-# Uses markdown-it-py to parse complete text into tokens, then converts
-# to prompt_toolkit FormattedText. Runs at commit time.
+# Uses markdown-it-py to parse complete text into tokens, then builds a
+# SyntaxTreeNode tree, then renders recursively via three primitives:
+#
+#   _Line  = list[(style, text)]  — a single logical line (no \n inside)
+#   _Block = list[_Line]          — a block renders to a list of lines
+#
+#   _render_node(node)        -> _Block      (one renderer per block type)
+#   _join_blocks(blocks, sep) -> _Block      (concatenate, optional blank line between)
+#   _indent_block(b, f, r)    -> _Block      (prefix first line with f, rest with r)
+#
+# Inter-block spacing is a property of the composer, not individual renderers.
+# Indentation recurses naturally for nested lists. No conditionals for
+# "what happens when X precedes Y" — the tree and the composer handle it.
 
 _md = MarkdownIt("commonmark").enable("table")
 
-_StyleTuples = list[tuple[str, str]]
+_Line = list[tuple[str, str]]
+_Block = list[_Line]
 
 
 def _markdown_to_ft(text: str) -> FormattedText:
     """Convert markdown text to FormattedText via markdown-it-py."""
     tokens = _md.parse(text)
-    result: _StyleTuples = []
-    _render_block_tokens(tokens, result)
-    # Trim trailing newlines
-    while result and result[-1][1] == "\n":
-        result.pop()
-    return FormattedText(result)
+    root = SyntaxTreeNode(tokens)
+    block = _render_children(root, blank_between=True)
+    return _block_to_ft(block)
 
 
-def _render_block_tokens(tokens: list, result: _StyleTuples) -> None:
-    """Walk the flat block-level token list and render into styled tuples."""
-    i = 0
-    style_ctx: list[str] = []  # block-level styles (e.g. heading -> bold)
-    list_stack: list[tuple[str, int]] = []  # ("bullet"|"ordered", counter)
+def _block_to_ft(block: _Block) -> FormattedText:
+    """Flatten a _Block into FormattedText, joining lines with '\\n'."""
+    out: list[tuple[str, str]] = []
+    for i, line in enumerate(block):
+        if i > 0:
+            out.append(("", "\n"))
+        out.extend(line)
+    return FormattedText(out)
 
-    while i < len(tokens):
-        tok = tokens[i]
 
-        # --- Headings ---
-        if tok.type == "heading_open":
-            style_ctx.append("class:text-heading")
-        elif tok.type == "heading_close":
-            style_ctx.pop()
-            result.append(("", "\n"))
+def _join_blocks(blocks: list[_Block], blank_between: bool) -> _Block:
+    """Concatenate blocks; optionally insert one blank line between each pair."""
+    out: _Block = []
+    emitted = False
+    for b in blocks:
+        if not b:
+            continue
+        if emitted and blank_between:
+            out.append([])  # blank separator line
+        out.extend(b)
+        emitted = True
+    return out
 
-        # --- Paragraphs ---
-        elif tok.type == "paragraph_open":
+
+def _indent_block(block: _Block, first_prefix: str, rest_prefix: str) -> _Block:
+    """Prepend first_prefix to the first line, rest_prefix to all subsequent
+    non-empty lines. Blank lines stay blank (no trailing whitespace)."""
+    if not block:
+        return block
+    out: _Block = []
+    first_applied = False
+    for line in block:
+        if not line:
+            out.append([])
+            continue
+        prefix = first_prefix if not first_applied else rest_prefix
+        out.append([("", prefix)] + line)
+        first_applied = True
+    # Edge case: block started with blank lines and first_prefix never applied.
+    # That's fine — it means a leading blank, which we preserve.
+    return out
+
+
+def _render_children(parent: SyntaxTreeNode, blank_between: bool) -> _Block:
+    """Render each block-level child, then join with the given spacing."""
+    return _join_blocks(
+        [_render_node(c) for c in parent.children], blank_between=blank_between
+    )
+
+
+def _render_node(node: SyntaxTreeNode) -> _Block:
+    """Dispatch a single block-level node to its renderer."""
+    t = node.type
+    if t == "heading":
+        return _render_heading(node)
+    if t == "paragraph":
+        return _render_paragraph(node)
+    if t == "bullet_list":
+        return _render_list(node, ordered=False)
+    if t == "ordered_list":
+        return _render_list(node, ordered=True)
+    if t == "fence":
+        return _render_fence(node)
+    if t == "code_block":
+        return _render_code_block(node)
+    if t == "blockquote":
+        return _render_blockquote(node)
+    if t == "hr":
+        return [[("class:dim", "─" * 40)]]
+    if t == "table":
+        return _render_table(node)
+    if t == "html_block":
+        # Preserve raw content as one or more lines.
+        content = (node.content or "").rstrip("\n")
+        return [[("class:dim", line)] for line in content.split("\n")]
+    # Unknown block: skip silently rather than break rendering.
+    return []
+
+
+def _render_heading(node: SyntaxTreeNode) -> _Block:
+    inline = node.children[0] if node.children else None
+    tuples = _render_inline(inline, base_style="class:text-heading") if inline else []
+    # Headings are single-line (softbreaks become spaces for display).
+    return [_flatten_break_lines(tuples)[0]] if tuples else []
+
+
+def _render_paragraph(node: SyntaxTreeNode) -> _Block:
+    inline = node.children[0] if node.children else None
+    if inline is None:
+        return []
+    tuples = _render_inline(inline, base_style="class:text")
+    # Soft/hard breaks in inline become line boundaries within the paragraph block.
+    return _flatten_break_lines(tuples)
+
+
+def _render_fence(node: SyntaxTreeNode) -> _Block:
+    lines: _Block = []
+    lang = (node.info or "").strip()
+    if lang:
+        lines.append([("class:dim-i", f"  {lang}")])
+    for line in (node.content or "").rstrip("\n").split("\n"):
+        lines.append([("class:md-code", f"  {line}")])
+    return lines
+
+
+def _render_code_block(node: SyntaxTreeNode) -> _Block:
+    return [
+        [("class:md-code", f"  {line}")]
+        for line in (node.content or "").rstrip("\n").split("\n")
+    ]
+
+
+def _render_blockquote(node: SyntaxTreeNode) -> _Block:
+    body = _render_children(node, blank_between=True)
+    # Prefix every non-empty line with "│ " dimmed.
+    out: _Block = []
+    for line in body:
+        if not line:
+            out.append([])
+        else:
+            out.append([("class:dim", "│ ")] + line)
+    return out
+
+
+def _render_list(node: SyntaxTreeNode, ordered: bool) -> _Block:
+    loose = _is_loose_list(node)
+    start = 1
+    if ordered:
+        # markdown-it exposes the start attribute on the opening token via nester_tokens.
+        try:
+            opening = node.nester_tokens.opening
+            start_attr = opening.attrGet("start")
+            if start_attr is not None:
+                start = int(start_attr)
+        except (AttributeError, ValueError, TypeError):
             pass
-        elif tok.type == "paragraph_close":
-            if not tok.hidden:
-                result.append(("", "\n"))
 
-        # --- Inline content ---
-        elif tok.type == "inline":
-            _render_inline(tok.children or [], result, list(style_ctx))
+    # Width of the widest marker so vertical alignment is preserved in
+    # ordered lists (e.g. 9. vs 10.).
+    items = node.children
+    if ordered:
+        max_marker = max(len(f"{start + i}. ") for i in range(len(items)))
+    else:
+        max_marker = len("• ")
 
-        # --- Fenced code blocks ---
-        elif tok.type == "fence":
-            lang = tok.info.strip()
-            if lang:
-                result.append(("class:dim-i", f"  {lang}\n"))
-            for line in tok.content.rstrip("\n").split("\n"):
-                result.append(("class:md-code", f"  {line}\n"))
+    item_blocks: list[_Block] = []
+    for idx, item in enumerate(items):
+        body = _render_children(item, blank_between=loose)
+        if ordered:
+            marker = f"{start + idx}. ".ljust(max_marker)
+        else:
+            marker = "• ".ljust(max_marker)
+        rest_indent = " " * max_marker
+        item_blocks.append(_indent_block(body, first_prefix=marker, rest_prefix=rest_indent))
 
-        # --- Indented code blocks ---
-        elif tok.type == "code_block":
-            for line in tok.content.rstrip("\n").split("\n"):
-                result.append(("class:md-code", f"  {line}\n"))
+    return _join_blocks(item_blocks, blank_between=loose)
 
-        # --- Lists ---
-        elif tok.type == "bullet_list_open":
-            list_stack.append(("bullet", 0))
-        elif tok.type == "bullet_list_close":
-            if list_stack:
-                list_stack.pop()
-        elif tok.type == "ordered_list_open":
-            list_stack.append(("ordered", 0))
-        elif tok.type == "ordered_list_close":
-            if list_stack:
-                list_stack.pop()
-        elif tok.type == "list_item_open":
-            if list_stack:
-                kind, count = list_stack[-1]
-                count += 1
-                list_stack[-1] = (kind, count)
-                indent = "  " * len(list_stack)
-                if kind == "bullet":
-                    result.append(("class:text", f"{indent}• "))
+
+def _is_loose_list(list_node: SyntaxTreeNode) -> bool:
+    """A list is loose if any of its direct list_items contains a non-hidden
+    paragraph. markdown-it sets paragraph.hidden=True in tight lists."""
+    for item in list_node.children:
+        for child in item.children:
+            if child.type == "paragraph" and not child.hidden:
+                return True
+    return False
+
+
+def _render_table(node: SyntaxTreeNode) -> _Block:
+    """Render a table node into aligned columns."""
+    rows: list[tuple[bool, list[str]]] = []  # (is_header, cell_texts)
+
+    for section in node.children:  # thead / tbody
+        is_header = section.type == "thead"
+        for row in section.children:  # tr
+            cells = []
+            for cell in row.children:  # th / td
+                # cell.children[0] is inline
+                if cell.children:
+                    inline = cell.children[0]
+                    cells.append(_inline_to_plain(inline))
                 else:
-                    result.append(("class:text", f"{indent}{count}. "))
-        elif tok.type == "list_item_close":
-            result.append(("", "\n"))
-
-        # --- Blockquotes ---
-        elif tok.type == "blockquote_open":
-            style_ctx.append("class:dim")
-        elif tok.type == "blockquote_close":
-            if "class:dim" in style_ctx:
-                style_ctx.remove("class:dim")
-
-        # --- Horizontal rules ---
-        elif tok.type == "hr":
-            result.append(("class:dim", "─" * 40 + "\n"))
-
-        # --- Tables ---
-        elif tok.type == "table_open":
-            table_tokens = []
-            i += 1
-            while i < len(tokens) and tokens[i].type != "table_close":
-                table_tokens.append(tokens[i])
-                i += 1
-            _render_table(table_tokens, result)
-
-        # --- HTML blocks (show raw) ---
-        elif tok.type == "html_block":
-            result.append(("class:dim", tok.content))
-
-        i += 1
-
-
-def _render_inline(
-    children: list, result: _StyleTuples, style_stack: list[str]
-) -> None:
-    """Render inline token children with a style stack for nesting."""
-    for tok in children:
-        if tok.type == "text":
-            parts = list(style_stack) if style_stack else []
-            # Ensure text color unless an explicit class is already set
-            if not any(p.startswith("class:") for p in parts):
-                parts.insert(0, "class:text")
-            result.append((" ".join(parts), tok.content))
-        elif tok.type == "strong_open":
-            style_stack.append("bold")
-        elif tok.type == "strong_close":
-            if "bold" in style_stack:
-                style_stack.remove("bold")
-        elif tok.type == "em_open":
-            style_stack.append("italic")
-        elif tok.type == "em_close":
-            if "italic" in style_stack:
-                style_stack.remove("italic")
-        elif tok.type == "code_inline":
-            result.append(("class:md-code", tok.content))
-        elif tok.type in ("softbreak", "hardbreak"):
-            result.append(("", "\n"))
-        elif tok.type == "link_open":
-            pass  # text shows via child text tokens
-        elif tok.type == "link_close":
-            pass
-        elif tok.type == "image":
-            result.append(("class:dim", f"[image: {tok.content}]"))
-
-
-def _render_table(tokens: list, result: _StyleTuples) -> None:
-    """Render table tokens with aligned columns."""
-    rows: list[tuple[bool, list[str]]] = []  # (is_header, cells)
-    current_row: list[str] = []
-    in_header = False
-
-    for tok in tokens:
-        if tok.type == "thead_open":
-            in_header = True
-        elif tok.type == "thead_close":
-            in_header = False
-        elif tok.type == "tr_open":
-            current_row = []
-        elif tok.type == "tr_close":
-            rows.append((in_header, current_row))
-        elif tok.type == "inline":
-            current_row.append(_inline_to_plain(tok.children or []))
+                    cells.append("")
+            rows.append((is_header, cells))
 
     if not rows:
-        return
+        return []
 
     num_cols = max(len(cells) for _, cells in rows)
     col_widths = [0] * num_cols
@@ -311,26 +364,112 @@ def _render_table(tokens: list, result: _StyleTuples) -> None:
         for j, cell in enumerate(cells):
             col_widths[j] = max(col_widths[j], len(cell))
 
+    out: _Block = []
     for is_hdr, cells in rows:
         padded = [
             (cells[j] if j < len(cells) else "").ljust(col_widths[j])
             for j in range(num_cols)
         ]
-        line = "  " + " \u2502 ".join(padded) + "\n"
+        line_text = "  " + " \u2502 ".join(padded)
         if is_hdr:
-            result.append(("class:text-heading", line))
-            sep = "  " + "\u2500\u253c\u2500".join(
-                "\u2500" * w for w in col_widths
-            ) + "\n"
-            result.append(("class:dim", sep))
+            out.append([("class:text-heading", line_text)])
+            sep_text = "  " + "\u2500\u253c\u2500".join("\u2500" * w for w in col_widths)
+            out.append([("class:dim", sep_text)])
         else:
-            result.append(("class:text", line))
+            out.append([("class:text", line_text)])
+    return out
 
 
-def _inline_to_plain(children: list) -> str:
-    """Extract plain text from inline children (for table cell measurement)."""
+def _render_inline(
+    inline: SyntaxTreeNode, base_style: str
+) -> list[tuple[str, str]]:
+    """Render an inline node's raw token stream into styled tuples. We walk
+    the FLAT inline token list (``inline.token.children``) rather than the
+    nested tree form — inline styling composes naturally with a simple style
+    stack scanned in order (strong_open / strong_close etc.).
+
+    Breaks are kept as ("", "\\n") sentinels that _flatten_break_lines splits on.
+    """
+    result: list[tuple[str, str]] = []
+    style_stack: list[str] = [base_style]
+
+    def current_style() -> str:
+        # Keep at most one "class:*" (the base color/heading), then modifiers.
+        class_style = None
+        modifiers = []
+        for s in style_stack:
+            if not s:
+                continue
+            if s.startswith("class:"):
+                class_style = s
+            else:
+                modifiers.append(s)
+        parts = []
+        if class_style:
+            parts.append(class_style)
+        parts.extend(modifiers)
+        return " ".join(parts)
+
+    raw_tokens = inline.token.children if inline.token else []
+    for tok in (raw_tokens or []):
+        t = tok.type
+        if t == "text":
+            result.append((current_style(), tok.content))
+        elif t == "strong_open":
+            style_stack.append("bold")
+        elif t == "strong_close":
+            if "bold" in style_stack:
+                style_stack.remove("bold")
+        elif t == "em_open":
+            style_stack.append("italic")
+        elif t == "em_close":
+            if "italic" in style_stack:
+                style_stack.remove("italic")
+        elif t == "code_inline":
+            result.append(("class:md-code", tok.content))
+        elif t in ("softbreak", "hardbreak"):
+            result.append(("", "\n"))
+        elif t == "link_open":
+            pass
+        elif t == "link_close":
+            pass
+        elif t == "image":
+            result.append(("class:dim", f"[image: {tok.content}]"))
+    return result
+
+
+def _flatten_break_lines(tuples: list[tuple[str, str]]) -> _Block:
+    """Split a flat list of styled tuples on embedded '\\n' sentinels into
+    a list of lines. Empty lines are preserved as []."""
+    lines: _Block = [[]]
+    for style, text in tuples:
+        if text == "\n":
+            lines.append([])
+            continue
+        # Also handle text that contains embedded newlines (rare but possible).
+        if "\n" in text:
+            segments = text.split("\n")
+            for k, seg in enumerate(segments):
+                if k > 0:
+                    lines.append([])
+                if seg:
+                    lines[-1].append((style, seg))
+        else:
+            lines[-1].append((style, text))
+    # If the only line is empty, drop it.
+    if lines and not any(lines):
+        return []
+    return lines
+
+
+def _inline_to_plain(inline: SyntaxTreeNode) -> str:
+    """Extract plain text from an inline node (used for table cell measurement).
+
+    Uses the flat token stream so it sees text inside strong/em wrappers.
+    """
     parts = []
-    for tok in children:
+    raw_tokens = inline.token.children if inline.token else []
+    for tok in (raw_tokens or []):
         if tok.type == "text":
             parts.append(tok.content)
         elif tok.type == "code_inline":
