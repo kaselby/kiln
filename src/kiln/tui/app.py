@@ -1434,10 +1434,15 @@ class KilnApp:
     def _on_buffer_text_changed(self, buffer) -> None:
         """Propagate buffer edits to the queued steering slot in real time.
 
-        Fires for every keystroke in edit mode. Empty buffers are held in
-        limbo — we don't auto-delete while the user is mid-edit; Enter on
-        empty formalizes the deletion. The ``_suspend_live_edit`` flag lets
-        internal buffer loads (navigation between slots) skip propagation.
+        Non-empty edits flow straight into ``queue[idx]``. Emptying the
+        buffer seamlessly removes the slot: if the queue still has
+        neighbors the next one is loaded into the buffer and edit mode
+        stays alive (Esc can still roll back via the snapshot); if the
+        queue just drained to empty we exit edit mode and restore the
+        pre-edit buffer, mirroring the other exit paths.
+
+        The ``_suspend_live_edit`` flag lets internal buffer loads skip
+        this handler so they don't round-trip back into the queue.
         """
         if self._suspend_live_edit:
             return
@@ -1449,8 +1454,44 @@ class KilnApp:
         text = buffer.text.strip()
         if text:
             self._steering_queue[idx] = text
-        # Empty buffer: leave the queue slot alone; Enter will finalize the
-        # deletion. Invalidate so the panel reflects the live content.
+            if self._app:
+                self._app.invalidate()
+            return
+
+        # Empty buffer → seamlessly delete the slot.
+        del self._steering_queue[idx]
+
+        if not self._steering_queue:
+            # Queue is now empty — no neighbor to fall back to. Exit edit
+            # mode and restore whatever the user had typed before entering.
+            prior = self._editing_prior_buffer
+            self._editing_steering = False
+            self._editing_index = None
+            self._editing_prior_buffer = None
+            self._editing_queue_snapshot = None
+            self._suspend_live_edit = True
+            try:
+                buffer.reset()
+                if prior:
+                    buffer.insert_text(prior)
+            finally:
+                self._suspend_live_edit = False
+            if self._app:
+                self._app.invalidate()
+            return
+
+        # Clamp the index and load the neighbor so the edit session stays
+        # alive. Staying at the same idx naturally shifts to what was the
+        # next-newer entry; if we deleted the tail, step back one.
+        if idx >= len(self._steering_queue):
+            idx = len(self._steering_queue) - 1
+        self._editing_index = idx
+        self._suspend_live_edit = True
+        try:
+            buffer.reset()
+            buffer.insert_text(self._steering_queue[idx])
+        finally:
+            self._suspend_live_edit = False
         if self._app:
             self._app.invalidate()
 
