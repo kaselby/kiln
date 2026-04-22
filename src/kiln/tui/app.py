@@ -843,14 +843,14 @@ class KilnApp:
         def _commit_steering_edit(text: str) -> None:
             """Apply the buffer's contents to the queue slot being edited."""
             idx = app_ref._editing_index
-            if idx is None:
-                return
-            if text:
-                app_ref._steering_queue[idx] = text
-                _tprint("<dim>Edited queued steering:</dim> {}", text)
-            else:
-                del app_ref._steering_queue[idx]
-                _tprint("<dim>Deleted queued steering</dim>")
+            # Guard against stale index if the queue drained during edit.
+            if idx is not None and 0 <= idx < len(app_ref._steering_queue):
+                if text:
+                    app_ref._steering_queue[idx] = text
+                    _tprint("<dim>Edited queued steering:</dim> {}", text)
+                else:
+                    del app_ref._steering_queue[idx]
+                    _tprint("<dim>Deleted queued steering</dim>")
             app_ref._input_buffer.reset()
             if app_ref._editing_prior_buffer:
                 app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
@@ -927,12 +927,26 @@ class KilnApp:
         def handle_newline(event):
             event.current_buffer.newline()
 
-        def _load_editing_buffer() -> None:
+        def _load_editing_buffer() -> bool:
+            """Load the indexed steering message into the buffer.
+
+            Returns False and exits edit mode if the index is invalid
+            (queue drained or mutated out-of-band). Callers can trust
+            a True return means the buffer is synced to the queue slot.
+            """
             idx = app_ref._editing_index
-            if idx is None:
-                return
+            if idx is None or not (0 <= idx < len(app_ref._steering_queue)):
+                # Stale index — bail cleanly.
+                app_ref._input_buffer.reset()
+                if app_ref._editing_prior_buffer:
+                    app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                app_ref._editing_steering = False
+                app_ref._editing_index = None
+                app_ref._editing_prior_buffer = None
+                return False
             app_ref._input_buffer.reset()
             app_ref._input_buffer.insert_text(app_ref._steering_queue[idx])
+            return True
 
         # Alt+Up: open the steering queue for editing, or navigate older.
         # First press pops "newest" (tail) into the buffer; subsequent
@@ -1105,10 +1119,13 @@ class KilnApp:
         n_steering = len(self._steering_queue)
         n_followup = len(self._followup_queue)
         if n_steering:
-            if self._editing_steering and self._editing_index is not None:
-                pos = f"{self._editing_index + 1}/{n_steering}"
+            idx = self._editing_index
+            editing_in_range = (
+                self._editing_steering and idx is not None and 0 <= idx < n_steering
+            )
+            if editing_in_range:
                 parts.append(
-                    f"<tool>↪ editing {pos}</tool> "
+                    f"<tool>↪ editing {idx + 1}/{n_steering}</tool> "
                     f"<dim>(Alt+↑/↓ nav • Enter commit • Esc cancel)</dim>"
                 )
             else:
@@ -1948,6 +1965,18 @@ class KilnApp:
             if etype == "steering_delivered":
                 for msg in ev.get("messages", []):
                     _tprint("\n<user>You (steering):</user> {}", msg)
+                # Steering was drained out from under an in-flight edit.
+                # Exit edit mode cleanly — the queue slot no longer exists.
+                if self._editing_steering:
+                    self._input_buffer.reset()
+                    if self._editing_prior_buffer:
+                        self._input_buffer.insert_text(self._editing_prior_buffer)
+                    self._editing_steering = False
+                    self._editing_index = None
+                    self._editing_prior_buffer = None
+                    _tprint("<dim>Queued steering delivered — edit cancelled</dim>")
+                    if self._app:
+                        self._app.invalidate()
             elif etype == "inbox_message":
                 sender = ev.get("from", "unknown")
                 summary = ev.get("summary", "")
