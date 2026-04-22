@@ -711,35 +711,37 @@ def wrap_hook_visibility(hook_fn, name: str, ui_events: list[dict]):
     return visible_hook
 
 
-def create_queued_message_hook(queue: list[str], ui_events: list[dict]):
-    """Create a PostToolUse hook that delivers steering messages mid-turn.
+def create_steering_hook(queue: list[str]):
+    """PostToolUse hook that aborts the current turn when steering is pending.
 
     Steering messages are user input typed while the agent is receiving.
-    They're injected as additionalContext so the agent sees them before
-    its next action — all at once, not one-at-a-time. Distinct from
-    followup messages, which are delivered as proper user prompts between
-    turns by the TUI.
+    This hook signals ``continue_=False`` at the next tool boundary so the
+    harness can inject queued messages as proper ``role: user`` turns in
+    ``harness.receive()`` — matching Pi's semantics where steering arrives
+    mid-turn as real user messages, not hook-level additionalContext.
+
+    Distinct from followup messages, which are scripted prompts drained
+    between turns by the TUI via ``harness.followup_queue``.
     """
 
-    async def queued_message_hook(
+    async def steering_hook(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
         if not queue:
             return {}
 
-        messages = list(queue)
-        queue.clear()
-        ui_events.append({"type": "followup_delivered", "messages": messages})
-
-        parts = [f"[User followup]: {msg}" for msg in messages]
         return {
+            "continue_": False,
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": "\n".join(parts),
-            }
+                "additionalContext": (
+                    "[User steering pending — turn aborted so queued user "
+                    "input can be injected as a proper user message.]"
+                ),
+            },
         }
 
-    return queued_message_hook
+    return steering_hook
 
 
 def create_message_sent_hook(ui_events: list[dict]):

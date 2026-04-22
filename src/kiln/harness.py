@@ -48,9 +48,9 @@ from .hooks import (
     create_inbox_check_hook,
     create_message_sent_hook,
     create_plan_nudge_hook,
-    create_queued_message_hook,
     create_read_tracking_hook,
     create_skill_context_hook,
+    create_steering_hook,
     create_supplemental_content_hook,
     create_usage_log_hook,
     wrap_hook_visibility,
@@ -691,6 +691,7 @@ class KilnHarness:
             "tags": list(self.config.tags),
             "context_limit_mode": self.config.context_limit_mode,
             "context_limit_tokens": self.config.context_limit_tokens,
+            "steering_delivery": self.config.steering_delivery,
         }
 
 
@@ -718,9 +719,7 @@ class KilnHarness:
             self.config.home / "logs", self.agent_id,
             self.config.tools_path / "bin",
         )
-        queued_messages = create_queued_message_hook(
-            self.steering_queue, self.ui_events,
-        )
+        steering_hook = create_steering_hook(self.steering_queue)
         message_sent = create_message_sent_hook(self.ui_events)
         supplemental_hook = create_supplemental_content_hook(self._supplemental)
 
@@ -733,7 +732,7 @@ class KilnHarness:
         if self.config.hook_visibility:
             ui = self.ui_events
             inbox_check = wrap_hook_visibility(inbox_check, "inbox_check", ui)
-            queued_messages = wrap_hook_visibility(queued_messages, "queued_messages", ui)
+            steering_hook = wrap_hook_visibility(steering_hook, "steering", ui)
             session_state = wrap_hook_visibility(session_state, "session_state", ui)
             plan_nudge = wrap_hook_visibility(plan_nudge, "plan_nudge", ui)
             skill_context = wrap_hook_visibility(skill_context, "skill_context", ui)
@@ -742,7 +741,7 @@ class KilnHarness:
         hooks = {
             "PostToolUse": [
                 HookMatcher(matcher=None, hooks=[
-                    inbox_check, queued_messages,
+                    inbox_check, steering_hook,
                     session_state, usage_log, plan_nudge,
                 ]),
                 HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker, supplemental_hook]),
@@ -1126,9 +1125,16 @@ class KilnHarness:
         turns).  If detected, interrupts generation immediately to prevent
         tool calls from executing on fabricated input.
 
-        After each receive cycle, checks for pending supplemental content
-        (e.g. PDF document blocks). If found, transparently injects it as
-        a new user turn and continues yielding.
+        After each receive cycle, drains pending content that hooks
+        signaled for delivery via ``continue_=False``:
+
+        - Supplemental content (e.g. PDF document blocks from Read).
+        - Steering messages (user input typed mid-turn, injected as real
+          ``role: user`` turns — Pi-style semantics).
+
+        Each injection produces a fresh turn from the backend, yielding
+        its events into the same stream. Drain continues until no more
+        injections are pending.
 
         Stream timeout is handled by the backend. If the backend yields an
         ErrorEvent(is_retryable=True), queues a recovery message so the
@@ -1140,13 +1146,54 @@ class KilnHarness:
         async for event in self._receive_guarded():
             yield event
 
-        # Transparent supplemental content injection.
-        while self._supplemental and self._supplemental.has_pending:
-            items = self._supplemental.drain()
-            rich_blocks = self._build_supplemental_blocks(items)
-            await self._backend.send(rich_blocks)
+        # Drain hook-signaled injections (continue_=False). Each iteration
+        # may produce further injections from the resulting turn.
+        while True:
+            blocks = self._drain_pending_injections()
+            if not blocks:
+                break
+            await self._backend.send(blocks)
             async for event in self._receive_guarded():
                 yield event
+
+    def _drain_pending_injections(self) -> list[ContentBlock] | None:
+        """Pull content for the next hook-signaled injection turn.
+
+        Supplemental content is prioritized (triggered by a specific tool
+        call) over steering (user-driven; can wait one cycle if both are
+        pending). Returns ``None`` when nothing is pending.
+        """
+        if self._supplemental and self._supplemental.has_pending:
+            items = self._supplemental.drain()
+            return self._build_supplemental_blocks(items)
+        if self.steering_queue:
+            return self._build_steering_blocks()
+        return None
+
+    def _build_steering_blocks(self) -> list[ContentBlock]:
+        """Drain the steering queue into user-message content blocks.
+
+        Delivery mode is read live from session config:
+
+        - ``"all"`` (default): all queued messages flushed as one user
+          turn, separated by blank lines.
+        - ``"one-at-a-time"``: only the head of the queue is taken;
+          remaining messages stay queued for subsequent drain cycles.
+        """
+        mode = "all"
+        if self.session_config is not None:
+            mode = str(self.session_config.get("steering_delivery") or "all")
+
+        if mode == "one-at-a-time":
+            messages = [self.steering_queue.pop(0)]
+        else:
+            messages = list(self.steering_queue)
+            self.steering_queue.clear()
+
+        self.ui_events.append({"type": "steering_delivered", "messages": messages})
+
+        combined = "\n\n".join(messages)
+        return [TextContent(text=combined)]
 
     async def _receive_guarded(self):
         """Yield events from the backend with output guardrail scanning.

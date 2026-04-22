@@ -736,6 +736,12 @@ class KilnApp:
         # Clipboard image paste: queued images sent with the next message
         self._pending_images: list[Path] = []
 
+        # Steering edit mode: set when Alt+Up pops a queued message into
+        # the input buffer. _editing_prior_buffer preserves whatever the
+        # user was typing so Esc can restore it. None = not in edit mode.
+        self._editing_steering: bool = False
+        self._editing_prior_buffer: str | None = None
+
         # Context limit: tracks the last limit value that fired the crossing
         # handler. Stored as an int (not bool) so that raising the cap mid-session
         # re-arms the trigger at the new limit. None means the handler has never
@@ -779,9 +785,14 @@ class KilnApp:
         )
 
     def _input_prefix(self, line_number: int, wrap_count: int) -> list[tuple[str, str]]:
-        """Prefix for input lines: '> ' on first line, '  ' on continuations."""
+        """Prefix for input lines: '> ' on first line, '  ' on continuations.
+
+        In steering-edit mode, shows '↪ ' to indicate the current buffer is
+        a queued message being edited (Enter re-queues, empty deletes, Esc restores).
+        """
         if line_number == 0 and wrap_count == 0:
-            return [("", "> ")]
+            prefix = "↪ " if self._editing_steering else "> "
+            return [("", prefix)]
         return [("", "  ")]
 
     def _build_keybindings(self) -> KeyBindings:
@@ -828,6 +839,19 @@ class KilnApp:
         @kb.add("enter", filter=is_idle & ~is_permission_pending)
         def handle_enter(event):
             text = app_ref._input_buffer.text.strip()
+            if app_ref._editing_steering:
+                # Edit-mode submit: empty → delete, non-empty → re-queue at end.
+                if text:
+                    app_ref._steering_queue.append(text)
+                    _tprint("<dim>Edited:</dim> {}", text)
+                else:
+                    _tprint("<dim>Deleted queued steering</dim>")
+                app_ref._input_buffer.reset()
+                app_ref._editing_steering = False
+                app_ref._editing_prior_buffer = None
+                if app_ref._app:
+                    app_ref._app.invalidate()
+                return
             has_images = bool(app_ref._pending_images)
             if not text and not has_images:
                 return
@@ -873,6 +897,20 @@ class KilnApp:
         @kb.add("enter", filter=is_receiving & ~is_permission_pending)
         def handle_enter_receiving(event):
             text = app_ref._input_buffer.text.strip()
+            if app_ref._editing_steering:
+                # Edit-mode submit: empty → delete, non-empty → re-queue at end.
+                # Queue entry was popped on Alt+Up, so nothing more to remove.
+                if text:
+                    app_ref._steering_queue.append(text)
+                    _tprint("<dim>Edited:</dim> {}", text)
+                else:
+                    _tprint("<dim>Deleted queued steering</dim>")
+                app_ref._input_buffer.reset()
+                app_ref._editing_steering = False
+                app_ref._editing_prior_buffer = None
+                if app_ref._app:
+                    app_ref._app.invalidate()
+                return
             if not text:
                 return
             app_ref._steering_queue.append(text)
@@ -885,6 +923,29 @@ class KilnApp:
         @kb.add(Keys.F20)           # CSI u Shift+Enter (kitty/WezTerm/Ghostty)
         def handle_newline(event):
             event.current_buffer.newline()
+
+        # Alt+Up: pop the most-recent queued steering message into the
+        # input buffer for editing. Enter re-queues (empty = delete); Esc
+        # restores. If already editing, pop the next-older message (cycle).
+        @kb.add("escape", "up", filter=~is_permission_pending)
+        def handle_edit_steering(event):
+            if not app_ref._steering_queue:
+                return
+            if not app_ref._editing_steering:
+                # Enter edit mode: preserve current buffer so Esc can restore.
+                app_ref._editing_prior_buffer = app_ref._input_buffer.text
+                app_ref._editing_steering = True
+            else:
+                # Already editing — current buffer is the message being edited.
+                # Put it back onto the queue (at end) before cycling older.
+                current = app_ref._input_buffer.text
+                if current.strip():
+                    app_ref._steering_queue.append(current)
+            popped = app_ref._steering_queue.pop()
+            app_ref._input_buffer.reset()
+            app_ref._input_buffer.insert_text(popped)
+            if app_ref._app:
+                app_ref._app.invalidate()
 
         # Smart paste: Ctrl+V checks clipboard for images, falls back to text.
         @kb.add("c-v")
@@ -909,9 +970,33 @@ class KilnApp:
             if req and not req.event.is_set():
                 req.decide(False)
 
+        def _cancel_steering_edit() -> bool:
+            """If in edit mode, restore queue + buffer. Returns True if handled."""
+            if not app_ref._editing_steering:
+                return False
+            popped = app_ref._input_buffer.text
+            if popped.strip():
+                app_ref._steering_queue.append(popped)
+            app_ref._input_buffer.reset()
+            if app_ref._editing_prior_buffer:
+                app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+            app_ref._editing_steering = False
+            app_ref._editing_prior_buffer = None
+            _tprint("<dim>Edit cancelled — steering restored to queue</dim>")
+            if app_ref._app:
+                app_ref._app.invalidate()
+            return True
+
         @kb.add("escape", filter=is_receiving & ~is_permission_pending)
         def handle_escape(event):
+            # Cancel steering edit before treating Esc as interrupt.
+            if _cancel_steering_edit():
+                return
             asyncio.ensure_future(app_ref._do_interrupt())
+
+        @kb.add("escape", filter=is_idle & ~is_permission_pending)
+        def handle_escape_idle(event):
+            _cancel_steering_edit()
 
         @kb.add("c-c")
         async def handle_quit(event):
@@ -990,9 +1075,15 @@ class KilnApp:
                 parts.append(f"\U0001f4e8 {pending} pending")
 
         # Queued messages waiting for delivery
-        n_queued = len(self._steering_queue) + len(self._followup_queue)
-        if n_queued:
-            parts.append(f"<tool>{n_queued} queued</tool>")
+        n_steering = len(self._steering_queue)
+        n_followup = len(self._followup_queue)
+        if n_steering:
+            parts.append(
+                f"<tool>↪ {n_steering} steering</tool> "
+                f"<dim>(Alt+↑ edit)</dim>"
+            )
+        if n_followup:
+            parts.append(f"<tool>{n_followup} queued</tool>")
 
         if self._receiving and not self._pending_permission:
             parts.append("Esc to interrupt")
@@ -1377,6 +1468,16 @@ class KilnApp:
             fut.set_result(None)
             return fut  # type: ignore[return-value]
 
+        # New turn supersedes any in-flight interrupt drain. Cancel the
+        # old receive task so its finally block runs (generation mismatch
+        # will prevent it from stomping state we're about to set).
+        if self._interrupt_in_flight and self._active_turn_task and not self._active_turn_task.done():
+            self._active_turn_task.cancel()
+        if self._interrupt_cancel_handle is not None:
+            self._interrupt_cancel_handle.cancel()
+            self._interrupt_cancel_handle = None
+        self._interrupt_in_flight = False
+
         self._active_turn_generation += 1
         generation = self._active_turn_generation
         self._receiving = True
@@ -1505,10 +1606,23 @@ class KilnApp:
 
 
     async def _do_interrupt(self) -> None:
-        """Interrupt the current response."""
+        """Interrupt the current response.
+
+        Input is unlocked immediately (``_receiving = False``) so the user
+        regains control without waiting for the SDK round-trip. The old
+        receive task continues draining in the background until the backend
+        yields ``TurnCompleteEvent`` (or the 5s safety timer force-cancels
+        it). ``_interrupt_in_flight`` stays True until that cleanup runs,
+        so the auto-drain path in ``_maybe_start_next_turn`` waits; an
+        explicit user-initiated ``_start_turn`` clears it and supersedes.
+        """
         if not self._receiving or self._interrupt_in_flight:
             return
         self._interrupt_in_flight = True
+        # Unlock UI immediately — don't wait on the SDK interrupt round-trip.
+        self._receiving = False
+        if self._app:
+            self._app.invalidate()
 
         if self._pending_permission and not self._pending_permission.event.is_set():
             self._pending_permission.decide(False)
@@ -1797,9 +1911,9 @@ class KilnApp:
         events.clear()
         for ev in batch:
             etype = ev.get("type", "")
-            if etype == "followup_delivered":
+            if etype == "steering_delivered":
                 for msg in ev.get("messages", []):
-                    _tprint("\n<user>You (followup):</user> {}", msg)
+                    _tprint("\n<user>You (steering):</user> {}", msg)
             elif etype == "inbox_message":
                 sender = ev.get("from", "unknown")
                 summary = ev.get("summary", "")

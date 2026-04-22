@@ -50,6 +50,7 @@ class SessionConfig:
         "tags": [],      # routing/presence tags for this live session
         "context_limit_mode": "soft",     # "off" | "soft" | "hard"
         "context_limit_tokens": 200_000,  # behavioral cap; applies to all modes
+        "steering_delivery": "all",       # "all" | "one-at-a-time"
     }
 
 
