@@ -99,6 +99,11 @@ TUI_STYLE = Style.from_dict({
     "agent-msg-b": "ansimagenta bold",
     "perm-prompt": "ansiyellow bold",
     "perm-key": "ansicyan bold",
+    "steering-header": "ansiyellow bold",
+    "steering-num": "#888888",
+    "steering-msg": "#cccccc",
+    "steering-editing": "ansiyellow bold reverse",
+    "steering-hint": "#888888",
     "mode-safe": "ansired bold",
     "mode-supervised": "ansiyellow bold",
     "mode-yolo": "ansigreen bold",
@@ -764,11 +769,23 @@ class KilnApp:
         def has_pending_permission():
             return self._pending_permission is not None
 
+        @Condition
+        def has_queued_steering():
+            return bool(self._steering_queue)
+
         layout = Layout(
             HSplit([
                 ConditionalContainer(
                     Window(FormattedTextControl(self._permission_bar), height=1),
                     filter=has_pending_permission,
+                ),
+                ConditionalContainer(
+                    Window(
+                        FormattedTextControl(self._steering_panel),
+                        height=D(min=1, max=8),
+                        wrap_lines=True,
+                    ),
+                    filter=has_queued_steering,
                 ),
                 Window(
                     BufferControl(buffer=self._input_buffer),
@@ -894,6 +911,9 @@ class KilnApp:
             if text == "/usage":
                 app_ref._show_usage()
                 return
+            if text == "/queue":
+                app_ref._show_queue()
+                return
 
             # Collect pending images before sending
             images = list(app_ref._pending_images) if app_ref._pending_images else None
@@ -948,12 +968,8 @@ class KilnApp:
             app_ref._input_buffer.insert_text(app_ref._steering_queue[idx])
             return True
 
-        # Alt+Up: open the steering queue for editing, or navigate older.
-        # First press pops "newest" (tail) into the buffer; subsequent
-        # presses walk toward older entries. Queue is not mutated until
-        # Enter (commits edit / deletes if empty) or Esc (discards).
-        @kb.add("escape", "up", filter=~is_permission_pending)
-        def handle_edit_steering_up(event):
+        def _steering_up() -> None:
+            """Enter or navigate older in the steering-edit queue."""
             if not app_ref._steering_queue:
                 return
             if not app_ref._editing_steering:
@@ -969,10 +985,8 @@ class KilnApp:
             if app_ref._app:
                 app_ref._app.invalidate()
 
-        # Alt+Down: walk toward newer entries; past the newest, exit edit
-        # mode and restore whatever the user was typing before.
-        @kb.add("escape", "down", filter=~is_permission_pending)
-        def handle_edit_steering_down(event):
+        def _steering_down() -> None:
+            """Walk toward newer entries; past the newest, exit edit mode."""
             if not app_ref._editing_steering or app_ref._editing_index is None:
                 return
             if app_ref._editing_index < len(app_ref._steering_queue) - 1:
@@ -988,6 +1002,45 @@ class KilnApp:
                 app_ref._editing_prior_buffer = None
             if app_ref._app:
                 app_ref._app.invalidate()
+
+        # Alt+Up / Alt+Down: explicit Pi-style bindings. Always navigate the
+        # steering queue when non-empty — they never collide with buffer
+        # cursor motion because the modifier disambiguates.
+        @kb.add("escape", "up", filter=~is_permission_pending)
+        def handle_alt_up(event):
+            _steering_up()
+
+        @kb.add("escape", "down", filter=~is_permission_pending)
+        def handle_alt_down(event):
+            _steering_down()
+
+        # Plain Up / Down: discoverable CC-style fallback for terminals
+        # where Alt+Arrow doesn't produce the expected escape sequence.
+        # Filter keeps multi-line cursor motion intact — we only hijack
+        # when hijacking is the *only* sensible interpretation.
+        @Condition
+        def up_navigates_queue():
+            if app_ref._editing_steering:
+                return True
+            if not app_ref._steering_queue:
+                return False
+            # Not editing — only take Up when the cursor is at the top row
+            # of the buffer, so multi-line cursor-up still works.
+            return app_ref._input_buffer.document.cursor_position_row == 0
+
+        @Condition
+        def down_navigates_queue():
+            # Down only makes sense inside edit mode (exits / walks newer).
+            # Outside of edit mode we never hijack plain Down.
+            return app_ref._editing_steering
+
+        @kb.add("up", filter=~is_permission_pending & up_navigates_queue)
+        def handle_plain_up(event):
+            _steering_up()
+
+        @kb.add("down", filter=~is_permission_pending & down_navigates_queue)
+        def handle_plain_down(event):
+            _steering_down()
 
         # Smart paste: Ctrl+V checks clipboard for images, falls back to text.
         @kb.add("c-v")
@@ -1115,24 +1168,9 @@ class KilnApp:
             if pending:
                 parts.append(f"\U0001f4e8 {pending} pending")
 
-        # Queued messages waiting for delivery
-        n_steering = len(self._steering_queue)
+        # Queued messages waiting for delivery — panel above the input bar
+        # carries the detail, so keep the toolbar entry compact.
         n_followup = len(self._followup_queue)
-        if n_steering:
-            idx = self._editing_index
-            editing_in_range = (
-                self._editing_steering and idx is not None and 0 <= idx < n_steering
-            )
-            if editing_in_range:
-                parts.append(
-                    f"<tool>↪ editing {idx + 1}/{n_steering}</tool> "
-                    f"<dim>(Alt+↑/↓ nav • Enter commit • Esc cancel)</dim>"
-                )
-            else:
-                parts.append(
-                    f"<tool>↪ {n_steering} steering</tool> "
-                    f"<dim>(Alt+↑ edit)</dim>"
-                )
         if n_followup:
             parts.append(f"<tool>{n_followup} queued</tool>")
 
@@ -1194,6 +1232,30 @@ class KilnApp:
         tasks = data["tasks"]
         done = sum(1 for t in tasks if t.get("status") == "done")
         _tprint("<dim>Progress: {}/{} done</dim>\n", done, len(tasks))
+
+    def _show_queue(self) -> None:
+        """Dump all queued steering/follow-up messages to scrollback.
+
+        Text fallback for terminals where the Up/Alt+Up keybind doesn't
+        fire — users can confirm what's queued and drop individual entries
+        by editing them via keybind (or just see they're there).
+        """
+        steering = list(self._steering_queue)
+        followup = list(self._followup_queue)
+        if not steering and not followup:
+            _tprint("<dim>No queued messages.</dim>")
+            return
+        if steering:
+            word = "message" if len(steering) == 1 else "messages"
+            _tprint("\n<text-heading>Queued steering ({} {}):</text-heading>", len(steering), word)
+            for i, msg in enumerate(steering, start=1):
+                _tprint("  <tool>{}</tool>  {}", i, msg)
+        if followup:
+            word = "message" if len(followup) == 1 else "messages"
+            _tprint("\n<text-heading>Queued follow-ups ({} {}):</text-heading>", len(followup), word)
+            for i, msg in enumerate(followup, start=1):
+                _tprint("  <tool>{}</tool>  {}", i, msg)
+        _tprint("")
 
     def _show_usage(self) -> None:
         """Show subscription usage for all providers."""
@@ -1312,6 +1374,97 @@ class KilnApp:
             "  <perm-key>[y]</perm-key> accept"
             "  <perm-key>[n]</perm-key> reject".format(tool=_display_name(req.tool_name))
         )
+
+    def _steering_panel(self) -> FormattedText:
+        """Persistent panel above the input bar listing queued steering messages.
+
+        Always visible when ``self._steering_queue`` is non-empty. Shows each
+        entry numbered with the currently-edited slot highlighted. Single-
+        line truncation keeps the panel bounded; a windowing scheme handles
+        queues larger than the visible cap. User text is kept out of HTML
+        parsing by emitting ``FormattedText`` tuples directly.
+        """
+        queue = self._steering_queue
+        parts: list[tuple[str, str]] = []
+        if not queue:
+            return FormattedText(parts)
+
+        n = len(queue)
+        editing_idx = self._editing_index if self._editing_steering else None
+        in_range = editing_idx is not None and 0 <= editing_idx < n
+
+        # Header line — differs when actively editing.
+        if in_range:
+            parts.append((
+                "class:steering-header",
+                f" ↪ editing {editing_idx + 1}/{n}",
+            ))
+            parts.append((
+                "class:steering-hint",
+                "  (↑/↓ or Alt+↑/↓ nav • Enter commit • empty deletes • Esc cancel)",
+            ))
+        else:
+            word = "message" if n == 1 else "messages"
+            parts.append((
+                "class:steering-header",
+                f" ↪ {n} queued steering {word}",
+            ))
+            parts.append((
+                "class:steering-hint",
+                "  (↑ or Alt+↑ to edit • /queue to list)",
+            ))
+        parts.append(("", "\n"))
+
+        # Pick a visible window. Newest entries are at the tail; they're the
+        # most likely target of a quick Alt+↑ edit, so the default window
+        # shows the tail. While editing, slide the window around the edited
+        # index so it stays in view.
+        MAX_SHOWN = 7
+        MAX_LEN = 120
+        if n <= MAX_SHOWN:
+            start, end = 0, n
+        elif in_range:
+            half = MAX_SHOWN // 2
+            start = max(0, editing_idx - half)
+            end = min(n, start + MAX_SHOWN)
+            start = max(0, end - MAX_SHOWN)
+        else:
+            start, end = n - MAX_SHOWN, n
+
+        if start > 0:
+            parts.append((
+                "class:steering-hint",
+                f"  … ({start} older hidden)\n",
+            ))
+
+        for i in range(start, end):
+            raw = queue[i]
+            # Collapse newlines + strip control chars so the line stays on
+            # one row. FormattedText bypasses HTML parsing but terminals
+            # still choke on raw control bytes.
+            flat = _XML_INVALID_RE.sub("", raw.replace("\n", " ⏎ "))
+            if len(flat) > MAX_LEN:
+                flat = flat[: MAX_LEN - 1] + "…"
+            num = f"{i + 1:>3}"
+            if i == editing_idx:
+                parts.append(("class:steering-editing", f" {num}  {flat}  ← editing"))
+            else:
+                parts.append(("class:steering-num", f" {num}  "))
+                parts.append(("class:steering-msg", flat))
+            parts.append(("", "\n"))
+
+        if end < n:
+            parts.append((
+                "class:steering-hint",
+                f"  … ({n - end} newer hidden)",
+            ))
+        else:
+            # Drop the trailing newline — otherwise the panel leaves a blank
+            # row between itself and the input bar.
+            if parts and parts[-1] == ("", "\n"):
+                parts.pop()
+
+        return FormattedText(parts)
 
     def run(self) -> None:
         """Run the TUI event loop."""
