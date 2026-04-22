@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -99,11 +100,12 @@ TUI_STYLE = Style.from_dict({
     "agent-msg-b": "ansimagenta bold",
     "perm-prompt": "ansiyellow bold",
     "perm-key": "ansicyan bold",
-    "steering-header": "ansiyellow bold",
-    "steering-num": "#888888",
+    "steering-rule": "#666666",
+    "steering-header": "ansicyan",
+    "steering-num": "#666666",
     "steering-msg": "#cccccc",
-    "steering-editing": "ansiyellow bold reverse",
-    "steering-hint": "#888888",
+    "steering-editing": "ansicyan reverse",
+    "steering-hint": "#888888 italic",
     "mode-safe": "ansired bold",
     "mode-supervised": "ansiyellow bold",
     "mode-yolo": "ansigreen bold",
@@ -1379,49 +1381,63 @@ class KilnApp:
     def _steering_panel(self) -> FormattedText:
         """Persistent panel above the input bar listing queued steering messages.
 
-        Always visible when ``self._steering_queue`` is non-empty. Shows each
-        entry numbered with the currently-edited slot highlighted. Single-
-        line truncation keeps the panel bounded; a windowing scheme handles
-        queues larger than the visible cap. User text is kept out of HTML
-        parsing by emitting ``FormattedText`` tuples directly.
+        Renders a thin top rule with inline label + hint, then one line per
+        queued entry (numbered for multi-entry queues, un-numbered for N=1).
+        The entry being edited is rendered reverse-video. Queues larger than
+        ``MAX_SHOWN`` slide a window around the edit index, with hidden-count
+        markers top and bottom.
+
+        Styled as dim chrome so it reads as UI, not scrollback. User-supplied
+        text bypasses the HTML parser via ``FormattedText`` tuples.
         """
         queue = self._steering_queue
-        parts: list[tuple[str, str]] = []
         if not queue:
-            return FormattedText(parts)
+            return FormattedText([])
 
         n = len(queue)
         editing_idx = self._editing_index if self._editing_steering else None
         in_range = editing_idx is not None and 0 <= editing_idx < n
 
-        # Header line — differs when actively editing.
+        # Available width for the top rule. Clamp to a sane band so we don't
+        # paint a 300-char divider on ultra-wide terminals.
+        try:
+            cols = shutil.get_terminal_size().columns
+        except OSError:
+            cols = 80
+        rule_width = max(40, min(cols - 1, 120))
+
+        # Left label + right hint — label narrates state, hint narrates keys.
         if in_range:
-            parts.append((
-                "class:steering-header",
-                f" ↪ editing {editing_idx + 1}/{n}",
-            ))
-            parts.append((
-                "class:steering-hint",
-                "  (↑/↓ or Alt+↑/↓ nav • Enter commit • empty deletes • Esc cancel)",
-            ))
+            label = f" ↪ editing {editing_idx + 1}/{n} "
+            hint = " ↑/↓ nav · Enter commit · Esc cancel "
         else:
-            word = "message" if n == 1 else "messages"
-            parts.append((
-                "class:steering-header",
-                f" ↪ {n} queued steering {word}",
-            ))
-            parts.append((
-                "class:steering-hint",
-                "  (↑ or Alt+↑ to edit • /queue to list)",
-            ))
+            count_word = "queued" if n == 1 else f"{n} queued"
+            label = f" ↪ {count_word} "
+            hint = " ↑ edit · /queue "
+
+        # Build top rule: ──label─...─hint──
+        left_edge = 2
+        right_edge = 2
+        gap = rule_width - left_edge - len(label) - len(hint) - right_edge
+        if gap < 4:
+            # Too narrow — drop the hint, let the label breathe.
+            hint = ""
+            gap = max(4, rule_width - left_edge - len(label) - right_edge)
+
+        parts: list[tuple[str, str]] = []
+        parts.append(("class:steering-rule", "─" * left_edge))
+        parts.append(("class:steering-header", label))
+        parts.append(("class:steering-rule", "─" * gap))
+        if hint:
+            parts.append(("class:steering-hint", hint))
+            parts.append(("class:steering-rule", "─" * right_edge))
         parts.append(("", "\n"))
 
-        # Pick a visible window. Newest entries are at the tail; they're the
-        # most likely target of a quick Alt+↑ edit, so the default window
-        # shows the tail. While editing, slide the window around the edited
-        # index so it stays in view.
+        # Pick a visible window. Newest entries are at the tail; in edit mode,
+        # slide the window around the edited index so it stays visible.
         MAX_SHOWN = 7
-        MAX_LEN = 120
+        # Leave room for "  NN  " prefix when numbered (6 chars).
+        max_msg_len = max(20, rule_width - 8)
         if n <= MAX_SHOWN:
             start, end = 0, n
         elif in_range:
@@ -1433,35 +1449,33 @@ class KilnApp:
             start, end = n - MAX_SHOWN, n
 
         if start > 0:
-            parts.append((
-                "class:steering-hint",
-                f"  … ({start} older hidden)\n",
-            ))
+            parts.append(("class:steering-hint", f"    … {start} older\n"))
 
+        numbered = n > 1
         for i in range(start, end):
-            raw = queue[i]
-            # Collapse newlines + strip control chars so the line stays on
-            # one row. FormattedText bypasses HTML parsing but terminals
-            # still choke on raw control bytes.
-            flat = _XML_INVALID_RE.sub("", raw.replace("\n", " ⏎ "))
-            if len(flat) > MAX_LEN:
-                flat = flat[: MAX_LEN - 1] + "…"
-            num = f"{i + 1:>3}"
-            if i == editing_idx:
-                parts.append(("class:steering-editing", f" {num}  {flat}  ← editing"))
+            # Collapse newlines + strip control chars so each entry is a
+            # single row regardless of what the user typed.
+            flat = _XML_INVALID_RE.sub("", queue[i].replace("\n", " ⏎ "))
+            if len(flat) > max_msg_len:
+                flat = flat[: max_msg_len - 1] + "…"
+
+            if numbered:
+                prefix = f"  {i + 1:>2}  "
+                parts.append(("class:steering-num", prefix))
             else:
-                parts.append(("class:steering-num", f" {num}  "))
+                parts.append(("class:steering-num", "  "))
+
+            if i == editing_idx:
+                parts.append(("class:steering-editing", flat))
+            else:
                 parts.append(("class:steering-msg", flat))
             parts.append(("", "\n"))
 
         if end < n:
-            parts.append((
-                "class:steering-hint",
-                f"  … ({n - end} newer hidden)",
-            ))
+            parts.append(("class:steering-hint", f"    … {n - end} newer"))
         else:
-            # Drop the trailing newline — otherwise the panel leaves a blank
-            # row between itself and the input bar.
+            # Drop the trailing newline so the panel sits flush against the
+            # input bar — otherwise we get a blank row between them.
             if parts and parts[-1] == ("", "\n"):
                 parts.pop()
 
