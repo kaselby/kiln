@@ -736,10 +736,14 @@ class KilnApp:
         # Clipboard image paste: queued images sent with the next message
         self._pending_images: list[Path] = []
 
-        # Steering edit mode: set when Alt+Up pops a queued message into
-        # the input buffer. _editing_prior_buffer preserves whatever the
-        # user was typing so Esc can restore it. None = not in edit mode.
+        # Steering edit mode: set when Alt+Up opens the queue for
+        # browsing/editing. _editing_index points into steering_queue at
+        # the currently-displayed message. The queue itself is not mutated
+        # during navigation — changes only commit on Enter (replace if
+        # non-empty, delete if empty) or revert on Esc. In-flight buffer
+        # edits are discarded when navigating away (Pi/CC semantics).
         self._editing_steering: bool = False
+        self._editing_index: int | None = None
         self._editing_prior_buffer: str | None = None
 
         # Context limit: tracks the last limit value that fired the crossing
@@ -836,21 +840,31 @@ class KilnApp:
             if app_ref._app:
                 app_ref._app.invalidate()
 
+        def _commit_steering_edit(text: str) -> None:
+            """Apply the buffer's contents to the queue slot being edited."""
+            idx = app_ref._editing_index
+            if idx is None:
+                return
+            if text:
+                app_ref._steering_queue[idx] = text
+                _tprint("<dim>Edited queued steering:</dim> {}", text)
+            else:
+                del app_ref._steering_queue[idx]
+                _tprint("<dim>Deleted queued steering</dim>")
+            app_ref._input_buffer.reset()
+            if app_ref._editing_prior_buffer:
+                app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+            app_ref._editing_steering = False
+            app_ref._editing_index = None
+            app_ref._editing_prior_buffer = None
+            if app_ref._app:
+                app_ref._app.invalidate()
+
         @kb.add("enter", filter=is_idle & ~is_permission_pending)
         def handle_enter(event):
             text = app_ref._input_buffer.text.strip()
             if app_ref._editing_steering:
-                # Edit-mode submit: empty → delete, non-empty → re-queue at end.
-                if text:
-                    app_ref._steering_queue.append(text)
-                    _tprint("<dim>Edited:</dim> {}", text)
-                else:
-                    _tprint("<dim>Deleted queued steering</dim>")
-                app_ref._input_buffer.reset()
-                app_ref._editing_steering = False
-                app_ref._editing_prior_buffer = None
-                if app_ref._app:
-                    app_ref._app.invalidate()
+                _commit_steering_edit(text)
                 return
             has_images = bool(app_ref._pending_images)
             if not text and not has_images:
@@ -898,18 +912,7 @@ class KilnApp:
         def handle_enter_receiving(event):
             text = app_ref._input_buffer.text.strip()
             if app_ref._editing_steering:
-                # Edit-mode submit: empty → delete, non-empty → re-queue at end.
-                # Queue entry was popped on Alt+Up, so nothing more to remove.
-                if text:
-                    app_ref._steering_queue.append(text)
-                    _tprint("<dim>Edited:</dim> {}", text)
-                else:
-                    _tprint("<dim>Deleted queued steering</dim>")
-                app_ref._input_buffer.reset()
-                app_ref._editing_steering = False
-                app_ref._editing_prior_buffer = None
-                if app_ref._app:
-                    app_ref._app.invalidate()
+                _commit_steering_edit(text)
                 return
             if not text:
                 return
@@ -924,26 +927,51 @@ class KilnApp:
         def handle_newline(event):
             event.current_buffer.newline()
 
-        # Alt+Up: pop the most-recent queued steering message into the
-        # input buffer for editing. Enter re-queues (empty = delete); Esc
-        # restores. If already editing, pop the next-older message (cycle).
+        def _load_editing_buffer() -> None:
+            idx = app_ref._editing_index
+            if idx is None:
+                return
+            app_ref._input_buffer.reset()
+            app_ref._input_buffer.insert_text(app_ref._steering_queue[idx])
+
+        # Alt+Up: open the steering queue for editing, or navigate older.
+        # First press pops "newest" (tail) into the buffer; subsequent
+        # presses walk toward older entries. Queue is not mutated until
+        # Enter (commits edit / deletes if empty) or Esc (discards).
         @kb.add("escape", "up", filter=~is_permission_pending)
-        def handle_edit_steering(event):
+        def handle_edit_steering_up(event):
             if not app_ref._steering_queue:
                 return
             if not app_ref._editing_steering:
-                # Enter edit mode: preserve current buffer so Esc can restore.
                 app_ref._editing_prior_buffer = app_ref._input_buffer.text
                 app_ref._editing_steering = True
+                app_ref._editing_index = len(app_ref._steering_queue) - 1
             else:
-                # Already editing — current buffer is the message being edited.
-                # Put it back onto the queue (at end) before cycling older.
-                current = app_ref._input_buffer.text
-                if current.strip():
-                    app_ref._steering_queue.append(current)
-            popped = app_ref._steering_queue.pop()
-            app_ref._input_buffer.reset()
-            app_ref._input_buffer.insert_text(popped)
+                if app_ref._editing_index is not None and app_ref._editing_index > 0:
+                    app_ref._editing_index -= 1
+                else:
+                    return  # already at oldest
+            _load_editing_buffer()
+            if app_ref._app:
+                app_ref._app.invalidate()
+
+        # Alt+Down: walk toward newer entries; past the newest, exit edit
+        # mode and restore whatever the user was typing before.
+        @kb.add("escape", "down", filter=~is_permission_pending)
+        def handle_edit_steering_down(event):
+            if not app_ref._editing_steering or app_ref._editing_index is None:
+                return
+            if app_ref._editing_index < len(app_ref._steering_queue) - 1:
+                app_ref._editing_index += 1
+                _load_editing_buffer()
+            else:
+                # Past the newest — exit edit mode, restore original buffer.
+                app_ref._input_buffer.reset()
+                if app_ref._editing_prior_buffer:
+                    app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                app_ref._editing_steering = False
+                app_ref._editing_index = None
+                app_ref._editing_prior_buffer = None
             if app_ref._app:
                 app_ref._app.invalidate()
 
@@ -971,18 +999,17 @@ class KilnApp:
                 req.decide(False)
 
         def _cancel_steering_edit() -> bool:
-            """If in edit mode, restore queue + buffer. Returns True if handled."""
+            """If in edit mode, restore prior buffer. Queue is untouched
+            because navigation doesn't mutate it — only Enter does."""
             if not app_ref._editing_steering:
                 return False
-            popped = app_ref._input_buffer.text
-            if popped.strip():
-                app_ref._steering_queue.append(popped)
             app_ref._input_buffer.reset()
             if app_ref._editing_prior_buffer:
                 app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
             app_ref._editing_steering = False
+            app_ref._editing_index = None
             app_ref._editing_prior_buffer = None
-            _tprint("<dim>Edit cancelled — steering restored to queue</dim>")
+            _tprint("<dim>Edit cancelled</dim>")
             if app_ref._app:
                 app_ref._app.invalidate()
             return True
@@ -1078,10 +1105,17 @@ class KilnApp:
         n_steering = len(self._steering_queue)
         n_followup = len(self._followup_queue)
         if n_steering:
-            parts.append(
-                f"<tool>↪ {n_steering} steering</tool> "
-                f"<dim>(Alt+↑ edit)</dim>"
-            )
+            if self._editing_steering and self._editing_index is not None:
+                pos = f"{self._editing_index + 1}/{n_steering}"
+                parts.append(
+                    f"<tool>↪ editing {pos}</tool> "
+                    f"<dim>(Alt+↑/↓ nav • Enter commit • Esc cancel)</dim>"
+                )
+            else:
+                parts.append(
+                    f"<tool>↪ {n_steering} steering</tool> "
+                    f"<dim>(Alt+↑ edit)</dim>"
+                )
         if n_followup:
             parts.append(f"<tool>{n_followup} queued</tool>")
 
