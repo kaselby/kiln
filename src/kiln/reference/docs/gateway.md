@@ -1,10 +1,10 @@
 # Gateway
 
-The daemon-hosted service that bridges agents to external platforms — Discord today, designed for more. Covers the service model, platform adapters, surface subscriptions, and the inbound/outbound routing paths.
+The daemon-hosted service that bridges agents to external platforms — Discord today, designed for more. Covers platform adapters, surface subscriptions, and the inbound/outbound routing paths. For the general service model (how services plug into the daemon, lifecycle, `DaemonHost`), see `services.md`.
 
 ## Overview
 
-The gateway is one of the daemon's optional services (see `lifecycle.md` for the daemon lifecycle generally). When enabled, it registers a set of platform-facing RPC handlers (`send_user`, `subscribe_surface`, `platform_op`, etc.), loads one or more **adapters** (per-platform plugins), and holds the surface-subscription and bridge state that ties Kiln sessions to platform identities. When disabled, the daemon has zero platform vocabulary — none of those RPC types resolve, no outbound `gateway` commands work.
+When enabled, the gateway registers a set of platform-facing RPC handlers (`send_user`, `subscribe_surface`, `platform_op`, etc.), loads one or more **adapters** (per-platform plugins), and holds the surface-subscription and bridge state that ties Kiln sessions to platform identities. When disabled, the daemon has zero platform vocabulary — none of those RPC types resolve, no outbound `gateway` commands work.
 
 An **adapter** (`kiln.daemon.adapters.*`) is the bridge between one external platform and the daemon. It owns its own network client (e.g. a `discord.Client` instance), classifies inbound platform events into Kiln-shaped routing decisions, delivers to inboxes via the gateway service, and consumes daemon events from the `EventBus` to mirror outbound traffic (Kiln channel broadcasts → Discord threads, for example).
 
@@ -59,7 +59,7 @@ daemon/
 └─────────────────────────────────────────────────┘
 ```
 
-Startup order: `KilnDaemon.start()` brings up the socket server, then `_start_services()` instantiates `GatewayService`, then the gateway's `start()` registers RPC handlers *before* `_start_adapters()`. Adapters subscribe to the `EventBus` only after their own client is connected so half-started adapters don't receive events they can't handle.
+Startup follows the standard service lifecycle (see `services.md`): the daemon instantiates `GatewayService`, then its `start()` registers RPC handlers *before* `_start_adapters()`. Adapters subscribe to the `EventBus` only after their own client is connected so half-started adapters don't receive events they can't handle.
 
 ### Inbound routing
 
@@ -112,6 +112,8 @@ This layout is the current Discord adapter convention. Future platform adapters 
 ## Reference
 
 ### Daemon config — `services.gateway`
+
+Lives under `services.gateway` in the daemon config (see `services.md` for the service-config schema). Gateway-specific fields:
 
 ```yaml
 # ~/.kiln/daemon/config.yml
