@@ -77,7 +77,7 @@ The harness runs a receive loop (`receive()` / `_receive_guarded()`) that yields
   - `session_state` — every 15 tool calls, emits `[Session state] mode=... | context: NkK/MkK | <owner>: presence | Agents: ...`.
   - `plan_nudge` — every 20 tool calls, re-injects the current plan if any tasks are still pending.
   - `usage_log` — appends to `tool-usage.jsonl` for custom tools and skill activations.
-  - `queued_messages` — delivers steering messages the user typed mid-turn.
+  - `steering` — when the user typed input mid-turn, returns `continue_: False` so the harness aborts the current turn and injects the queued text as a real `role: user` message in `receive()` (Pi-style semantics). Delivery mode (`all` vs `one-at-a-time`) read live from session config.
 - **PostToolUse** (matched):
   - `Read` → `read_tracker` (records into `FileState`, marks inbox messages read) + `supplemental_content` (stops continuation when a PDF is pending).
   - `activate_skill` → `skill_context` (injects SKILL.md body).
@@ -88,7 +88,7 @@ Periodic background work:
 - `persist_live_session_state()` / `_snapshot_session_state()` — refreshes `logs/session-state/<agent-id>.yml` with live config, subscriptions, and context tokens.
 - Heartbeat (`config.heartbeat`, seconds; 0 = disabled) — harness-driven nudge so agents can run quasi-async.
 
-Supplemental content (PDFs) breaks the normal flow: the `Read` PostToolUse hook returns `continue_: False`, interrupting the turn; the harness then injects a `DocumentContent` block as a new user message and resumes.
+Supplemental content (PDFs) and steering (user-typed input mid-turn) both break the normal flow via the same mechanism: a PostToolUse hook returns `continue_: False`, the current turn ends, and `harness.receive()` drains any pending injections (`_drain_pending_injections()`) as a fresh user turn before yielding further events. Supplemental is prioritized over steering when both are pending.
 
 ### Shutdown flow
 
