@@ -9,6 +9,8 @@ from kiln.prompt import (
     KilnOverrides,
     KilnSections,
     PromptBuilder,
+    _parse_tool_header,
+    discover_tools,
     load_kiln_overrides,
     parse_kiln_sections,
     render_builtins_summary,
@@ -597,6 +599,122 @@ def test_prompt_builder_identity_and_memory_are_not_substituted(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Reference docs index — drift test for scripts/build_docs_index.py
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# _parse_tool_header — tool header parser
+# ---------------------------------------------------------------------------
+
+
+def test_parse_tool_header_basic():
+    text = "\n".join([
+        "#!/usr/bin/env bash",
+        "# ---",
+        "# name: foo",
+        "# brief: One-liner",
+        "# arguments: \"<x> [y]\"",
+        "# ---",
+        "",
+        "echo hello",
+    ])
+    h = _parse_tool_header(text)
+    assert h == {"name": "foo", "brief": "One-liner", "arguments": "<x> [y]"}
+
+
+def test_parse_tool_header_accepts_blank_comment_lines():
+    """Blank '#' lines must not terminate the header — they preserve YAML
+    structure (e.g. paragraph breaks inside a block scalar) and any fields
+    defined after them must still be captured."""
+    text = "\n".join([
+        "#!/usr/bin/env python3",
+        "# ---",
+        "# name: foo",
+        "# description: |",
+        "#   First paragraph of description.",
+        "#",
+        "#   Second paragraph, after a blank comment line.",
+        "# arguments: \"<x>\"",
+        "# ---",
+        "",
+        "print('hi')",
+    ])
+    h = _parse_tool_header(text)
+    assert h is not None
+    assert h["name"] == "foo"
+    assert h["arguments"] == "<x>"
+    assert "First paragraph" in h["description"]
+    assert "Second paragraph" in h["description"]
+
+
+def test_parse_tool_header_returns_none_when_no_header():
+    assert _parse_tool_header("#!/usr/bin/env bash\necho hello\n") is None
+
+
+def test_parse_tool_header_stops_at_closing_delimiter():
+    text = "\n".join([
+        "# ---",
+        "# name: foo",
+        "# ---",
+        "# name: ignored",  # this should not be parsed
+        "echo hi",
+    ])
+    h = _parse_tool_header(text)
+    assert h == {"name": "foo"}
+
+
+# ---------------------------------------------------------------------------
+# discover_tools — directory scan
+# ---------------------------------------------------------------------------
+
+
+def _write_tool(path: Path, header_body: str) -> None:
+    path.write_text("#!/usr/bin/env bash\n# ---\n" + header_body + "# ---\necho hi\n")
+    path.chmod(0o755)
+
+
+def test_discover_tools_prefers_full_description_over_brief(tmp_path: Path):
+    """Core tools need rich session-context signal — renderers should get the
+    full `description` when it's present, with `brief` available as fallback."""
+    _write_tool(tmp_path / "alpha", (
+        "# name: alpha\n"
+        "# brief: Short one-liner\n"
+        "# description: Full multi-sentence paragraph explaining what alpha does.\n"
+        "# arguments: \"<x>\"\n"
+    ))
+    tools = discover_tools(tmp_path)
+    assert len(tools) == 1
+    t = tools[0]
+    assert t["name"] == "alpha"
+    assert t["description"] == "Full multi-sentence paragraph explaining what alpha does."
+    assert t["brief"] == "Short one-liner"
+    assert t["arguments"] == "<x>"
+
+
+def test_discover_tools_falls_back_to_brief_when_no_description(tmp_path: Path):
+    _write_tool(tmp_path / "beta", (
+        "# name: beta\n"
+        "# brief: Only brief, no description\n"
+    ))
+    tools = discover_tools(tmp_path)
+    assert tools[0]["description"] == "Only brief, no description"
+    assert tools[0]["brief"] == "Only brief, no description"
+
+
+def test_discover_tools_recovers_fields_after_blank_comment_line(tmp_path: Path):
+    """Regression test: previously a blank '#' line terminated header scan,
+    dropping every field defined after it (including arguments)."""
+    _write_tool(tmp_path / "gamma", (
+        "# name: gamma\n"
+        "# description: |\n"
+        "#   Para one.\n"
+        "#\n"
+        "#   Para two.\n"
+        "# arguments: \"<cmd>\"\n"
+    ))
+    tools = discover_tools(tmp_path)
+    assert tools[0]["arguments"] == "<cmd>"
+    assert "Para one." in tools[0]["description"]
+    assert "Para two." in tools[0]["description"]
 
 
 def test_docs_index_unchanged():

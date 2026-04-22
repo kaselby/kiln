@@ -196,9 +196,13 @@ def discover_tools(tools_path: Path) -> list[dict]:
                 continue
             header = _parse_tool_header(text)
             if header and "name" in header:
+                # Prefer full description for listings; fall back to brief.
+                # Renderers that want a one-liner (e.g. library tier) can
+                # use brief directly when it's present.
                 entry = {
                     "name": header["name"],
-                    "description": header.get("brief", header.get("description", "")),
+                    "description": header.get("description", header.get("brief", "")),
+                    "brief": header.get("brief", ""),
                     "arguments": header.get("arguments", ""),
                 }
                 if header.get("cost"):
@@ -241,7 +245,11 @@ def _parse_tool_header(text: str) -> dict | None:
             in_header = True
             continue
         if in_header:
-            if stripped.startswith("# "):
+            if stripped == "#":
+                # Blank comment line — preserves YAML structure (e.g. separates
+                # paragraphs in a block scalar) without terminating the header.
+                header_lines.append("")
+            elif stripped.startswith("# "):
                 header_lines.append(stripped[2:])
             else:
                 break  # non-comment line inside header = malformed, stop
