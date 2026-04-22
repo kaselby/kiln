@@ -120,6 +120,12 @@ class AgentConfig:
     context_limit_mode: str = "soft"
     context_limit_tokens: int = 200_000
 
+    # Steering delivery mode — how queued user-typed mid-turn input is drained.
+    #   "all"           — inject all queued messages at once as a single user turn (default)
+    #   "one-at-a-time" — drip-feed: deliver one message per injection cycle
+    # Runtime-mutable via session_config.
+    steering_delivery: str = "all"
+
     # Tools — namespaced list: "Base::Read", "Kiln::Bash", "MyAgent::CustomTool"
     tools: list[str] = field(default_factory=lambda: list(DEFAULT_TOOLS))
     mcp_server: str | None = None     # path to custom MCP server module (relative to home)
@@ -405,6 +411,16 @@ def _apply_raw_fields(config: AgentConfig, raw: dict) -> None:
         val = raw["context_limit_tokens"]
         if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
             config.context_limit_tokens = int(val)
+
+    # Steering delivery mode — "all" or "one-at-a-time"
+    sd_key = (
+        "steering_delivery" if "steering_delivery" in raw
+        else "steering-delivery" if "steering-delivery" in raw else None
+    )
+    if sd_key:
+        val = str(raw[sd_key]).lower()
+        if val in ("all", "one-at-a-time"):
+            config.steering_delivery = val
 
 
 def load_agent_spec(spec_path: Path) -> AgentConfig:
