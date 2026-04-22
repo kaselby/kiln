@@ -784,6 +784,7 @@ class KilnApp:
                         FormattedTextControl(self._steering_panel),
                         height=D(min=1, max=8),
                         wrap_lines=True,
+                        dont_extend_height=True,
                     ),
                     filter=has_queued_steering,
                 ),
