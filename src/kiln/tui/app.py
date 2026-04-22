@@ -1473,11 +1473,9 @@ class KilnApp:
 
         if end < n:
             parts.append(("class:steering-hint", f"    … {n - end} newer"))
-        else:
-            # Drop the trailing newline so the panel sits flush against the
-            # input bar — otherwise we get a blank row between them.
-            if parts and parts[-1] == ("", "\n"):
-                parts.pop()
+            parts.append(("", "\n"))
+        # Intentionally leave one trailing newline so the panel has a blank
+        # row of breathing room above the input bar rather than sitting flush.
 
         return FormattedText(parts)
 
