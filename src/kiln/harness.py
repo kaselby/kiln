@@ -780,6 +780,10 @@ class KilnHarness:
         resolved = self.config.resolve_tools()
         base_tools = resolved.get("Base", [])
 
+        # Working directory — used by MCP server and BackendConfig.
+        # May be overridden from saved state on resume (see below).
+        cwd = str(self.config.home)
+
         # Environment
         venv_path = self.config.home / "venv"
         tools_path = self.config.tools_path
