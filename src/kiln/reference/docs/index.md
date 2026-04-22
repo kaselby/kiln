@@ -6,6 +6,7 @@ committed index matches the rendered output.
 
 - [`builtins.md`](./builtins.md) — **Built-In Tools.** Full reference for the tools served by Kiln's standard MCP server — the ones that require harness-level wiring (shared shell, file-state tracking, session control, daemon access) and can't be written as shell scripts
 - [`collaboration.md`](./collaboration.md) — **Collaboration.** How Kiln spawns, identifies, and coordinates multi-agent work — the `kiln run` lifecycle, templates, tags, and the agents registry
+- [`customization.md`](./customization.md) — **Customization.** How to bend Kiln to a specific agent's needs — from one-line config tweaks all the way to a fully custom harness
 - [`gateway.md`](./gateway.md) — **Gateway.** The daemon-hosted service that bridges agents to external platforms — Discord today, designed for more
 - [`home.md`](./home.md) — **Agent Home.** The layout and ownership model of an agent's home directory — the single root that holds everything Kiln and the agent itself write
 - [`lifecycle.md`](./lifecycle.md) — **Session Lifecycle.** How a Kiln session starts, runs, and stops — including resume, self-continuation, and the state artifacts each phase reads and writes

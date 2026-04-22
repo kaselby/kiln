@@ -102,6 +102,7 @@ Throughout this reference, `<home>` stands in for the agent's absolute home path
 - `lifecycle.md` — what writes `state/`, `logs/`, `inbox/`, `plans/`, and when.
 - `messaging.md` — inbox delivery format, trust state.
 - `gateway.md` — `credentials/` conventions for platform adapters.
+- `customization.md` — `kiln-doc/` override layers, session templates, and custom harness scaffolding.
 
 ## Conventions
 
