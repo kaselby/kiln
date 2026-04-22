@@ -58,13 +58,12 @@ from .hooks import (
 from .names import generate_agent_name
 from .permissions import PermissionHandler, PermissionMode
 from .prompt import (
-    build_session_context,
+    PromptBuilder,
     discover_skill_layout,
     discover_skills,
     discover_tool_layout,
     discover_tools,
     get_knowledge_cutoff,
-    load_tool_docs,
     resolve_model,
 )
 from .registry import lookup_session, register_session
@@ -619,38 +618,22 @@ class KilnHarness:
             if saved_model:
                 self.config.model = saved_model
 
-        cwd = str(self.config.home)
-
         if saved_state and "system_prompt" in saved_state:
+            # Resume path — reuse the saved system prompt verbatim so a
+            # session resumed mid-run keeps the exact prompt it was
+            # originally launched with. Pre-refactor snapshots continue
+            # to work unchanged.
             full_prompt = saved_state["system_prompt"]
         else:
-            # Build fresh prompt
-            identity = self.config.load_identity()
-            custom_tools = discover_tool_layout(self.config.tools_path)
-            skills = discover_skill_layout(self.config.skills_path)
-
-            extra_lines = [f"Inbox: {self.config.agent_inbox(self.agent_id)}"]
-            session_ctx = build_session_context(
+            # Fresh path — assemble via PromptBuilder. Four chunks
+            # (identity, Kiln reference, session context, memory files)
+            # joined with `\n\n---\n\n`. Only the Kiln reference chunk
+            # is subject to placeholder substitution.
+            full_prompt = PromptBuilder(
+                self.config,
                 self.agent_id,
-                self.config.model,
-                tools=custom_tools,
-                skills=skills,
-                parent=self.config.parent,
-                depth=self.config.depth,
-                cwd=cwd,
-                extra_lines=extra_lines,
-            )
-
-            tool_docs = load_tool_docs(self.config.tools)
-
-            context_parts = []
-            for label, content in self.config.load_context_files():
-                context_parts.append(f"\n\n---\n## {label}\n\n{content}")
-
-            full_prompt = identity
-            if tool_docs:
-                full_prompt += "\n\n" + tool_docs
-            full_prompt += session_ctx + "".join(context_parts)
+                extra_lines=[f"Inbox: {self.config.agent_inbox(self.agent_id)}"],
+            ).build()
 
         # Write an initial derived session snapshot so resume/status surfaces exist
         # even if the session exits early. Values copied here are snapshots, not
@@ -763,8 +746,8 @@ class KilnHarness:
                     session_state, usage_log, plan_nudge,
                 ]),
                 HookMatcher(matcher="mcp__kiln__Read", hooks=[read_tracker, supplemental_hook]),
-                HookMatcher(matcher="mcp__kiln__activate_skill", hooks=[skill_context]),
-                HookMatcher(matcher="mcp__kiln__message", hooks=[message_sent]),
+                HookMatcher(matcher="mcp__kiln__ActivateSkill", hooks=[skill_context]),
+                HookMatcher(matcher="mcp__kiln__Message", hooks=[message_sent]),
             ],
             "Stop": [],
         }

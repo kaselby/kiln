@@ -18,16 +18,35 @@ import yaml
 #
 NAMESPACE_KILN = "Kiln"
 
+# Authoritative set of tools served by Kiln's built-in MCP server.
+# The MCP server registration in tools.py:create_mcp_server must match this.
+# Used by resolve_tools() to fail loud when an agent.yml references a tool
+# that Kiln doesn't expose (e.g. a stale snake_case name).
+KILN_TOOL_NAMES = frozenset({
+    "Bash", "Read", "Write", "Edit",
+    "Plan", "Message", "ActivateSkill", "ExitSession",
+})
+
+# Renamed built-in tools (0.2 → 0.3). Mapping from old snake_case name to
+# new CamelCase name, used to produce a clear error message when an
+# agent.yml still references the old name.
+_RENAMED_KILN_TOOLS = {
+    "plan": "Plan",
+    "message": "Message",
+    "activate_skill": "ActivateSkill",
+    "exit_session": "ExitSession",
+}
+
 # Default tool set when agent spec doesn't specify.
 DEFAULT_TOOLS = [
     "Kiln::Bash",
     "Kiln::Read",
     "Kiln::Write",
     "Kiln::Edit",
-    "Kiln::message",
-    "Kiln::plan",
-    "Kiln::exit_session",
-    "Kiln::activate_skill",
+    "Kiln::Message",
+    "Kiln::Plan",
+    "Kiln::ExitSession",
+    "Kiln::ActivateSkill",
 ]
 
 
@@ -249,6 +268,11 @@ class AgentConfig:
         - Pass Base tools to Claude Code's --tools flag
         - Include Kiln tools from kiln's standard MCP server
         - Include agent tools from the agent's custom MCP server
+
+        Validates that every ``Kiln::<name>`` entry matches a tool Kiln's
+        MCP server actually exposes, raising ValueError with a clear message
+        (including rename guidance) otherwise. Unknown namespaces are not
+        validated — agents can freely introduce their own namespaces.
         """
         result: dict[str, list[str]] = {}
         for entry in self.tools:
@@ -258,6 +282,24 @@ class AgentConfig:
                 continue
             namespace, tool_name = entry.split("::", 1)
             result.setdefault(namespace, []).append(tool_name)
+
+        # Validate Kiln:: tool names — fail loud on old names / typos
+        kiln_tools = result.get(NAMESPACE_KILN, [])
+        for name in kiln_tools:
+            if name in KILN_TOOL_NAMES:
+                continue
+            if name in _RENAMED_KILN_TOOLS:
+                raise ValueError(
+                    f"agent.yml references Kiln::{name} — this tool was "
+                    f"renamed to Kiln::{_RENAMED_KILN_TOOLS[name]} in the "
+                    f"prompt-refactor release. Update your tools list."
+                )
+            raise ValueError(
+                f"agent.yml references Kiln::{name}, which isn't a tool "
+                f"Kiln's MCP server exposes. Known Kiln tools: "
+                f"{', '.join(sorted(KILN_TOOL_NAMES))}."
+            )
+
         return result
 
 

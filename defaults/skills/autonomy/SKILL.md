@@ -26,7 +26,7 @@ When context fills up and work remains, continue into a new session.
 
 2. **Exit with continue and handoff:**
    ```
-   exit_session(continue=true, handoff="What's in flight right now...")
+   ExitSession(continue=true, handoff="What's in flight right now...")
    ```
    The handoff text is delivered as an inbox message to the new session.
    Focus on active state: what you were doing, what's done, what's next,

@@ -1,0 +1,56 @@
+# Opinionated agent spec — demonstrates the canonical shape of a
+# long-lived Kiln agent with memory, context injection, and the
+# session-summary cleanup hook.
+#
+# Compared to examples/minimal-agent.yml, this adds:
+#   - explicit tool list (all eight built-ins),
+#   - context_injection to auto-inject memory into every session,
+#   - orientation and cleanup hooks,
+#   - non-default runtime tuning (effort, heartbeat, initial mode).
+
+name: assistant
+home: ~/.assistant            # absolute or ~-prefixed; agent's single root
+identity_doc: ASSISTANT.md
+
+model: claude-opus-4-7
+effort: max                   # max | high | medium | low — backend-specific
+heartbeat: 30                 # minutes between periodic nudges; 0 to disable
+initial_mode: yolo            # plan | default | yolo — permission stance at start
+
+# Built-in tool surface. Narrow this list to drop capabilities the agent
+# doesn't need (e.g. omit Kiln::ActivateSkill if it has no skills).
+tools:
+  - Kiln::Bash
+  - Kiln::Read
+  - Kiln::Edit
+  - Kiln::Write
+  - Kiln::Plan
+  - Kiln::Message
+  - Kiln::ActivateSkill
+  - Kiln::ExitSession
+
+# Files auto-injected into the system prompt at session start. Each entry
+# becomes a "## <label>" chunk; labels default to the path. See
+# docs/memory.md for the pattern.
+context_injection:
+  - path: memory/durable.md
+    label: "Durable — Core Memory"
+  - path: memory/working.md
+    label: "Working State"
+
+# Model prompt run once at the start of a fresh session. Use it to orient
+# the agent to today's date, recent events, or anything it should check
+# before doing work. Placeholders ({today}, {agent_id}, ...) are substituted
+# at session start.
+orientation: |
+  Today is {today}. Session ID: {agent_id}.
+
+  Skim your working state, then check inbox for anything queued.
+
+# Model prompt run once at shutdown. The canonical shape: write a session
+# summary so `recall` can index it. Placeholders are substituted at
+# shutdown time.
+cleanup: |
+  Write a session summary to memory/sessions/{today}-{agent_id}.md covering
+  what you worked on, key decisions, and anything the next session should
+  know.

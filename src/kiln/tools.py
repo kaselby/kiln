@@ -1499,11 +1499,11 @@ def create_mcp_server(
             file_state,
         )
 
-    @tool("activate_skill", ACTIVATE_SKILL_DESC, ACTIVATE_SKILL_SCHEMA)
+    @tool("ActivateSkill", ACTIVATE_SKILL_DESC, ACTIVATE_SKILL_SCHEMA)
     async def activate_skill_tool(args: dict) -> dict:
         return do_activate_skill(args["name"], skills_path)
 
-    @tool("message", MESSAGE_DESC, MESSAGE_SCHEMA)
+    @tool("Message", MESSAGE_DESC, MESSAGE_SCHEMA)
     async def message_tool(args: dict) -> dict:
         action = args.get("action")
 
@@ -1570,7 +1570,7 @@ def create_mcp_server(
         else:
             return _error(f"Unknown action: {action}. Use send, subscribe, or unsubscribe.")
 
-    @tool("exit_session", EXIT_SESSION_DESC, EXIT_SESSION_SCHEMA)
+    @tool("ExitSession", EXIT_SESSION_DESC, EXIT_SESSION_SCHEMA)
     async def exit_session_tool(args: dict) -> dict:
         return do_exit_session(
             session_control,
@@ -1579,7 +1579,7 @@ def create_mcp_server(
             handoff=args.get("handoff", ""),
         )
 
-    @tool("plan", PLAN_DESC, PLAN_SCHEMA)
+    @tool("Plan", PLAN_DESC, PLAN_SCHEMA)
     async def plan_tool(args: dict) -> dict:
         return do_update_plan(
             _plans_path, agent_id,

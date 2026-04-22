@@ -4,11 +4,7 @@
 exa:              Semantic search via Exa API **[$0.01/call]**
 fetch-tweet:      Fetch tweet text and metadata via FxTwitter API
 hn:               Search and read Hacker News stories and comments
-list-sessions:    List session summaries, most recent first
-log-analysis:     Analyze agent observability logs — tool usage, session stats, conversation content
-read-sessions:    Read session summary contents
 reddit:           Search and read Reddit posts/comments
-session-query:    Query past session conversations
 task:             Atomic TODO.yml task operations with file locking
 tavily:           Web search via Tavily API **[$0.008/call]**
 tokens:           Count tokens in files using tiktoken

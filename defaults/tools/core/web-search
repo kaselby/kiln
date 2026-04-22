@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+# ---
+# name: web-search
+# description: Standalone web search — ranked results with title, URL, and snippets. Primary web search tool for any backend (not tied to Claude Code). Defaults to Tavily; use --answer for an AI-synthesized answer, or --backend exa for semantic search.
+# arguments: "<query> [-n N] [--answer] [--time day|week|month|year] [--include d1,d2] [--exclude d1,d2] [--topic news] [--backend tavily|exa] [--json]"
+# cost: 0.008
+# ---
+"""
+web-search — standalone web search tool.
+
+Replaces Claude Code's built-in WebSearch with a backend-agnostic shell tool.
+Returns ranked results with titles, URLs, and snippets — strictly more info
+than CC WebSearch at similar or lower cost.
+
+Backends:
+  tavily (default) — keyword search with relevance scores, snippets, and
+                     optional AI-synthesized answer. Best for factual lookups,
+                     news, and "find me this page". $0.008/search.
+  exa              — semantic search. Best for conceptual/research queries
+                     where the phrasing is fuzzy. $0.01/search.
+
+Environment:
+  TAVILY_API_KEY  required for tavily backend
+  EXA_API_KEY     required for exa backend
+  AGENT_HOME      optional; if set, credentials are loaded from
+                  $AGENT_HOME/credentials/ and usage is logged via the
+                  budget module.
+
+Examples:
+  web-search "population of Toronto 2026"
+  web-search "rust async runtime" -n 10
+  web-search "Claude Sonnet 4.6" --answer --time month
+  web-search "CVE-2026-1234 advisory" --include redhat.com,debian.org
+  web-search "distributed consensus" --backend exa -n 8
+  web-search "Anthropic release notes" --topic news --time week
+"""
+
+import argparse
+import json
+import os
+import socket
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Force IPv4 — Python prefers IPv6, but many networks can't reach Cloudflare's
+# AAAA records, causing a 60s timeout before IPv4 fallback.
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(*args, **kwargs):
+    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
+socket.getaddrinfo = _ipv4_getaddrinfo
+
+
+# Cost estimates (actual cost returned by API when available)
+COST_TAVILY_BASIC = 0.008
+COST_TAVILY_ADVANCED = 0.016
+COST_EXA = 0.01
+
+# Snippet length cap — keeps output compact across backends
+SNIPPET_CHARS = 350
+
+
+# ---- Credentials + budget ----
+
+_agent_home = os.environ.get("AGENT_HOME", "")
+if _agent_home:
+    _creds_dir = Path(_agent_home) / "credentials"
+    if _creds_dir.is_dir():
+        for _f in _creds_dir.iterdir():
+            if _f.is_file() and not _f.name.startswith(".") and _f.name not in os.environ:
+                os.environ[_f.name] = _f.read_text().strip()
+
+
+def check_budget(cost):
+    """Check budget; returns budget module (for later logging) or None."""
+    if not _agent_home:
+        return None
+    try:
+        sys.path.insert(0, str(Path(_agent_home) / "tools"))
+        from lib import budget
+        allowed, spent, limit, msg = budget.check_budget(cost)
+        if not allowed:
+            print(f"BLOCKED: {msg}", file=sys.stderr)
+            sys.exit(2)
+        if "WARNING" in msg:
+            print(msg, file=sys.stderr)
+        return budget
+    except ImportError:
+        return None
+
+
+def log_usage(budget_mod, cost, params):
+    if budget_mod:
+        log_params = {k: v for k, v in params.items() if k != "api_key" and v not in (None, "", [])}
+        budget_mod.log_usage("web-search", cost, params=log_params)
+
+
+# ---- Backends ----
+
+def tavily_search(args):
+    """Run a Tavily search. Returns (data_dict, cost)."""
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        print("Error: TAVILY_API_KEY not set. Set env var or put in $AGENT_HOME/credentials/TAVILY_API_KEY.", file=sys.stderr)
+        sys.exit(1)
+
+    body = {
+        "query": args.query,
+        "search_depth": args.depth,
+        "max_results": args.num,
+        "topic": args.topic,
+        "include_answer": bool(args.answer),
+        "include_raw_content": False,
+    }
+    if args.time:
+        body["time_range"] = args.time
+    if args.include:
+        body["include_domains"] = args.include
+    if args.exclude:
+        body["exclude_domains"] = args.exclude
+
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "kiln-tools/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        print(f"Tavily API error ({e.code}): {err}", file=sys.stderr)
+        sys.exit(2)
+    except (urllib.error.URLError, socket.timeout) as e:
+        print(f"Tavily network error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    cost = COST_TAVILY_ADVANCED if args.depth == "advanced" else COST_TAVILY_BASIC
+
+    # Unify shape
+    results = []
+    for r in raw.get("results", []):
+        snippet = (r.get("content") or "").strip()
+        if len(snippet) > SNIPPET_CHARS:
+            snippet = snippet[:SNIPPET_CHARS].rstrip() + "…"
+        results.append({
+            "title": r.get("title") or "(no title)",
+            "url": r.get("url") or "",
+            "score": r.get("score"),
+            "snippet": snippet,
+            "published": r.get("published_date"),
+        })
+
+    return {
+        "query": args.query,
+        "backend": "tavily",
+        "answer": raw.get("answer") if args.answer else None,
+        "results": results,
+    }, cost
+
+
+def exa_search(args):
+    """Run an Exa search. Returns (data_dict, cost)."""
+    api_key = os.environ.get("EXA_API_KEY")
+    if not api_key:
+        print("Error: EXA_API_KEY not set. Set env var or put in $AGENT_HOME/credentials/EXA_API_KEY.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.answer:
+        print("Warning: --answer is not supported with --backend exa; ignoring.", file=sys.stderr)
+
+    body = {
+        "query": args.query,
+        "numResults": args.num,
+        "type": "auto",
+        "contents": {"highlights": {"numSentences": 3}},
+    }
+    if args.include:
+        body["includeDomains"] = args.include
+    if args.exclude:
+        body["excludeDomains"] = args.exclude
+
+    # Exa uses startPublishedDate (not time_range). Map --time and --days.
+    days = _time_to_days(args.time) or args.days
+    if days:
+        start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+        body["startPublishedDate"] = start + "T00:00:00.000Z"
+
+    req = urllib.request.Request(
+        "https://api.exa.ai/search",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "User-Agent": "curl/8.7.1",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        print(f"Exa API error ({e.code}): {err}", file=sys.stderr)
+        sys.exit(2)
+    except (urllib.error.URLError, socket.timeout) as e:
+        print(f"Exa network error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    cost = raw.get("costDollars", {}).get("total", COST_EXA)
+
+    results = []
+    for r in raw.get("results", []):
+        snippet = ""
+        if r.get("highlights"):
+            snippet = " ".join(h.strip() for h in r["highlights"])
+        elif r.get("text"):
+            snippet = r["text"]
+        snippet = snippet.strip()
+        if len(snippet) > SNIPPET_CHARS:
+            snippet = snippet[:SNIPPET_CHARS].rstrip() + "…"
+        results.append({
+            "title": r.get("title") or "(no title)",
+            "url": r.get("url") or "",
+            "score": r.get("score"),
+            "snippet": snippet,
+            "published": (r.get("publishedDate") or "")[:10] or None,
+        })
+
+    return {
+        "query": args.query,
+        "backend": "exa",
+        "answer": None,
+        "results": results,
+    }, cost
+
+
+def _time_to_days(trange):
+    return {"day": 1, "week": 7, "month": 31, "year": 365}.get(trange or "", None)
+
+
+# ---- Output ----
+
+def format_text(data, cost):
+    n = len(data["results"])
+    lines = [
+        f"# Web search: \"{data['query']}\"",
+        f"Backend: {data['backend']} | Results: {n} | Cost: ${cost:.4f}",
+        "",
+    ]
+
+    if data.get("answer"):
+        lines.append("## Answer")
+        lines.append(data["answer"])
+        lines.append("")
+        lines.append("_(Synthesized by the search provider — verify against the sources below for technical details.)_")
+        lines.append("")
+
+    if n == 0:
+        lines.append("No results.")
+        return "\n".join(lines)
+
+    for i, r in enumerate(data["results"], 1):
+        header = f"[{i}] {r['title']}"
+        if r.get("score") is not None:
+            header += f"  (score: {r['score']:.2f})"
+        lines.append(header)
+        lines.append(f"    {r['url']}")
+        if r.get("published"):
+            lines.append(f"    Published: {r['published']}")
+        if r.get("snippet"):
+            lines.append(f"    {r['snippet']}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def format_json(data, cost):
+    out = dict(data)
+    out["cost"] = round(cost, 4)
+    return json.dumps(out, indent=2, ensure_ascii=False)
+
+
+# ---- CLI ----
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="web-search",
+        description="Standalone web search — ranked results with snippets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  web-search "population of Toronto 2026"
+  web-search "rust async runtime" -n 10
+  web-search "Claude Sonnet 4.6" --answer --time month
+  web-search "CVE-2026-1234" --include redhat.com,debian.org
+  web-search "distributed consensus" --backend exa -n 8
+  web-search "Anthropic release notes" --topic news --time week
+
+Exit codes:
+  0  success (may have 0 results)
+  1  usage error or missing API key
+  2  API / network error, or budget exceeded
+""",
+    )
+    p.add_argument("query", nargs="+", help="search query")
+    p.add_argument("-n", "--num", type=int, default=5,
+                   help="number of results (default 5, practical max ~20)")
+    p.add_argument("-a", "--answer", action="store_true",
+                   help="include AI-synthesized answer (Tavily only; unreliable for technical details)")
+    p.add_argument("--time", choices=["day", "week", "month", "year"],
+                   help="recency filter")
+    p.add_argument("--days", type=int,
+                   help="recency in days (Exa backend; --time used for Tavily)")
+    p.add_argument("--include", help="comma-separated list of domains to include")
+    p.add_argument("--exclude", help="comma-separated list of domains to exclude")
+    p.add_argument("--topic", choices=["general", "news", "finance"], default="general",
+                   help="Tavily topic category (default general)")
+    p.add_argument("--backend", choices=["tavily", "exa"], default="tavily",
+                   help="search backend (default tavily)")
+    p.add_argument("--depth", choices=["basic", "advanced"], default="basic",
+                   help="Tavily search depth (advanced costs 2x; default basic)")
+    p.add_argument("--json", dest="as_json", action="store_true",
+                   help="output raw JSON for programmatic use")
+
+    args = p.parse_args(argv)
+    args.query = " ".join(args.query).strip()
+    if not args.query or len(args.query) < 2:
+        p.error("query must be at least 2 characters")
+    args.include = [d.strip() for d in args.include.split(",")] if args.include else None
+    args.exclude = [d.strip() for d in args.exclude.split(",")] if args.exclude else None
+    if args.include and args.exclude and set(args.include) & set(args.exclude):
+        p.error("--include and --exclude cannot overlap")
+    if args.num < 1 or args.num > 50:
+        p.error("-n must be between 1 and 50")
+    return args
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+
+    # Budget pre-check (use estimated cost; actual cost may differ)
+    est = COST_TAVILY_ADVANCED if (args.backend == "tavily" and args.depth == "advanced") else (
+        COST_TAVILY_BASIC if args.backend == "tavily" else COST_EXA
+    )
+    budget_mod = check_budget(est)
+
+    if args.backend == "tavily":
+        data, cost = tavily_search(args)
+    else:
+        data, cost = exa_search(args)
+
+    log_usage(budget_mod, cost, {
+        "query": args.query, "backend": args.backend, "num": args.num,
+        "time": args.time, "topic": args.topic, "depth": args.depth,
+    })
+
+    if args.as_json:
+        print(format_json(data, cost))
+    else:
+        print(format_text(data, cost))
+
+
+if __name__ == "__main__":
+    main()

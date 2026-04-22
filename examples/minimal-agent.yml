@@ -1,15 +1,16 @@
-# Minimal agent spec — a simple coding assistant
-# Uses kiln's default harness. No custom code needed.
+# Minimal agent spec — a single-purpose coding assistant.
+# Uses Kiln's default harness. No custom code needed.
 
 name: assistant
 identity_doc: identity.md
 model: claude-sonnet-4-6
 
-# Uses kiln's default tool set (all Kiln:: tools + Base::Read + Base::WebSearch)
-# Uncomment to customize:
+# Uses Kiln's default tool set:
+#   Kiln::{Bash, Read, Write, Edit, Message, Plan, ExitSession, ActivateSkill}
+# plus every shell tool discovered under <home>/tools/ (core + library).
+#
+# Uncomment and narrow if you want a smaller built-in surface:
 # tools:
-#   - Base::Read
-#   - Base::WebSearch
 #   - Kiln::Bash
 #   - Kiln::Read
 #   - Kiln::Write
