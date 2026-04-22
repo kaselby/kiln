@@ -745,13 +745,19 @@ class KilnApp:
 
         # Steering edit mode: set when Alt+Up opens the queue for
         # browsing/editing. _editing_index points into steering_queue at
-        # the currently-displayed message. The queue itself is not mutated
-        # during navigation — changes only commit on Enter (replace if
-        # non-empty, delete if empty) or revert on Esc. In-flight buffer
-        # edits are discarded when navigating away (Pi/CC semantics).
+        # the currently-displayed message. Buffer edits propagate LIVE to
+        # queue[_editing_index] — no commit step required. Enter finalizes
+        # (empty buffer deletes the slot; otherwise just exits edit mode).
+        # Esc reverts the whole queue from _editing_queue_snapshot so the
+        # user can back out cleanly from any edit session.
         self._editing_steering: bool = False
         self._editing_index: int | None = None
         self._editing_prior_buffer: str | None = None
+        self._editing_queue_snapshot: list[str] | None = None
+        # Re-entrancy guard for the buffer on_text_changed hook, which also
+        # fires when WE load a slot into the buffer during navigation — we
+        # don't want those loads to round-trip back into the queue.
+        self._suspend_live_edit: bool = False
 
         # Context limit: tracks the last limit value that fired the crossing
         # handler. Stored as an int (not bool) so that raising the cap mid-session
@@ -765,6 +771,10 @@ class KilnApp:
 
         # Build the prompt_toolkit Application
         self._input_buffer = Buffer(multiline=True)
+        # Live-edit propagation: while in steering edit mode, buffer changes
+        # flow through to the queue in real time so the user sees their
+        # edits reflected in the panel as they type.
+        self._input_buffer.on_text_changed += self._on_buffer_text_changed
         kb = self._build_keybindings()
 
         @Condition
@@ -861,22 +871,32 @@ class KilnApp:
                 app_ref._app.invalidate()
 
         def _commit_steering_edit(text: str) -> None:
-            """Apply the buffer's contents to the queue slot being edited."""
+            """Finalize the current edit session.
+
+            Edits are already applied live via ``_on_buffer_text_changed``;
+            this only handles the terminal states: if the buffer is empty
+            the slot is deleted, then in either case we exit edit mode and
+            restore the pre-edit buffer. The queue snapshot is cleared —
+            live edits stand.
+            """
             idx = app_ref._editing_index
             # Guard against stale index if the queue drained during edit.
             if idx is not None and 0 <= idx < len(app_ref._steering_queue):
-                if text:
-                    app_ref._steering_queue[idx] = text
-                    _tprint("<dim>Edited queued steering:</dim> {}", text)
-                else:
+                if not text:
                     del app_ref._steering_queue[idx]
                     _tprint("<dim>Deleted queued steering</dim>")
-            app_ref._input_buffer.reset()
-            if app_ref._editing_prior_buffer:
-                app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                # Non-empty: live edits already propagated — no extra work.
+            app_ref._suspend_live_edit = True
+            try:
+                app_ref._input_buffer.reset()
+                if app_ref._editing_prior_buffer:
+                    app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+            finally:
+                app_ref._suspend_live_edit = False
             app_ref._editing_steering = False
             app_ref._editing_index = None
             app_ref._editing_prior_buffer = None
+            app_ref._editing_queue_snapshot = None
             if app_ref._app:
                 app_ref._app.invalidate()
 
@@ -954,21 +974,31 @@ class KilnApp:
             """Load the indexed steering message into the buffer.
 
             Returns False and exits edit mode if the index is invalid
-            (queue drained or mutated out-of-band). Callers can trust
-            a True return means the buffer is synced to the queue slot.
+            (queue drained or mutated out-of-band). Suspends the live-edit
+            propagator while we write to the buffer, so these internal
+            loads don't echo back through ``_on_buffer_text_changed``.
             """
             idx = app_ref._editing_index
             if idx is None or not (0 <= idx < len(app_ref._steering_queue)):
                 # Stale index — bail cleanly.
-                app_ref._input_buffer.reset()
-                if app_ref._editing_prior_buffer:
-                    app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                app_ref._suspend_live_edit = True
+                try:
+                    app_ref._input_buffer.reset()
+                    if app_ref._editing_prior_buffer:
+                        app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                finally:
+                    app_ref._suspend_live_edit = False
                 app_ref._editing_steering = False
                 app_ref._editing_index = None
                 app_ref._editing_prior_buffer = None
+                app_ref._editing_queue_snapshot = None
                 return False
-            app_ref._input_buffer.reset()
-            app_ref._input_buffer.insert_text(app_ref._steering_queue[idx])
+            app_ref._suspend_live_edit = True
+            try:
+                app_ref._input_buffer.reset()
+                app_ref._input_buffer.insert_text(app_ref._steering_queue[idx])
+            finally:
+                app_ref._suspend_live_edit = False
             return True
 
         def _steering_up() -> None:
@@ -977,6 +1007,10 @@ class KilnApp:
                 return
             if not app_ref._editing_steering:
                 app_ref._editing_prior_buffer = app_ref._input_buffer.text
+                # Snapshot the whole queue so Esc can restore the entire
+                # edit session, not just the buffer. Live edits propagate
+                # into the real queue; this is the rollback source.
+                app_ref._editing_queue_snapshot = list(app_ref._steering_queue)
                 app_ref._editing_steering = True
                 app_ref._editing_index = len(app_ref._steering_queue) - 1
             else:
@@ -997,12 +1031,18 @@ class KilnApp:
                 _load_editing_buffer()
             else:
                 # Past the newest — exit edit mode, restore original buffer.
-                app_ref._input_buffer.reset()
-                if app_ref._editing_prior_buffer:
-                    app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                # Live edits stand; clear the snapshot so they're committed.
+                app_ref._suspend_live_edit = True
+                try:
+                    app_ref._input_buffer.reset()
+                    if app_ref._editing_prior_buffer:
+                        app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+                finally:
+                    app_ref._suspend_live_edit = False
                 app_ref._editing_steering = False
                 app_ref._editing_index = None
                 app_ref._editing_prior_buffer = None
+                app_ref._editing_queue_snapshot = None
             if app_ref._app:
                 app_ref._app.invalidate()
 
@@ -1069,16 +1109,29 @@ class KilnApp:
                 req.decide(False)
 
         def _cancel_steering_edit() -> bool:
-            """If in edit mode, restore prior buffer. Queue is untouched
-            because navigation doesn't mutate it — only Enter does."""
+            """Exit edit mode discarding live edits.
+
+            Edits propagated to the real queue as the user typed; restoring
+            the snapshot rolls back the whole session's changes so Esc has
+            honest "cancel" semantics. Buffer is restored to whatever the
+            user was typing before they entered edit mode.
+            """
             if not app_ref._editing_steering:
                 return False
-            app_ref._input_buffer.reset()
-            if app_ref._editing_prior_buffer:
-                app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+            # Roll back the queue to its pre-edit state.
+            if app_ref._editing_queue_snapshot is not None:
+                app_ref._steering_queue[:] = app_ref._editing_queue_snapshot
+            app_ref._suspend_live_edit = True
+            try:
+                app_ref._input_buffer.reset()
+                if app_ref._editing_prior_buffer:
+                    app_ref._input_buffer.insert_text(app_ref._editing_prior_buffer)
+            finally:
+                app_ref._suspend_live_edit = False
             app_ref._editing_steering = False
             app_ref._editing_index = None
             app_ref._editing_prior_buffer = None
+            app_ref._editing_queue_snapshot = None
             _tprint("<dim>Edit cancelled</dim>")
             if app_ref._app:
                 app_ref._app.invalidate()
@@ -1377,6 +1430,29 @@ class KilnApp:
             "  <perm-key>[y]</perm-key> accept"
             "  <perm-key>[n]</perm-key> reject".format(tool=_display_name(req.tool_name))
         )
+
+    def _on_buffer_text_changed(self, buffer) -> None:
+        """Propagate buffer edits to the queued steering slot in real time.
+
+        Fires for every keystroke in edit mode. Empty buffers are held in
+        limbo — we don't auto-delete while the user is mid-edit; Enter on
+        empty formalizes the deletion. The ``_suspend_live_edit`` flag lets
+        internal buffer loads (navigation between slots) skip propagation.
+        """
+        if self._suspend_live_edit:
+            return
+        if not self._editing_steering:
+            return
+        idx = self._editing_index
+        if idx is None or not (0 <= idx < len(self._steering_queue)):
+            return
+        text = buffer.text.strip()
+        if text:
+            self._steering_queue[idx] = text
+        # Empty buffer: leave the queue slot alone; Enter will finalize the
+        # deletion. Invalidate so the panel reflects the live content.
+        if self._app:
+            self._app.invalidate()
 
     def _steering_panel(self) -> FormattedText:
         """Persistent panel above the input bar listing queued steering messages.
@@ -2133,13 +2209,20 @@ class KilnApp:
                     _tprint("\n<user>You (steering):</user> {}", msg)
                 # Steering was drained out from under an in-flight edit.
                 # Exit edit mode cleanly — the queue slot no longer exists.
+                # Drop the snapshot without restoring it: the delivered
+                # messages are gone; resurrecting them would be worse.
                 if self._editing_steering:
-                    self._input_buffer.reset()
-                    if self._editing_prior_buffer:
-                        self._input_buffer.insert_text(self._editing_prior_buffer)
+                    self._suspend_live_edit = True
+                    try:
+                        self._input_buffer.reset()
+                        if self._editing_prior_buffer:
+                            self._input_buffer.insert_text(self._editing_prior_buffer)
+                    finally:
+                        self._suspend_live_edit = False
                     self._editing_steering = False
                     self._editing_index = None
                     self._editing_prior_buffer = None
+                    self._editing_queue_snapshot = None
                     _tprint("<dim>Queued steering delivered — edit cancelled</dim>")
                     if self._app:
                         self._app.invalidate()
