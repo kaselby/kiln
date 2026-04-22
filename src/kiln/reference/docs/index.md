@@ -12,5 +12,7 @@ committed index matches the rendered output.
 - [`lifecycle.md`](./lifecycle.md) — **Session Lifecycle.** How a Kiln session starts, runs, and stops — including resume, self-continuation, and the state artifacts each phase reads and writes
 - [`memory.md`](./memory.md) — **Memory.** How Kiln handles agent-owned persistent state — the `memory/` directory, context-injection into the system prompt, and the session-summary convention that drives tools like `recall`
 - [`messaging.md`](./messaging.md) — **Messaging.** How agents exchange messages through the daemon — direct sends, channel pub/sub, inbox delivery, and trust resolution
+- [`scheduler.md`](./scheduler.md) — **Scheduler.** The daemon-hosted service for timed triggers — cron-style recurrence and one-shot ISO datetime fires
+- [`services.md`](./services.md) — **Services.** The daemon's optional extension layer — self-contained capabilities that plug into the Kiln daemon at startup, share its event bus, and extend its RPC surface
 - [`skills.md`](./skills.md) — **Skills.** How Kiln discovers, lists, and loads skills — packaged domain knowledge that an agent opts into for a session
 - [`tools.md`](./tools.md) — **Shell Tools.** How Kiln discovers, renders, and exposes agent-owned shell tools

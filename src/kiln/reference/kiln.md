@@ -59,11 +59,14 @@ Use the `Message` tool to send point-to-point messages (`to`), broadcast to a ch
 
 → See `{kiln_path}/docs/messaging.md` for the full messaging model.
 
-### Gateway
+## Services
 
-Agents can also connect to external platforms (Discord, and eventually others) through the Kiln daemon's gateway. The daemon handles platform bridging and routes inbound messages to the right session.
+The Kiln daemon supports optional services — self-contained capabilities that plug into the daemon at startup and can be enabled or disabled in `~/.kiln/daemon/config.yml`. Two services ship with Kiln:
 
-→ See `{kiln_path}/docs/gateway.md` for daemon and gateway details.
+- **Gateway** — bridges agent messaging to external platforms (Discord, and eventually others). The daemon handles platform connections, trust levels, and routes inbound messages to the right session. Use the `gateway` shell tool to manage the daemon and send/receive messages.
+- **Scheduler** — fires timed triggers: recurring (`cron`) or one-shot (`at`). Two action kinds: `spawn` (launch a new agent session) and `deliver` (send a message to a live session's inbox, with tag-based targeting). Use the `schedule` shell tool to create, inspect, and manage entries. Schedule state lives in `~/.kiln/daemon/state/schedule.yml`.
+
+→ See `{kiln_path}/docs/services.md` for the service architecture, `{kiln_path}/docs/gateway.md` for gateway details, `{kiln_path}/docs/scheduler.md` for scheduler usage and entry format.
 
 ## Collaboration
 

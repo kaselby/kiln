@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+# ---
+# name: schedule
+# brief: Manage Kiln scheduler entries (cron + one-shot triggers)
+# description: |
+#   Create, inspect, and manage scheduled entries in the Kiln daemon's scheduler.
+#   Entries live in ~/.kiln/daemon/state/schedule.yml as declarative YAML.
+#   Two trigger kinds: cron (recurring) and at (one-shot ISO datetime).
+#   Two action kinds: spawn (launch a session) and deliver (inbox message).
+#   Validated against the scheduler's own parser — if the tool accepts it,
+#   the engine will too.
+# arguments: "<list|show|add-spawn|add-deliver|remove|enable|disable|validate> [args] [options]"
+# ---
+#
+# Usage:
+#   schedule list                            List all entries with status
+#   schedule show <id>                       Detailed view of a single entry
+#   schedule add-spawn [flags]               Add a spawn-action entry
+#   schedule add-deliver [flags]             Add a deliver-action entry
+#   schedule remove <id>                     Remove an entry
+#   schedule enable <id>                     Enable a disabled entry
+#   schedule disable <id>                    Disable an entry
+#   schedule validate                        Parse schedule.yml and report errors
+#
+# add-spawn flags:
+#   --agent AGENT                 (required) Agent to spawn
+#   --template TEMPLATE           Session template
+#   --mode MODE                   Session mode (e.g. yolo)
+#   --prompt PROMPT               Startup prompt
+#   Trigger (one required):
+#     --cron EXPR                 Cron expression (e.g. "0 8 * * *")
+#     --at TIME                   ISO datetime (e.g. "2026-04-23T08:00:00-04:00")
+#   Options:
+#     --timezone TZ               Timezone for cron (e.g. "America/Toronto")
+#     --id ID                     Entry ID (auto-generated if omitted)
+#     --catchup DURATION          Catchup window (e.g. "4h", default "1h")
+#     --no-catchup                Disable catchup
+#     --disabled                  Create entry in disabled state
+#
+# add-deliver flags:
+#   --agent AGENT                 (required) Target agent for delivery
+#   --summary TEXT                (required) Message summary
+#   --body TEXT                   (required) Message body
+#   --tags TAG1,TAG2              Session tags to match
+#   --match any|all               Tag match mode (default: any)
+#   --fallback inbox|drop|error   No-session fallback (default: inbox)
+#   --priority normal|high|low    Message priority (default: normal)
+#   Trigger + options: same as add-spawn
+#
+# Examples:
+#   schedule add-deliver --agent beth --summary "Buffer check" \
+#     --body "Check inbox and volatile for anything that needs attention." \
+#     --tags canonical --cron "0 */6 * * *" --timezone America/Toronto
+#
+#   schedule add-spawn --agent beth --template worker --mode yolo \
+#     --prompt "Run the daily review." --at "2026-04-23T08:00:00-04:00"
+#
+#   schedule disable morning-review
+#   schedule remove old-oneshot
+
+import argparse
+import hashlib
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+STATE_DIR = Path.home() / ".kiln" / "daemon" / "state"
+SCHEDULE_PATH = STATE_DIR / "schedule.yml"
+STATE_PATH = STATE_DIR / "scheduler-state.json"
+
+
+# ---------------------------------------------------------------------------
+# YAML helpers
+# ---------------------------------------------------------------------------
+
+def load_raw() -> dict:
+    """Load schedule.yml as raw dict, preserving structure for round-tripping."""
+    if not SCHEDULE_PATH.exists():
+        return {"schedules": []}
+    text = SCHEDULE_PATH.read_text()
+    data = yaml.safe_load(text)
+    if not data or not isinstance(data, dict):
+        return {"schedules": []}
+    data.setdefault("schedules", [])
+    return data
+
+
+def save_raw(data: dict) -> None:
+    """Write schedule data back to YAML."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SCHEDULE_PATH.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+
+
+def find_entry(data: dict, entry_id: str) -> dict | None:
+    """Find a raw entry dict by ID."""
+    for entry in data.get("schedules", []):
+        if isinstance(entry, dict) and entry.get("id") == entry_id:
+            return entry
+    return None
+
+
+def generate_id(action_kind: str, agent: str) -> str:
+    """Generate a short, readable ID: {agent}-{action}-{hex}."""
+    seed = f"{agent}-{action_kind}-{time.time()}"
+    short_hash = hashlib.sha1(seed.encode()).hexdigest()[:6]
+    return f"{agent}-{action_kind}-{short_hash}"
+
+
+# ---------------------------------------------------------------------------
+# Validation (delegates to Kiln's own parser)
+# ---------------------------------------------------------------------------
+
+def validate_entry(entry_dict: dict) -> list[str]:
+    """Validate a single entry dict using the scheduler's parser."""
+    from kiln.services.scheduler.models import parse_entry
+    _, errors = parse_entry(entry_dict)
+    return errors
+
+
+def validate_file() -> tuple[int, list[str]]:
+    """Validate the full schedule file. Returns (valid_count, errors)."""
+    from kiln.services.scheduler.models import load_schedule
+    import logging
+
+    # Capture warnings from load_schedule
+    errors = []
+    handler = logging.Handler()
+    handler.emit = lambda record: errors.append(record.getMessage())
+    logger = logging.getLogger("kiln.services.scheduler.models")
+    logger.addHandler(handler)
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
+
+    try:
+        entries = load_schedule(SCHEDULE_PATH)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+    return len(entries), errors
+
+
+# ---------------------------------------------------------------------------
+# Build entry dicts
+# ---------------------------------------------------------------------------
+
+def build_trigger(args) -> dict:
+    """Build trigger dict from parsed args."""
+    if args.cron:
+        trigger = {"kind": "cron", "expr": args.cron}
+        if args.timezone:
+            trigger["timezone"] = args.timezone
+        return trigger
+    elif args.at:
+        return {"kind": "at", "time": args.at}
+    else:
+        print("Error: must specify --cron or --at", file=sys.stderr)
+        sys.exit(1)
+
+
+def build_common(args, action: dict) -> dict:
+    """Build the full entry dict from trigger + action + common flags."""
+    entry = {}
+    entry["id"] = args.id if args.id else generate_id(action["kind"], action.get("agent", action.get("target", {}).get("agent", "unknown")))
+    entry["trigger"] = build_trigger(args)
+    entry["action"] = action
+
+    if args.disabled:
+        entry["enabled"] = False
+    if args.no_catchup:
+        entry["catchup"] = False
+    elif args.catchup:
+        entry["catchup"] = args.catchup
+
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_list(_args) -> None:
+    """List all schedule entries with status."""
+    from kiln.services.scheduler.models import load_schedule, load_state
+
+    entries = load_schedule(SCHEDULE_PATH)
+    state = load_state(STATE_PATH)
+
+    if not entries:
+        print("No scheduled entries.")
+        if not SCHEDULE_PATH.exists():
+            print(f"  (schedule file: {SCHEDULE_PATH} — does not exist)")
+        return
+
+    for entry in entries:
+        es = state.get_entry(entry.id)
+
+        # Status
+        if not entry.enabled:
+            status = "\033[90mdisabled\033[0m"
+        elif es.completed:
+            status = "\033[90mcompleted\033[0m"
+        else:
+            status = "\033[32mactive\033[0m"
+
+        # Trigger
+        if hasattr(entry.trigger, "expr"):
+            trig = f"cron \033[36m{entry.trigger.expr}\033[0m"
+            if entry.trigger.timezone:
+                trig += f" ({entry.trigger.timezone})"
+        else:
+            trig = f"at \033[36m{entry.trigger.time}\033[0m"
+
+        # Action
+        if entry.action.kind == "spawn":
+            act = f"spawn → {entry.action.agent}"
+            if entry.action.template:
+                act += f" ({entry.action.template})"
+        else:
+            act = f"deliver → {entry.action.target.agent}"
+            if entry.action.target.tags:
+                act += f" [{','.join(entry.action.target.tags)}]"
+
+        # Fire history
+        fire_info = ""
+        if es.fire_count:
+            fire_info = f"  ({es.fire_count} fires"
+            if es.last_fired:
+                fire_info += f", last: {es.last_fired.strftime('%Y-%m-%d %H:%M')}"
+            fire_info += ")"
+
+        print(f"  \033[1m{entry.id}\033[0m  [{status}]")
+        print(f"    {trig}  |  {act}{fire_info}")
+
+
+def cmd_show(args) -> None:
+    """Show detailed view of a single entry."""
+    data = load_raw()
+    entry_dict = find_entry(data, args.id)
+    if not entry_dict:
+        print(f"Error: no entry with id '{args.id}'", file=sys.stderr)
+        sys.exit(1)
+
+    # Also load runtime state for this entry
+    from kiln.services.scheduler.models import load_state
+    state = load_state(STATE_PATH)
+    es = state.get_entry(args.id)
+
+    print(f"\033[1m{args.id}\033[0m")
+    print()
+
+    # Enabled
+    enabled = entry_dict.get("enabled", True)
+    print(f"  Enabled:    {'yes' if enabled else 'no'}")
+
+    # Status from runtime state
+    if es.completed:
+        print(f"  Status:     completed")
+    elif not enabled:
+        print(f"  Status:     disabled")
+    else:
+        print(f"  Status:     active")
+
+    # Trigger
+    trigger = entry_dict.get("trigger", {})
+    kind = trigger.get("kind", "?")
+    if kind == "cron":
+        print(f"  Trigger:    cron '{trigger.get('expr', '')}'")
+        if trigger.get("timezone"):
+            print(f"  Timezone:   {trigger['timezone']}")
+    elif kind == "at":
+        print(f"  Trigger:    at {trigger.get('time', '')}")
+
+    # Catchup
+    catchup = entry_dict.get("catchup")
+    if catchup is False:
+        print(f"  Catchup:    disabled")
+    elif catchup:
+        print(f"  Catchup:    {catchup}")
+    else:
+        print(f"  Catchup:    default (1h)")
+
+    # Action
+    action = entry_dict.get("action", {})
+    akind = action.get("kind", "?")
+    print()
+    if akind == "spawn":
+        print(f"  Action:     spawn")
+        print(f"  Agent:      {action.get('agent', '?')}")
+        if action.get("template"):
+            print(f"  Template:   {action['template']}")
+        if action.get("mode"):
+            print(f"  Mode:       {action['mode']}")
+        if action.get("prompt"):
+            prompt = action["prompt"]
+            if len(prompt) > 120:
+                prompt = prompt[:117] + "..."
+            print(f"  Prompt:     {prompt}")
+    elif akind == "deliver":
+        print(f"  Action:     deliver")
+        target = action.get("target", {})
+        print(f"  Agent:      {target.get('agent', '?')}")
+        if target.get("tags"):
+            print(f"  Tags:       {', '.join(target['tags'])}")
+        if target.get("match", "any") != "any":
+            print(f"  Match:      {target['match']}")
+        if target.get("fallback", "inbox") != "inbox":
+            print(f"  Fallback:   {target['fallback']}")
+        print(f"  Summary:    {action.get('summary', '')}")
+        body = action.get("body", "")
+        if len(body) > 200:
+            body = body[:197] + "..."
+        print(f"  Body:       {body}")
+        if action.get("priority", "normal") != "normal":
+            print(f"  Priority:   {action['priority']}")
+
+    # Runtime info
+    if es.fire_count or es.last_fired:
+        print()
+        print(f"  Fires:      {es.fire_count}")
+        if es.last_fired:
+            print(f"  Last fired: {es.last_fired.isoformat()}")
+
+
+def cmd_add_spawn(args) -> None:
+    """Add a spawn-action entry."""
+    action = {"kind": "spawn", "agent": args.agent}
+    if args.template:
+        action["template"] = args.template
+    if args.mode:
+        action["mode"] = args.mode
+    if args.prompt:
+        action["prompt"] = args.prompt
+
+    entry = build_common(args, action)
+
+    # Validate before writing
+    errors = validate_entry(entry)
+    if errors:
+        print("Validation errors:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Check for ID collision
+    data = load_raw()
+    if find_entry(data, entry["id"]):
+        print(f"Error: entry '{entry['id']}' already exists. Use a different --id or remove it first.", file=sys.stderr)
+        sys.exit(1)
+
+    data["schedules"].append(entry)
+    save_raw(data)
+
+    print(f"Added: {entry['id']}")
+    trigger = entry["trigger"]
+    if trigger["kind"] == "cron":
+        print(f"  cron '{trigger['expr']}'  →  spawn {args.agent}")
+    else:
+        print(f"  at {trigger['time']}  →  spawn {args.agent}")
+
+
+def cmd_add_deliver(args) -> None:
+    """Add a deliver-action entry."""
+    target = {"kind": "agent", "agent": args.agent}
+    if args.tags:
+        target["tags"] = [t.strip() for t in args.tags.split(",")]
+    if args.match != "any":
+        target["match"] = args.match
+    if args.fallback != "inbox":
+        target["fallback"] = args.fallback
+
+    action = {
+        "kind": "deliver",
+        "target": target,
+        "summary": args.summary,
+        "body": args.body,
+    }
+    if args.priority != "normal":
+        action["priority"] = args.priority
+
+    entry = build_common(args, action)
+
+    # Validate before writing
+    errors = validate_entry(entry)
+    if errors:
+        print("Validation errors:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Check for ID collision
+    data = load_raw()
+    if find_entry(data, entry["id"]):
+        print(f"Error: entry '{entry['id']}' already exists. Use a different --id or remove it first.", file=sys.stderr)
+        sys.exit(1)
+
+    data["schedules"].append(entry)
+    save_raw(data)
+
+    print(f"Added: {entry['id']}")
+    trigger = entry["trigger"]
+    if trigger["kind"] == "cron":
+        print(f"  cron '{trigger['expr']}'  →  deliver to {args.agent}: {args.summary}")
+    else:
+        print(f"  at {trigger['time']}  →  deliver to {args.agent}: {args.summary}")
+
+
+def cmd_remove(args) -> None:
+    """Remove a schedule entry."""
+    data = load_raw()
+    before = len(data["schedules"])
+    data["schedules"] = [e for e in data["schedules"] if not (isinstance(e, dict) and e.get("id") == args.id)]
+
+    if len(data["schedules"]) == before:
+        print(f"Error: no entry with id '{args.id}'", file=sys.stderr)
+        sys.exit(1)
+
+    save_raw(data)
+    print(f"Removed: {args.id}")
+
+
+def cmd_enable(args) -> None:
+    """Enable a disabled entry."""
+    data = load_raw()
+    entry = find_entry(data, args.id)
+    if not entry:
+        print(f"Error: no entry with id '{args.id}'", file=sys.stderr)
+        sys.exit(1)
+
+    if entry.get("enabled", True):
+        print(f"Already enabled: {args.id}")
+        return
+
+    entry["enabled"] = True
+    save_raw(data)
+    print(f"Enabled: {args.id}")
+
+
+def cmd_disable(args) -> None:
+    """Disable an entry."""
+    data = load_raw()
+    entry = find_entry(data, args.id)
+    if not entry:
+        print(f"Error: no entry with id '{args.id}'", file=sys.stderr)
+        sys.exit(1)
+
+    if not entry.get("enabled", True):
+        print(f"Already disabled: {args.id}")
+        return
+
+    entry["enabled"] = False
+    save_raw(data)
+    print(f"Disabled: {args.id}")
+
+
+def cmd_validate(_args) -> None:
+    """Parse schedule.yml and report errors."""
+    if not SCHEDULE_PATH.exists():
+        print(f"No schedule file at {SCHEDULE_PATH}")
+        return
+
+    valid_count, errors = validate_file()
+
+    if errors:
+        print(f"\033[31mValidation errors:\033[0m")
+        for e in errors:
+            print(f"  - {e}")
+        print()
+
+    # Also count raw entries to show skip count
+    data = load_raw()
+    total = len(data.get("schedules", []))
+    skipped = total - valid_count
+
+    if errors or skipped:
+        print(f"{valid_count}/{total} entries valid ({skipped} skipped)")
+    else:
+        print(f"\033[32m✓\033[0m {valid_count} entries, all valid")
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def add_trigger_flags(parser: argparse.ArgumentParser) -> None:
+    """Add trigger and common flags shared by add-spawn and add-deliver."""
+    trig = parser.add_argument_group("trigger (one required)")
+    trig.add_argument("--cron", metavar="EXPR", help="Cron expression")
+    trig.add_argument("--at", metavar="TIME", help="ISO datetime for one-shot")
+    trig.add_argument("--timezone", metavar="TZ", help="Timezone for cron trigger")
+
+    opts = parser.add_argument_group("options")
+    opts.add_argument("--id", metavar="ID", help="Entry ID (auto-generated if omitted)")
+    opts.add_argument("--catchup", metavar="DUR", help="Catchup window (e.g. 4h)")
+    opts.add_argument("--no-catchup", action="store_true", help="Disable catchup")
+    opts.add_argument("--disabled", action="store_true", help="Create in disabled state")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="schedule", description="Manage Kiln scheduler entries")
+    sub = parser.add_subparsers(dest="command")
+
+    # list
+    sub.add_parser("list", help="List all entries with status")
+
+    # show
+    p_show = sub.add_parser("show", help="Show entry details")
+    p_show.add_argument("id", help="Entry ID")
+
+    # add-spawn
+    p_spawn = sub.add_parser("add-spawn", help="Add a spawn-action entry")
+    p_spawn.add_argument("--agent", required=True, help="Agent to spawn")
+    p_spawn.add_argument("--template", help="Session template")
+    p_spawn.add_argument("--mode", help="Session mode")
+    p_spawn.add_argument("--prompt", help="Startup prompt")
+    add_trigger_flags(p_spawn)
+
+    # add-deliver
+    p_deliver = sub.add_parser("add-deliver", help="Add a deliver-action entry")
+    p_deliver.add_argument("--agent", required=True, help="Target agent")
+    p_deliver.add_argument("--summary", required=True, help="Message summary")
+    p_deliver.add_argument("--body", required=True, help="Message body")
+    p_deliver.add_argument("--tags", metavar="TAGS", help="Comma-separated session tags")
+    p_deliver.add_argument("--match", choices=["any", "all"], default="any", help="Tag match mode")
+    p_deliver.add_argument("--fallback", choices=["inbox", "drop", "error"], default="inbox", help="No-session fallback")
+    p_deliver.add_argument("--priority", choices=["normal", "high", "low"], default="normal", help="Message priority")
+    add_trigger_flags(p_deliver)
+
+    # remove
+    p_remove = sub.add_parser("remove", help="Remove an entry")
+    p_remove.add_argument("id", help="Entry ID")
+
+    # enable / disable
+    p_enable = sub.add_parser("enable", help="Enable an entry")
+    p_enable.add_argument("id", help="Entry ID")
+
+    p_disable = sub.add_parser("disable", help="Disable an entry")
+    p_disable.add_argument("id", help="Entry ID")
+
+    # validate
+    sub.add_parser("validate", help="Parse schedule.yml and report errors")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        # No subcommand — show list by default
+        cmd_list(args)
+        return
+
+    dispatch = {
+        "list": cmd_list,
+        "show": cmd_show,
+        "add-spawn": cmd_add_spawn,
+        "add-deliver": cmd_add_deliver,
+        "remove": cmd_remove,
+        "enable": cmd_enable,
+        "disable": cmd_disable,
+        "validate": cmd_validate,
+    }
+
+    fn = dispatch.get(args.command)
+    if fn:
+        fn(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
