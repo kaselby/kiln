@@ -150,12 +150,18 @@ class OpenAIResponsesProvider:
         Retries on transient errors (5xx, rate limits, connection issues)
         with exponential backoff.
         """
+        # `store: false` means items aren't persisted server-side, so any
+        # reasoning items we replay on subsequent turns must carry their own
+        # encrypted_content — otherwise the API tries to resolve the rs_... id
+        # server-side and 404s. gpt-5.5 emits reasoning items even when no
+        # `reasoning` parameter is set, so `include` must be unconditional.
         params: dict[str, Any] = {
             "model": model,
             "input": input,
             "instructions": instructions,
             "stream": True,
             "store": False,
+            "include": ["reasoning.encrypted_content"],
             "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
@@ -165,7 +171,6 @@ class OpenAIResponsesProvider:
 
         if reasoning:
             params["reasoning"] = reasoning
-            params["include"] = ["reasoning.encrypted_content"]
 
         if self._session_id:
             params["prompt_cache_key"] = self._session_id

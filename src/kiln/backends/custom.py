@@ -431,6 +431,8 @@ class CustomBackend:
                     # Round-trip raw provider items for multi-turn continuity.
                     # Strip output-only fields that APIs reject as input.
                     for raw in turn.raw_output_items:
+                        if _is_unreplayable_reasoning(raw):
+                            continue
                         items.append(_strip_output_only_fields(raw))
                 else:
                     # Fallback: reconstruct in provider-native replay format.
@@ -666,6 +668,19 @@ def _strip_output_only_fields(item: dict) -> dict:
     if not any(k in item for k in _OUTPUT_ONLY_FIELDS):
         return item
     return {k: v for k, v in item.items() if k not in _OUTPUT_ONLY_FIELDS}
+
+
+def _is_unreplayable_reasoning(item: dict) -> bool:
+    """True for reasoning items that can't survive stateless replay.
+
+    When `store=false`, a reasoning item replayed as input must carry either
+    `encrypted_content` or `content` — otherwise the server treats the `rs_`
+    id as a reference to a persisted item and 404s. Items with neither are
+    inert bookkeeping; skipping them is safe and preserves conversation flow.
+    """
+    if item.get("type") != "reasoning":
+        return False
+    return not item.get("encrypted_content") and not item.get("content")
 
 
 def _accumulate_usage(total: Usage, turn: Usage) -> Usage:

@@ -410,6 +410,54 @@ class TestBuildInput:
         assert items[1]["type"] == "function_call"
         assert items[1]["call_id"] == "c1"
 
+    def test_empty_reasoning_item_dropped_on_replay(self):
+        """Reasoning items with no encrypted_content or content are dropped.
+
+        gpt-5.5 emits reasoning items even for trivial turns. With `store=false`
+        and no encrypted_content, replaying the bare `rs_...` id causes a 404
+        ('Items are not persisted when store is false'). Skipping inert items
+        keeps the conversation replayable.
+        """
+        backend = make_backend()
+        backend._history = [
+            AssistantTurn(
+                raw_output_items=[
+                    {"type": "reasoning", "id": "rs_empty",
+                     "summary": [], "content": None,
+                     "encrypted_content": None, "status": None},
+                    {"type": "function_call", "call_id": "c1",
+                     "name": "Read", "arguments": "{}", "id": "fc_1"},
+                ],
+                tool_calls=[
+                    ToolCallEvent(id="c1", name="Read", input={}, item_id="fc_1"),
+                ],
+            ),
+        ]
+        items = backend._build_input()
+        types = [i.get("type") for i in items]
+        assert "reasoning" not in types
+        assert types == ["function_call"]
+
+    def test_reasoning_item_with_encrypted_content_preserved(self):
+        """Reasoning items carrying encrypted_content must round-trip intact."""
+        backend = make_backend()
+        backend._history = [
+            AssistantTurn(
+                raw_output_items=[
+                    {"type": "reasoning", "id": "rs_full",
+                     "summary": [], "content": None,
+                     "encrypted_content": "gAAAAABp...",
+                     "status": "completed"},
+                ],
+            ),
+        ]
+        items = backend._build_input()
+        assert len(items) == 1
+        assert items[0]["type"] == "reasoning"
+        assert items[0]["encrypted_content"] == "gAAAAABp..."
+        # status is output-only and should be stripped
+        assert "status" not in items[0]
+
 
     def test_parallel_tool_calls_orphan_handling(self):
         """When continue_=False stops after tool 1 of 2, tool 2 gets
